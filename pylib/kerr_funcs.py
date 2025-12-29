@@ -113,9 +113,11 @@ class KerrModel(dict):
             plt.show()
         
 
-    def __init__(self, filename='from-kerr/toby_v1.npz', 
-                 meta='from-kerr/toby_v1.pickle'):
+    def __init__(self, root='from-kerr/toby_v1'):
+
         import pickle
+        filename, meta = root+'.npz', root+'.pickle'
+        super().__init__()
 
         with np.load(filename) as f:
             self.diffuse = f['diffuse']
