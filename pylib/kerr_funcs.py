@@ -4,26 +4,6 @@ import matplotlib.pyplot as plt
 from astropy.coordinates import SkyCoord, Angle
 from astropy_healpix import HEALPix 
 
-def wraps_at(b):
-    # return pixel index where wraparound occurs, or zero
-    # nside = b.nside
-    # npix = 12*nside**2
-    pix = b.pix.astype(np.int64 )
-    istep = np.where(np.diff(pix)<0)
-    return 0 if istep[0].size==0 else istep[0][0]
-
-def wrap_fix(b):
-    # return pixel array with wraparound fixed if needed
-    nside = b.nside
-    npix = 12*nside**2
-    pix = b.pix.astype(np.int64 )
-    istep = np.where(np.diff(pix)<0)
-    if len(istep[0])==1:
-        wrapat = istep[0][0]
-        # print(f'Wraparound until {wrapat}')
-        return pix[wrapat+1:]
-        # pix[:wrapat] += 3*npix//4 -1
-    return pix
 
 class KerrModel(dict):
 
@@ -67,13 +47,12 @@ class KerrModel(dict):
                 nside = self.nside
             ratio = (self.nside//nside)**2
 
-            # remove "bad" pixels if wrapped
-            w = wraps_at(self) # zero if OK
-            pix = self.pix[w:]
+
+            pix = self.pix
             pix = healpy.nest2ring(nside, pix//ratio )
 
             mp = np.zeros(12*nside**2) # RING sequence of values
-            np.add.at(mp, pix, values[w:])
+            np.add.at(mp, pix, values)
             return mp
         
         def ait_plot(self, component, *, nside=128, figsize=(12,6), fig=None, colorbar=True, 
@@ -129,10 +108,11 @@ class KerrModel(dict):
             self.meta_df = pd.DataFrame(meta, columns='event_type emin emax nside nocc'.split())
         self.meta_df['occupancy']= (self.meta_df.nocc/(12*self.meta_df.nside**2)).round(3)
 
+        nbands = len(meta)
         offset = 0
-        for m in meta:
+        for i,m in enumerate(meta):
             b = self.Band(m)
-            if b.e0<100: continue
+            # if b.e0<100: continue
             self[b.key] = b
             nocc = m[-1]
             b.diffuse = self.diffuse[offset:offset+nocc]
@@ -140,6 +120,9 @@ class KerrModel(dict):
             b.photons = self.photons[offset:offset+nocc]
             b.pix     = self.pix[offset:offset+nocc]            
             offset += nocc
+            b.totals = dict(diffuse=self.diffuse[-nbands+i], ptsrc=self.ptsrc[-nbands+i],)
+        # the total pixel sums
+        self.totals = dict(diffuse=self.diffuse[offset:], ptsrc=self.ptsrc[offset:],)
             
         print(f"""Loaded Kerr model from "{filename}":
             {len(self)} bands {self[(0,4)]} ... {self[(3,11)]}
@@ -182,7 +165,7 @@ class ResidualPlotter:
         rnorm = self.rnorm.clip(*ylim)
 
         nfit = norm.fit(rnorm[~np.isnan(rnorm)])
-        ax.hist(rnorm, bins=25, range=ylim, density=True, histtype='stepfilled', alpha=0.5, label='residuals')
+        ax.hist(rnorm, bins=25, range=ylim, density=True, histtype='stepfilled', alpha=0.5, )
         ax.plot((x:=np.linspace(*ylim,num=25)), norm.pdf(x, *nfit), 'r-', lw=4,
             label =rf'$\mu$={nfit[0]:.2f}'+'\n'+ rf'$\sigma$={nfit[1]:.2f}')
         ax.legend(fontsize=10, loc='lower center')
@@ -220,20 +203,32 @@ class ResidualPlotter:
         plt.show()
 
 
-def plot_residual_histograms(self, ipsf, nside=64):
-
-    fig, axx = plt.subplots(2,4, figsize=(12,6), constrained_layout=True, 
-                            sharex=True, sharey=True,
-                gridspec_kw={'hspace':0.1, 'wspace':0} )          
-    for i, ax in enumerate(axx.flat):
+def multi_residual_plotter(self, nside=64):
+    fig, axx = plt.subplots(5, 9, figsize=(15,6),# constrained_layout=True, 
+                            sharex=True, sharey=True,gridspec_kw={'hspace':0.1, 'wspace':0},
+                            height_ratios=[0.1,1,1,1,1] , width_ratios=[0.5,1,1,1,1,1,1,1,1] ) 
+ 
+    axx[0,0].axis('off')
+    for i, ax in enumerate(axx.flat[1:9]):
+        ax.axis('off')
+        ax.text(0.5, 0.5, self(3,i).energy, transform=ax.transAxes, fontsize=18, ha='center', va='center')
+    for i, ax in enumerate(axx.flat[9:]):
+        col = i%9
+        row = i//9
+        if col==0:
+            ax.text(0.5, 0.5, self(row,7).psf.upper(), transform=ax.transAxes, fontsize=18, ha='center', va='center',)
+            ax.axis('off')
+            continue
         try:
-            band = self(ipsf,i)
+            band = self(row, col-1)
         except KeyError:
+            ax.set_visible(False)
+            continue
+        if band.key[1]<0:
             ax.set_visible(False)
             continue
         rp = ResidualPlotter(band, nside=nside)
         rp.residual_hist(ax=ax) 
-        ax.set(ylabel='')
-        ax.text(0.05, 0.9, f'{band.energy}', transform=ax.transAxes, fontsize=14)
-    ax.set(ylim=(1e-4, 0.5))   
-    fig.suptitle(f'Residual Histograms for PSF{ipsf} Bands', fontsize=18)
+        ax.set(ylabel='', xlabel='', yticks=[])
+    ax.set(ylim=(1e-4, 0.5)) 
+    plt.show()
