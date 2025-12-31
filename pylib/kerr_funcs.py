@@ -97,6 +97,7 @@ class KerrModel(dict):
         import pickle
         filename, meta = root+'.npz', root+'.pickle'
         super().__init__()
+        self.name = root.split('/')[-1]
 
         with np.load(filename) as f:
             self.diffuse = f['diffuse']
@@ -179,7 +180,7 @@ class ResidualPlotter:
         fig.suptitle(str(self.band), fontsize=18)
         fig1,fig2 = fig.subfigures(ncols=2, wspace=0.07)
         ap = self.band.ait_plot(component='data', nside=self.nside, fig=fig1,)
-        ap.title( f'photons / nside {self.nside} pixel', ha='right')
+        ap.title( f'photons / nside {self.nside} pixel', x=0, ha='left')
 
         resid = self.resid 
         model = self.model
@@ -188,7 +189,7 @@ class ResidualPlotter:
         afig.imshow( resid/np.sqrt(model), 
                     cmap='coolwarm',  vmin=-2, vmax=2)#**kwargs)
         afig.colorbar(label='normalized residual', shrink=0.5)
-        afig.title( f'residuals', ha='right')
+        afig.title( f'residuals',x=0, ha='left', fontsize=16)
         plt.show()
     
         fig, (ax1,ax2) = plt.subplots(ncols=2, figsize=(15,4), gridspec_kw={'width_ratios': [2.5, 1]})
