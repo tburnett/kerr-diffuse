@@ -8,26 +8,63 @@ from . sources import PointSource
 from . parameterset import ParameterSet
 from . spectral_models import (LogParabola, PLSuperExpCutoff4, PowerLaw)   
 
-class DemoModel(SourceList):  #, FitterView):
+class Pixels:
+    """ class describing the pixels in the model
+    Here, a set of energies with one pixel bin per energy
+    Includes also exposure information to convert flux to counts
+    """
+    bins = np.logspace(2,5,13) # energy bin edges: 12 bins from 100 MeV to 100 GeV
+
+    def __init__(self):
+        self.energies = np.sqrt(self.bins[1:]*self.bins[:-1])
+        self.exposure_factor = np.full_like(self.energies,1e13) * self.energies/100  # simple energy-dependent exposure
+
+    def counts(self, source_model):
+        """ Convert flux to counts using exposure_factor
+        """
+        return source_model.flux(self.energies) * self.exposure_factor
+    
+    def count_gradient(self, source_model):
+        """ Convert flux gradient to counts gradient using exposure_factor
+        """
+        return source_model.gradient(self.energies) * self.exposure_factor
+    
+    
+class DemoModel(SourceList, Pixels):  
     """
     Inherit from a SourceList, which encapsulates a list of sources, to create a model.
-    The model has a set of energy bins and an exposure_factor_factor factor to predict counts per bin
     
-    Also generates a simulation to produce a data set for testing.
+    Inherot from a special Pixels class encapsulating the pixel descriptonn
+
+    Generates a simulation to produce a data set for testing.
     """
     
-    bins = np.logspace(2,5,13) # energy bin edges: 12 bins from 100 MeV to 100 GeV
+    # bins = np.logspace(2,5,13) # energy bin edges: 12 bins from 100 MeV to 100 GeV
 
 
     def __init__(self, sources, *, random_state=42):
         super().__init__(sources)
+        Pixels.__init__(self)  # initialize Pixels part
+        
         self.sources = sources
-        self.values = self.parameters.values # property access to parameters
-        self.energies = np.sqrt(self.bins[1:]*self.bins[:-1])
-        self.exposure_factor = np.full_like(self.energies,1e13) * self.energies/100  # simple energy-dependent exposure
+        assert isinstance(self.parameters, ParameterSet)
+        assert hasattr(self, 'energies'), "Pixels not initialized properly"
 
+        # this is a read/write property
+        self.values = self.parameters.values # property access to parameters
+        
         self.data = self.simulate(random_state=random_state)
     
+    def counts(self):
+        """ return counts predicted by the model
+        """
+        return super().counts(self)
+    
+    def count_gradient(self):
+        """ Return the gradient of the counts with respect to free parameters
+        """
+        return super().count_gradient(self)
+
     def simulate(self, random_state=42): 
         """
         Simulate data from the model with Poisson noise
@@ -39,7 +76,7 @@ class DemoModel(SourceList):  #, FitterView):
         """
         from scipy import stats
         # compute predicted counts with current parameters
-        predicted = self(self.energies)*self.exposure_factor
+        predicted = self.counts()
         if random_state is None:
             return predicted
 
@@ -49,7 +86,7 @@ class DemoModel(SourceList):  #, FitterView):
     def dataframe(self):
         assert hasattr(self, 'data'), "No data available. Please run simulate() first."
         return pd.DataFrame.from_dict(dict(energy=self.energies.astype(int), 
-                                           model=(self(self.energies)*self.exposure_factor).round(1), 
+                                           model=self.counts().round(1), 
                                            data=self.data)
                                            )
 
@@ -100,160 +137,4 @@ class DemoModel(SourceList):  #, FitterView):
             df = model.dataframe()
             model.spectral_plot()
         return model
-
-
-class Likelihood:
-    
-    def __init__(self, model, data,):
-        self.model = model
-        self.data = data
-        self.mp = model.parameters
- 
-    def log_like(self, x):
-        """ Evaluate the log likelihood with a parameter set x """
-
-        self.mp.values = x
-        model_predictions = self.model(self.model.energies)*self.model.exposure_factor
-        ret = self.data * np.log(model_predictions) - model_predictions  # Poisson likelihood
-        return np.sum(ret) 
-    
-    def __call__(self, x):
-        """ Return a 2-tuple for use with optimize.fmin_l_bfgs_b:
-        * the negative of the log likelihood at x
-        * negative gradient of the log likelihood wrt parameters (or parameter) at x 
-        """  
-        self.mp.values = x
-        d = self.data
-        m = self.model(self.model.energies)*self.model.exposure_factor
-        g = self.model.gradient(self.model.energies)*self.model.exposure_factor
-        gsum = ((d/m-1)*g).sum(axis=1)
-        return -np.sum(d * np.log(m) - m),  -gsum
-    
-    def maximize(self, x0=None):
-        """
-        Maximize the log likelihood function starting from initial guess x0 if present
-        
-        Sets fit_info, a dictionary containing the covariance matrix, standard deviations,
-        correlation matrix, gradient at the optimum, and the fitted parameters.
-        """
-        import numdifftools
-
-        def evaluate_ts():
-            """ Evaluate TS for Norm parameters
-            """
-            model = self.model
-            logl = self.log_like
-            x_fit =  self.fit_info['x_fit'].copy()
-            val_fit = -self(x_fit)[0]
-            values = x_fit.copy()
-            ts_array = np.full_like(values, np.nan)
-
-            for k,name in enumerate(model.parameter_names):
-                if name.endswith('_Norm'):
-                    values[k] = -20
-                    ts_array[k] = round(2*(val_fit - logl(values)),1)
-                    values[k] = x_fit[k]
-                    model.parameters.values = x_fit
-            return ts_array
-
-        if x0 is None:
-            x0 = self.model.parameters.values.copy()
-        x_fit, val, d = optimize.fmin_l_bfgs_b(self, x0,  bounds=self.model.bounds); 
-        if d['warnflag'] != 0:
-            raise RuntimeError('fit_plot: optimization failed: %s' % d['task'])
-        # do this since final values are projections 
-        val, gradient = self(x_fit)
-        self.model.parameters.values = x_fit
-  
-        hess = numdifftools.Hessian(self.log_like)(x_fit) 
-        cov = np.linalg.inv(-hess)
-        sigs = np.sqrt(cov.diagonal())
-        self.model.parameters.set_covariance(cov)
-
-        self.fit_info = dict(
-            cov = cov,
-            sigs = sigs,
-            corr = cov / np.outer(sigs,sigs),
-            grad = -gradient,
-            x_fit = x_fit,
-            value = -val, 
-
-            funcalls = d['funcalls'],)
-        self.fit_info['ts_values'] = evaluate_ts()
-        
-    @property
-    def model_parameters(self):
-        """ Return the external parameters of the model
-        """
-        return self.model.parameters.model_parameters
-    
-    def summary(self,  out=None, title=None, gradient=True, ts=True):
-        """ summary table of free parameters, values, uncertainties, gradient
-        
-        Parameters:
-        ----------
-
-        out : open file or None
-        title: None or string
-        gradient: bool
-            set False to not print gradient
-        ts: bool
-            set False to not print TS values
-            
-        """
-        if title is not None:
-            print(title, file=out)
-
-        fmt, tup = '%-21s%6s%10s%10s', tuple('Name index value error(%)'.split())
-        if gradient:
-            grad = self.fit_info['grad']
-            fmt +='%10s'; tup += ('gradient',)
-        if ts:
-            ts_values = self.fit_info.get('ts_values', None)
-            if ts_values is not None:
-                fmt +='%10s'; tup += ('TS',)
-        print(fmt %tup, file=out)
-        prev=''
-
-        index_array = np.arange(len(self.model.parameters.mask))[self.model.parameters.mask]
-        for index, (name, value, rsig) in enumerate(zip(self.model.parameter_names, 
-                                                        self.model_parameters,#self.fit_info['x_fit'], 
-                                                        self.model.parameters.uncertainties)):
-            t = name.split('_')
-            pname = t[-1]
-            sname = '_'.join(t[:-1])
-            if sname==prev: name = len(sname)*' '+'_'+pname
-            prev = sname
-            fmt = '%-21s%6d%10.4g%10s'
-            psig = '%.1f'%(rsig*100) if rsig>0 and not np.isnan(rsig) else '***'
-            truncname = name[:20]+'*' if len(name)>20 else name
-            tup = (truncname, index_array[index], value,psig)
-            if gradient:
-                fmt +='%10.1f'; tup += (grad[index],)
-            if ts and ts_values is not None:
-                fmt +='%10s'; tup += (f'{ts_values[index]:.0f}' if not pd.isna(ts_values[index]) else '',)
-            print(fmt % tup, file=out)
-    
-    @classmethod
-    def test_plots(cls, model):
-        from like3.views import fit_plot
-        data = model.data
-        x0 = model.parameters.values.copy()
-        fig, axx = plt.subplots(ncols=len(x0), figsize=(4*len(x0),4), sharey=True)
-        for k,ax in enumerate(axx):
-            model.parameters.values=x0
-            func = cls(model, data, k)
-            fit_plot(func, x0[k], ax=ax, title=model.parameter_names[k])
-        plt.show()
-
-    @classmethod
-    def test_fit(cls, src_key=0, random_state=42):
-        """ Test fitting the model to its own simulated data
-        """
-        model=DemoModel.test(plot=False, random_state=random_state, src_key=src_key)
-        data = model.data
-        x0 = model.parameters.values.copy()
-        result = cls(model, data,).maximize(x0)    
-        print(model)
-        return result
 

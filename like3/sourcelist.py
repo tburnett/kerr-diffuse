@@ -40,7 +40,7 @@ class SourceList(list):
         n_free = len(self.parameters)
         return '%d total sources: %d free parameters' % ( ns,  n_free )
 
-    def __call__(self, energies):
+    def flux(self, energies):
         """ Compute flux values for given parameter set """
                 
         r = np.zeros_like(energies)
@@ -53,7 +53,7 @@ class SourceList(list):
         """               
         return np.vstack([source.model.gradient(energies)[source.model.free]*1.0
                           for source in self])
-        
+       
 
     def initialize(self, **kw):
         """For fast parameter access: must be called if any source changes
