@@ -188,12 +188,64 @@ class ParameterSet(object):
         for u in zip(self.parameter_names, self.get_parameters(), self.uncertainties):
             print('%-21s %8.2f %8.1f' % u, file=out)
 
+    def select_parameters(self, *select):
+        """ Select fit parameters by number or name
+
+        Parameters
+        ----------
+        *select : list of int, str 
+            If int, select the parameter by its index.
+            If str, select parameter by name or by source name.
+                - Start with _: select parameters ending with the string following the _
+                - End with *: select parameters containing the string before the *
+                - Otherwise, select parameters starting with the source name.
+
+        Returns
+        -------
+        selected : set
+            Set of selected parameter indices.
+        """
+        selected= set()
+        npars = len(self.parameter_names)
+    
+        # if not hasattr(select, '__iter__') or isinstance(select, (str, bytes)): select = [select]
+
+        for item in select:
+
+            if type(item)==int or type(item)==np.int64:
+                selected.add(item)
+                if item>=npars:
+                    raise Exception('Selected parameter number, %d, not in range [0,%d)' %(item, npars))
+            elif type(item)==bytes or type(item)==str: #np.string_:
+                if item.startswith('_'):
+                    # look for parameters
+                    if item[-1] != '*':
+                        toadd = [i for i in range(npars) if self.parameter_names[i].endswith(item)]
+                    else:
+                        def filt(i):
+                            return self.parameter_names[i].find(item[:-1])!=-1
+                        toadd = list(filter( filt, list(range(npars)) ))
+                elif item in self.parameter_names:
+                    toadd = [list(self.parameter_names).index(item)]
+                    self.selection_description = 'parameter %s' % item
+                else:
+                    try:
+                        src = self.sources.find_source(item)
+                    except Exception:
+                        raise Exception('fit parameter select list item %s not found as parameter name or source name' %item)
+                    self.selection_description = 'source %s'%src.name
+                    toadd = [i for i in range(npars) if self.parameter_names[i].startswith(src.name)]
+                selected = selected.union(toadd )
+            else:
+                raise Exception('fit parameter select list item %s, type %s, must be either an integer or a string' %(item, type(item)))
+        return selected
+
 
 class ParSubSet(ParameterSet):
     """ adapt ParameterSet to implement a subset
     to use, set the mask property to an array of bool or call the select function 
     """
-    def __init__(self, roimodel, select=None, exclude=None, mask=None):
+    def __init__(self, roimodel, *select, mask=None):
         """
         roimodel : ROImodel object
         mask    : [array of bool | None ]
@@ -202,8 +254,8 @@ class ParSubSet(ParameterSet):
         super(ParSubSet,self).__init__(roimodel)
         self.set_mask(mask)
         self.selection_description = None
-        if select is not None:
-            self.select(select, exclude)
+        if len(select) > 0:
+            self.select(*select,)
         
     def __repr__(self):
         return '%s.%s: subset of %d parameters' % (self.__module__, self.__class__.__name__, sum(self.mask))
@@ -218,7 +270,7 @@ class ParSubSet(ParameterSet):
     def get_mask(self): return self._mask        
     mask = property(get_mask, set_mask) 
     
-    def select(self, select=None, exclude=None):
+    def select(self, *select, ):
         """
         Parameters
         ----------
@@ -236,52 +288,13 @@ class ParSubSet(ParameterSet):
         """
 
         # select a list of parameter numbers, or None for all free parameters
-        selected= set()
-        npars = len(self)
+        selected = self.select_parameters(*select)
         
-        if select is not None:
-            try:
-                selectpar = select
-                if not hasattr(select, '__iter__'): select = [select]
-                for item in select:
-                    if type(item)==int or type(item)==np.int64:
-                        selected.add(item)
-                        if item>=npars:
-                            raise Exception('Selected parameter number, %d, not in range [0,%d)' %(item, npars))
-                    elif type(item)==bytes or type(item)==np.string_:
-                        if item.startswith('_'):
-                            # look for parameters
-                            if item[-1] != '*':
-                                toadd = [i for i in range(npars) if self.parameter_names[i].endswith(item)]
-                            else:
-                                def filt(i):
-                                    return self.parameter_names[i].find(item[:-1])!=-1
-                                toadd = list(filter( filt, list(range(npars)) ))
-                        elif item in self.parameter_names:
-                            toadd = [list(self.parameter_names).index(item)]
-                            self.selection_description = 'parameter %s' % item
-                        else:
-                            src = self.roimodel.find_source(item)
-                            self.selection_description = 'source %s'%src.name
-                            toadd = [i for i in range(npars) if self.parameter_names[i].startswith(src.name)]
-                        selected = selected.union(toadd )
-                    else:
-                        raise Exception('fit parameter select list item %s, type %s, must be either an integer or a string' %(item, type(item)))
-            except Exception as msg:
-                raise Exception('Fail parameter select: {}'.format(msg))
-            select = sorted(list(selected))
-            if len(select)==0:
-                raise Exception('nothing selected using "%s"' % selectpar)
-        
-        if exclude is not None:
-            if not hasattr(exclude, '__iter__'): exclude = [exclude]
-            all = set(range(npars)) if select is None else set(select)
-            select = list( all.difference(exclude))
-        t = np.zeros(len(self), bool)
-        t[select]=True
+        t = np.zeros(len(self.parameter_names), bool)
+        t[list(selected)]=True
         self.set_mask( t )
         if self.selection_description is None:
-            self.selection_description = 'parameters %s' % select
+            self.selection_description = 'parameters %s' % selected
         
     def __getitem__(self, i):
         """ access the ith parameter"""

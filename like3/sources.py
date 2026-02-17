@@ -4,10 +4,9 @@ $Header: /nfs/slac/g/glast/ground/cvs/pointlike/python/uw/like2/sources.py,v 1.5
 
 """
 import numpy as np
-from . skydir import SkyDir
+# from . skydir import SkyDir
+from astropy.coordinates import SkyCoord#, Angle
 from . import  spectral_models
-
-
 from . import response
 
 # convenience adapters 
@@ -97,7 +96,7 @@ class Source(object):
             self.free = np.array(self.model.free).copy() if self.model is not None else None  # save copy of initial free array to restore
             return
         elif hasattr(self.skydir, '__iter__'): #allow a tuple of (ra,dec)
-            self.skydir = SkyDir(*self.skydir)
+            self.skydir = SkyCoord(*self.skydir, unit='deg', frame='icrs')
         if 'model' not in kwargs or self.model is None:
             self.model=LogParabola(1e-14, 2.2, 0, 1e3)
             self.model.free[2:]=False
@@ -173,8 +172,10 @@ class Source(object):
         self.changed = True
 
     def __str__(self):
+        sdir = f'({self.skydir.ra.deg:07.3f}, {self.skydir.dec.deg:+05.3f})'
         return '\tname  : %s\n\tICRS  : %s\n\tmodel : %s\n\t\t%s' %\
-    (self.name, self.skydir, self.model.name, self.model.__str__(indent='\t\t'))
+    (self.name, sdir, self.model.name, self.model.__str__(indent='\t\t'))
+    
     def __repr__(self):
         return '%s.%s: \n%s' % (self.__module__,self.__class__.__name__ , self.__str__())
         
@@ -197,8 +198,8 @@ class PointSource(Source):
         ret = PointSource(**self.__dict__)
         ret.model = self.model.copy()
         return ret
-    def response(self, band, roi=None, **kwargs):
-        return response.PointResponse(self, band, roi, **kwargs)
+    def response(self, band,  ):
+        return response.PointResponse(self, band, )
 
 
 class ExtendedSource(Source):

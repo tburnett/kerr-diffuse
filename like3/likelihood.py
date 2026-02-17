@@ -24,6 +24,20 @@ class Likelihood:
         self.model = model
         self.data = data
         self.mp = model.parameters
+
+    def select(self, *select):
+        """ Select a subset of parameters for fittingself.maximize(model.values)
+        s
+        Parameters:
+        ----------
+        select : list of int or None
+            List of parameter indices to select
+        exclude : list of int or None
+            List of parameter indices to exclude
+            
+        """
+        self.model.parameters = self.model.parsubset(*select)
+        self.mp = self.model.parameters
  
     def log_like(self, x):
         """ Evaluate the log likelihood with a parameter set x """
@@ -40,8 +54,7 @@ class Likelihood:
         """  
         self.mp.values = x
         d = self.data
-        # m = self.model.flux(self.model.energies)*self.model.exposure_factor
-        # g = self.model.gradient(self.model.energies)*self.model.exposure_factor
+
         m = self.model.counts()
         g = self.model.count_gradient()
         gsum = ((d/m-1)*g).sum(axis=1)
@@ -76,7 +89,8 @@ class Likelihood:
 
         if x0 is None:
             x0 = self.model.parameters.values.copy()
-        x_fit, val, d = optimize.fmin_l_bfgs_b(self, x0,  bounds=self.model.bounds); 
+        initial_val,_ = self(x0)
+        x_fit, val, d = optimize.fmin_l_bfgs_b(self, x0,  bounds=self.model.parameters.bounds); 
         if d['warnflag'] != 0:
             raise RuntimeError('fit_plot: optimization failed: %s' % d['task'])
         # do this since final values are projections 
@@ -91,10 +105,10 @@ class Likelihood:
         self.fit_info = dict(
             cov = cov,
             sigs = sigs,
-            corr = cov / np.outer(sigs,sigs),
+            corr = (cov / np.outer(sigs,sigs)).round(2),
             grad = -gradient,
             x_fit = x_fit,
-            value = -val, 
+            delta_loglike = round(initial_val-val,2), 
 
             funcalls = d['funcalls'],)
         self.fit_info['ts_values'] = evaluate_ts()
@@ -123,19 +137,23 @@ class Likelihood:
             print(title, file=out)
 
         fmt, tup = '%-21s%6s%10s%10s', tuple('Name index value error(%)'.split())
-        if gradient:
-            grad = self.fit_info['grad']
-            fmt +='%10s'; tup += ('gradient',)
-        if ts:
-            ts_values = self.fit_info.get('ts_values', None)
-            if ts_values is not None:
-                fmt +='%10s'; tup += ('TS',)
+
+        mask = self.model.parameters.mask
+        if hasattr(self, 'fit_info'):
+            if gradient:
+                grad = self.fit_info['grad'][mask]
+                fmt +='%10s'; tup += ('gradient',)
+            if ts:
+                ts_values = self.fit_info.get('ts_values', None)[mask]
+                if ts_values is not None:
+                    fmt +='%10s'; tup += ('TS',)
         print(fmt %tup, file=out)
         prev=''
+        
 
-        index_array = np.arange(len(self.model.parameters.mask))[self.model.parameters.mask]
-        for index, (name, value, rsig) in enumerate(zip(self.model.parameter_names, 
-                                                        self.model_parameters,#self.fit_info['x_fit'], 
+        index_array = np.arange(len(mask))[mask]
+        for index, (name, value, rsig) in enumerate(zip(self.model.parameter_names[mask], 
+                                                        self.model_parameters,
                                                         self.model.parameters.uncertainties)):
             t = name.split('_')
             pname = t[-1]

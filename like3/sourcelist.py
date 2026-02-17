@@ -4,7 +4,7 @@ Set up and manage the model for all the sources in an ROI
 $Header: /nfs/slac/g/glast/ground/cvs/pointlike/python/uw/like2/roimodel.py,v 1.29 2018/01/27 15:37:17 burnett Exp $
 
 """
-import os, pickle
+
 import numpy as np
 import pandas as pd
 
@@ -22,23 +22,18 @@ class SourceList(list):
 
     def __init__(self, sources):
 
-        # clear if called again  (why?)
-        # while len(self)>0:
-        #     self.pop()
-            
-        # sources loaded by a subclass that must implement this function
         for source in sources:
             self.add_source(source)
         
         self.initialize()
 
-        print(self.summary())
+        # print(self.__repr__())
         self.selected_source = None
 
-    def summary(self):
+    def __repr__(self):
         ns = len(self)
         n_free = len(self.parameters)
-        return '%d total sources: %d free parameters' % ( ns,  n_free )
+        return f'{len(self)} sources, {len(self.parameters)} free parameters'
 
     def flux(self, energies):
         """ Compute flux values for given parameter set """
@@ -50,9 +45,11 @@ class SourceList(list):
     
     def gradient(self, energies):
         """ Retrun the gradient of the flux with respect to free parameters
-        """               
-        return np.vstack([source.model.gradient(energies)[source.model.free]*1.0
+        """    
+        energies = np.atleast_1d(energies)           
+        g = np.vstack([source.model.gradient(energies)[source.model.free]*1.0
                           for source in self])
+        return g [ self.parameters.mask]
        
 
     def initialize(self, **kw):
@@ -60,10 +57,10 @@ class SourceList(list):
         """
         self.parameters = parameterset.ParameterSet(self, **kw)
   
-    def parsubset(self, select=None, exclude=None):
+    def parsubset(self, *select):
         """ return a ParSubSet object with possible initial selection of a subset of the parameters
         """
-        return parameterset.ParSubSet(self, select, exclude)
+        return parameterset.ParSubSet(self, *select)
         
     
     # note that the following properties are dynamic, in case sources or their models change interactively
@@ -76,6 +73,7 @@ class SourceList(list):
         """ mask which defines variable sources: all global and local sources with at least one variable parameter 
         """
         return np.array([ np.any(s.model.free) for s in self])
+    
     @property 
     def bounds(self):
         """ fitter representation of applied bounds """
@@ -129,10 +127,11 @@ class SourceList(list):
                     return found(self[names.index(name)])
             not_found()
         try:
-            selected_source = self[names.index(source_name)]
+            k = names.index(source_name)
+            self.selected_source = self[k]
             #if self.selected_source is None or self.selected_source != selected_source:
             #    print 'selected source %s for analysis' % selected_source.name
-            return found(selected_source)
+            return found(self.selected_source)
         except:
             self.selected_source = None
             not_found()
@@ -191,28 +190,39 @@ class SourceList(list):
         self.initialize()
         return src, old_model
         
-            
-    # def add_sources(self, auxcat='plots/seedcheck/good_seeds.csv'):
-    #     """Add new sources from a csv file
-    #     Default assumes analysis by seedcheck
-    #     """
-    #     assert os.path.exists(auxcat), 'auxcat file %s not found' % auxcat
-    #     if os.path.splitext(auxcat)[1] != '.csv':
-    #         raise Exception('Only support csv files, not %s' % auxcat)
-    #     good_seeds = pd.read_csv(auxcat, index_col=0)
-    #     print('Check %d sources from file %s: ' % (len(good_seeds), auxcat), end=' ')
-    #     myindex = Band(12).index(self.roi_dir)
-    #     inside = good_seeds['index']==myindex
-    #     ni = sum(inside)
-    #     if ni>0:
-    #         print('%d inside ROI' % ni)
-    #     else:
-    #         print('No sources in ROI %04d' % myindex)
-    #     for name, s in good_seeds[inside].iterrows():
-    #         src = pickle.load(open('%s/seedcheck/%s.pickle' % (self.config.modeldir, name)))
-    #         try:
-    #             self.add_source(name=name, skydir=src.skydir, model=src.model)
-    #         finally: pass
-    #     return good_seeds[inside]
+    def list_sources(self):
+        """ print the list of sources in the model, with indication of which are free
+        """
+        for source in self:
+            print(source)
+        return
+    
+    @classmethod
+    def demo(cls,  src_key=2,) :
+        """ Create a simple model with one (or two) point sources 
+            0 : PLSuperExpCutoff source
+            1 : PowerLaw source
+            2 : both sources
+        """ 
+        ps = sources.PointSource(name='Pulsar', skydir=(0,0), 
+                        model=sources.PLSuperExpCutoff4(1e-11, 2., 0.7, 0.69),)  
+        
+        pl = sources.PointSource(name='Blazar', skydir=(10,0), 
+                        model=sources.LogParabola(4e-12, 2, 0, 1e3))
+        
+        pp = []
+        if src_key==0:
+            pp = [ps]
+        elif src_key==1:
+            pp = [pl]
+        else:
+            pp = [ps, pl]
+        model = cls(pp)
+
+        print(f'Model: {str(model)}')
+        return model
+
+
+
 
 
