@@ -44,7 +44,7 @@ class SourceList(list):
         return r
     
     def gradient(self, energies):
-        """ Retrun the gradient of the flux with respect to free parameters
+        """ Return the gradient of the flux with respect to free parameters
         """    
         energies = np.atleast_1d(energies)           
         g = np.vstack([source.model.gradient(energies)[source.model.free]*1.0
@@ -204,10 +204,10 @@ class SourceList(list):
             1 : PowerLaw source
             2 : both sources
         """ 
-        ps = sources.PointSource(name='Pulsar', skydir=(0,0), 
+        ps = sources.PointSource(name='Pulsar',  skydir=(0,0), frame='galactic',
                         model=sources.PLSuperExpCutoff4(1e-11, 2., 0.7, 0.69),)  
         
-        pl = sources.PointSource(name='Blazar', skydir=(10,0), 
+        pl = sources.PointSource(name='Blazar',skydir=(5,0), frame='galactic',
                         model=sources.LogParabola(4e-12, 2, 0, 1e3))
         
         pp = []

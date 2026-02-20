@@ -29,21 +29,22 @@ class PointResponse(HEALPix):
         self.source = source
         self.sdir = source.skydir
         self.band = band
-        self.r68 = band.r68
+        self.r68 = band.psf.r68
         super().__init__(nside=band.nside, order='ring', frame='galactic')
     
-    def evaluate(self):
+    def evaluate(self,  cpix=None, *,r68_radius=3):
         """Evaluate the PSF response at a given sky direction `sdir` (SkyCoord). 
-        Returns the HEALPix pixel indices and corresponding PSF values."""
+        Returns a tuple of HEALPix pixel indices and corresponding PSF values times the pixel area."""
         
-        cpix = self.cone_search_skycoord(self.sdir, Angle(3*self.r68, 'deg'))
+        if cpix is None:
+            cpix = self.cone_search_skycoord(self.sdir, Angle(r68_radius*self.r68, 'deg'))
         aa = self.sdir.separation(self.healpix_to_skycoord(cpix)).deg
-        vpix = np.array(list(map(self.band.psf, aa)))
+        vpix = np.array(list(map(self.band.psf, aa))) * self.pixel_area.value
         return cpix, vpix
 
-    def plot_response(self):
-        """Plot the PSF response as a function of angular separation from `sdir`, for pixels within 3*R68."""
-        cpix, vpix = self.evaluate()
+    def plot_response(self, *, r68_radius=3):
+        """Plot the PSF response as a function of angular separation from `sdir`, for pixels within `r68_radius`*R68."""
+        cpix, vpix = self.evaluate(r68_radius=r68_radius)
         aa = self.sdir.separation(self.healpix_to_skycoord(cpix)).deg
         
         fig, ax = plt.subplots(figsize=(6,4))
@@ -64,9 +65,9 @@ class PointResponse(HEALPix):
     def plot_psf_map(self, *, frame='galactic', **kwargs):
         """Plot the PSF response as a HEALPix map centered on `sdir`."""
         from utilities.skymaps import ZEAfigure
-        cpix, vpix = self.evaluate()
+        k,v = self.evaluate()
         pixmap = np.zeros(self.npix)
-        pixmap[cpix] = vpix
+        pixmap[k] = v
         pixmap[pixmap == 0] = np.nan  # Set zero values to NaN for log evaluation
         kw = dict(size=8*self.r68, pixelsize=self.r68/50,  fig=None, figsize=(6,5))
         kw.update(kwargs)

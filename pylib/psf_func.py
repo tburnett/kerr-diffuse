@@ -4,6 +4,7 @@ import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from pylib.binned_data import BandList
 from utilities.ipynb_docgen import show, show_fig
 
 
@@ -83,27 +84,37 @@ class PSFlist(list):
         plt.show()  
 
     @classmethod
-    def demo(cls, idx=8):
-        p = cls()[idx]
-        show(f"""###  PSF demo: compare with equivalent Gaussian
-             Select PSF index {idx}: {p} """)
-        # radial functions
-        sigma = p.corresponding_sigma()
-        norm = lambda r: 1/(2*np.pi*sigma**2) * np.exp(-(r/sigma)**2/2) # corresponding Gaussian
-        psf = lambda r: Like(p).pdf(r).clip(1e-4) # normalized psf values
-        disk = lambda r: np.where( r<1, 1/(np.pi) , 0) # unit disk radius 1
+    def demo_df(cls,):
+        """
+        Create a DataFrame of PSF functions for each band, to be used in BandList"""
+        plist = cls(event_type=0)[:12]
+        df = pd.DataFrame(plist)
+        df.drop(['event_type','r68'], axis=1, inplace=True)
+        df['psf'] = plist
+        return df
 
-        # Set up grid for integration
-        R,grid = 1.5,201 # maximum radius, number of bins
-        x = y = np.linspace(-R,R,grid)
-        dx = x[1]-x[0]
-        xx,yy = np.meshgrid(x,y)
-        rr = np.sqrt(xx**2 + yy**2)#.clip(0,R)
+    # @classmethod
+    # def demo(cls, idx=8):
+    #     p = cls()[idx]
+    #     show(f"""###  PSF demo: compare with equivalent Gaussian
+    #          Select PSF index {idx}: {p} """)
+    #     # radial functions
+    #     sigma = p.corresponding_sigma()
+    #     norm = lambda r: 1/(2*np.pi*sigma**2) * np.exp(-(r/sigma)**2/2) # corresponding Gaussian
+    #     psf = lambda r: Like(p).pdf(r).clip(1e-4) # normalized psf values
+    #     disk = lambda r: np.where( r<1, 1/(np.pi) , 0) # unit disk radius 1
 
-        radial_integral = lambda z : np.sum(z) * dx**2
+    #     # Set up grid for integration
+    #     R,grid = 1.5,201 # maximum radius, number of bins
+    #     x = y = np.linspace(-R,R,grid)
+    #     dx = x[1]-x[0]
+    #     xx,yy = np.meshgrid(x,y)
+    #     rr = np.sqrt(xx**2 + yy**2)#.clip(0,R)
 
-        show(f"""Check Integrals: unit disk, {radial_integral(disk(rr)):.3f},
-            PSF: {radial_integral(psf(rr)):.3f}, 
-            Norm: {radial_integral(norm(rr)):.3f}""")
+    #     radial_integral = lambda z : np.sum(z) * dx**2
 
-        show_fig(p.plot_w_gaussian, maxr=4*sigma);   
+    #     show(f"""Check Integrals: unit disk, {radial_integral(disk(rr)):.3f},
+    #         PSF: {radial_integral(psf(rr)):.3f}, 
+    #         Norm: {radial_integral(norm(rr)):.3f}""")
+
+    #     show_fig(p.plot_w_gaussian, maxr=4*sigma);   

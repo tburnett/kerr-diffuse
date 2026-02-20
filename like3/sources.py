@@ -96,7 +96,7 @@ class Source(object):
             self.free = np.array(self.model.free).copy() if self.model is not None else None  # save copy of initial free array to restore
             return
         elif hasattr(self.skydir, '__iter__'): #allow a tuple of (ra,dec)
-            self.skydir = SkyCoord(*self.skydir, unit='deg', frame='icrs')
+            self.skydir = SkyCoord(*self.skydir, unit='deg', frame=kwargs.get('frame', 'icrs'))
         if 'model' not in kwargs or self.model is None:
             self.model=LogParabola(1e-14, 2.2, 0, 1e3)
             self.model.free[2:]=False
