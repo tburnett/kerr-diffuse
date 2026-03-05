@@ -189,13 +189,14 @@ class BandList(list):
         self.sources = source_model
         self.parameters = source_model.parameters
         self.parameter_names = source_model.parameter_names
+
         # get energies and exposure factor for easy access
         energies = [band.energy for band in self]
         self.exposure_factor = np.full_like(energies,1e13) * energies/100  # simple energy-dependent exposure
 
 
     def counts(self):
-        """ Convert flux to counts per pixel using the exposure factor for each band
+        """ Convert flux to counts per band using the exposure factor for each band
         """
         return np.array([band.source_model.flux(band.energy) * self.exposure_factor[i] 
                          for i, band in enumerate(self)])

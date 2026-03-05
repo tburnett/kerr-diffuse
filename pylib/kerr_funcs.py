@@ -172,7 +172,9 @@ class KerrModel(dict):
             
         print(f"""Loaded Kerr model from "{filename}":
             {len(self)} bands {self[(0,4)]} ... {self[(3,11)]}
-            {self.photons.sum().astype(int):,d} photons""")
+            {self.photons.sum().astype(int):,d} photons
+            {len(self.pix):,d} pixels
+            """)
         
         if ring:
             for b in self.values():
