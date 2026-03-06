@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from astropy.coordinates import SkyCoord, Angle
 from astropy_healpix import HEALPix 
+from pathlib import Path
 
 
 class KerrModel(dict):
@@ -122,16 +123,18 @@ class KerrModel(dict):
          
        
 
-    def __init__(self, root='files/from-kerr/toby_v1', *, ring=False):
+    def __init__(self, root, *, ring=False):
         """ 
         Load Kerr model from files root+'.npz' and root+'.pickle'
         root : path root for files
         ring : if True, convert pixel indices to RING ordering"""
 
         import pickle
-        filename, meta = root+'.npz', root+'.pickle'
+        root = Path(root).expanduser()
+  
+        filename, meta = root.with_suffix('.npz'), root.with_suffix('.pickle')
         super().__init__()
-        self.name = root.split('/')[-1]
+        self.name = root.name
         self.ring = ring
 
         with np.load(filename) as f:
