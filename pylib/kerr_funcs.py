@@ -6,7 +6,10 @@ from astropy_healpix import HEALPix
 from pathlib import Path
 
 
-class KerrModel(dict):
+class PixelTable(dict):
+    """ Manage a pixel table for a Kerr diffuse model, with methods to access and visualize the data in various ways.
+    
+    """
 
     class Band(HEALPix):
 
@@ -60,6 +63,9 @@ class KerrModel(dict):
 
             if component=='resid':
                 values = self.photons - model()
+            elif component=='sigma': #normalized residual
+                d, m = self.photons, model()
+                return (d-m)/np.sqrt(m.clip(1e-2,None)) # avoid div by zero
             elif component=='model':
                 values = model()
             else:
@@ -106,20 +112,31 @@ class KerrModel(dict):
                 afig.colorbar(label='log10(counts)' if log else 'counts', shrink=shrink)
             return afig   
 
-        def zea_plot(self, component, center, *, nside=256, figsize=(8,8), size=5, fig=None,
+        def zea_plot(self, component, center, *, nside=256, figsize=(8,8), 
+                    pixelsize=0.05, size=5, fig=None,
                      cmap='viridis', colorbar=True, title=None,**kwargs):
             from utilities.skymaps import ZEAfigure
 
-            mp = self.ring_map(nside, component=component)
-            mp[mp==0] = np.nan
-
-
-            zfig = ZEAfigure(center, size=size, fig=fig, figsize=figsize, 
+            zfig = ZEAfigure(center, size=size, fig=fig, figsize=figsize, pixelsize=pixelsize,
                              title=f'{component} for {self}' if title is None else title) 
-            zfig.imshow(np.log10(mp), cmap=cmap, **kwargs)
+            
+            if component is not None:
+                mp = self.ring_map(nside, component=component)
+                mp[mp==0] = np.nan
+                zfig.imshow(np.log10(mp), cmap=cmap, **kwargs)
+
             if colorbar:
                 zfig.colorbar(label='log10(counts)', shrink=0.7)
             return zfig    
+        
+        def get_outliers(self, sigma_min=4):
+            """ Return a dataframe with nested pixel indeces, data, model, and sigma for all pixels with residuals > sigma_min """
+            
+            d, m = self.ring_map(None, 'data',), self.ring_map(None, 'model')
+            r = (d-m)/np.sqrt(m.clip(1e-2, None))
+            out = r > sigma_min
+            pix = np.arange(12*self.nside**2)
+            return pd.DataFrame( dict(pixel=self.ring_to_nested(pix[out]), data=d[out], model=m[out], sigma=r[out] )) 
          
        
 
@@ -215,14 +232,16 @@ class KerrModel(dict):
         mp = self.ring_map(nside, component=component, frame=frame)
         mp[mp==0] = np.nan
 
-        afig = AITfigure(fig=fig, figsize=figsize, title=f'{component} for KerrModel {self.name}')
+        afig = AITfigure(fig=fig, figsize=figsize, title=f'{component} for PixelTable {self.name}')
         afig.imshow(np.log10(mp), cmap=cmap, **kwargs)
         if colorbar:
             afig.colorbar(label='log10(counts)', shrink=shrink)
         return afig
     
-    def zea_plot(self, center, *, component='data', nside=256, figsize=(8,8), size=5, fig=None,
-                    frame='icrs', proj='ZEA', cmap='viridis', colorbar=True, title=None,**kwargs):
+    def zea_plot(self, center, *, component='data', nside=256, 
+                figsize=(8,8), size=5, pixelsize=0.1, fig=None,
+                frame='icrs', proj='ZEA', cmap='viridis', 
+                colorbar=True, title=None,**kwargs):
         from utilities.skymaps import ZEAfigure
 
         mp = self.ring_map(nside, component=component, frame=frame)
@@ -321,11 +340,13 @@ class ResidualPlotter:
             rnorm = self.rnorm
 
         nfit = norm.fit(rnorm[~np.isnan(rnorm)])
-        ax.hist(rnorm, bins=25, range=ylim, density=True, histtype='stepfilled', alpha=0.5,)#  label=f'N={len(rnorm)}' )
+        ax.hist(rnorm.clip(*ylim), bins=25, range=ylim, density=True, 
+                histtype='stepfilled', alpha=0.5,)
         ax.plot((x:=np.linspace(*ylim,num=25)), norm.pdf(x, *nfit), 'r-', lw=4,
             label =rf'$\mu$={nfit[0]:.2f}'+'\n'+ rf'$\sigma$={nfit[1]:.2f}')
         ax.legend(fontsize=10, loc='lower center')
-        ax.set(xlabel=r'residual ($\sigma$ units)', ylabel='density', yscale='log',xlim=ylim, ylim=(1e-4, 0.5))
+        ax.set(xlabel=r'residual ($\sigma$ units)', ylabel='density', 
+               yscale='log',xlim=ylim, ylim=(1e-4, 0.5))
 
     def plots(self):
 
@@ -510,7 +531,119 @@ class KerrDataFile:
     def to_fits(cls, kerrfile, fitsfile, *, ring=False):
         """ Translage Kerr format to FITS
         """
-        km = KerrModel(kerrfile, ring=ring )
+        km = PixelTable(kerrfile, ring=ring )
         cls(km).writeto(fitsfile)
 
+def grouper(points, radius,):
+    """Group a SkyCoord array of points into connected clusters using a separation threshold.
 
+    Parameters
+    ----------
+    points : Skycoord array
+    radius : float
+        Maximum pairwise separation, in degrees, for two points to be considered neighbors.
+
+    Returns
+    -------
+    list[np.ndarray]
+        A list of clusters, where each cluster is an array of point indices.
+    """
+
+    if radius <= 0:
+        raise ValueError("radius must be > 0")
+
+    n_points = len(points)
+    if n_points == 0:
+        return []
+
+    unvisited = np.ones(n_points, dtype=bool)
+    clusters = []
+
+    # Build connected components where edges join points within `radius`.
+    for seed in range(n_points):
+        if not unvisited[seed]:
+            continue
+
+        stack = [seed]
+        unvisited[seed] = False
+        cluster = []
+
+        while stack:
+            i = stack.pop()
+            cluster.append(i)
+
+            remaining = np.flatnonzero(unvisited)
+            if len(remaining) == 0:
+                continue
+
+            dists = points[i].separation(points[remaining]).deg 
+            
+            neighbors = remaining[dists <= radius]
+            if len(neighbors):
+                unvisited[neighbors] = False
+                stack.extend(neighbors.tolist())
+
+        clusters.append(np.array(cluster, dtype=int))
+
+    return clusters
+
+def plot_residuals_for_given_energy(pixel_table, energy_index):
+    """ Plot residuals vs model count predictions for a given energy index across all four PSF bands.
+    """
+    def mdplot(band,ax=None):
+        d = band.photons; m = band.diffuse+band.ptsrc+band.sunmoon
+        fig, ax = plt.subplots(figsize=(5,5)) if ax is None else (ax.figure, ax)
+        ax.scatter(m.clip(1,1e4), ((d-m)/np.sqrt(m)).clip(-5,10), s=2);
+        ax.set(xscale='log',yscale='linear',xlabel='model counts', ylabel=r'residual ($\sigma$ units)', )
+        ax.text(1,8, f'{band.psf}\nnside {band.nside}', fontsize=14)
+        
+    fig, axx = plt.subplots(2,2, figsize=(12,8), sharey=True, sharex=True)
+    for i,ax in enumerate(axx.flat):
+        mdplot(pixel_table(i,energy_index),ax)
+        if i<2: ax.set(xlabel='')
+        if i%2==1: ax.set(ylabel='')
+        ax.axhline(0, color='0.5', ls='--', lw=2)
+    fig.suptitle(pixel_table(0,energy_index).energy, fontsize=16  )
+    return fig
+
+def histograms_of_residuals_for_given_energy(pixel_table, energy_index):
+    fig, axx = plt.subplots(1,4, figsize=(12,3),sharey=True)
+    for i, ax in enumerate(axx.flat):
+        pt = pixel_table(i, energy_index)
+        ResidualPlotter( pt, ).residual_hist(ax=ax,)
+        ax.text(0.05, 0.9, f'PSF{i}', transform=ax.transAxes, fontsize=12, ha='left')
+        if i>0: ax.set_ylabel('')
+    fig.suptitle(f'Residual histograms for {pixel_table(0,energy_index).energy} ', fontsize=14)
+    return fig
+
+class ResidualPoints:
+    
+    def __init__(self, pixel_table, energy_index, sigma_min=5):
+        
+        self.bands = [pixel_table(i, energy_index) for i in range(4)]
+        self.sigma_min = sigma_min
+
+        dff = []
+        for ie,band in enumerate(self.bands):
+
+
+            df = band.get_outliers(self.sigma_min)
+            skyc = band.healpix_to_skycoord(df.pixel)
+            glon = skyc.galactic.l.deg; glon[glon>180] -= 360
+            df['glon'] = glon
+            df['glat'] = skyc.galactic.b.deg
+            df['psf'] = ie 
+            df['nside'] = band.nside
+            dff.append(df)
+        self.df = pd.concat(dff)
+        self.skycoord = SkyCoord(self.df.glon, self.df.glat, unit='deg', frame='galactic')
+
+
+    def ait_plot(self):
+        from utilities.skymaps import AITfigure
+        band=self.band
+        afig = AITfigure(figsize=(12,6), 
+                title=rf"""{band.psf}: {len(self.points)} {band.energy} residuals > {self.sigma_min} $\sigma$""")
+        (afig.scatter(self.points, marker='o',s=5*np.sqrt(self.df.data-self.df.model), color='yellow')
+        .show()
+        )
