@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from pathlib import Path
+from importlib import reload
+from utilities.ipynb_docgen import show, show_fig, show_date
 np.set_printoptions(linewidth=120)
 
 def set_theme(argv):
@@ -34,6 +36,8 @@ def set_theme(argv):
 
 if 'dark' in sys.argv:
     dark_mode = set_theme(sys.argv)
+if 'date' in sys.argv:
+    show_date()
 
 def axis_kw(axis, d):
     return dict( (axis+k, v) for k,v in d.items() )

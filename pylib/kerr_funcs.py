@@ -7,11 +7,14 @@ from pathlib import Path
 
 
 class PixelTable(dict):
-    """ Manage a pixel table for a Kerr diffuse model, with methods to access and visualize the data in various ways.
+    """ Manage a pixel table for a Kerr diffuse model, with methods to access and visualize the data
+      in various ways.
     
     """
 
     class Band(HEALPix):
+        """ A band of the Kerr model, defined by an event type PSF and energy range, 
+        with associated photon data and model components."""
 
         def __init__(self, meta):
             self.psf, self.e0, self.e1, nside, self.nocc = meta
@@ -125,8 +128,8 @@ class PixelTable(dict):
                 mp[mp==0] = np.nan
                 zfig.imshow(np.log10(mp), cmap=cmap, **kwargs)
 
-            if colorbar:
-                zfig.colorbar(label='log10(counts)', shrink=0.7)
+                if colorbar:
+                    zfig.colorbar(label='log10(counts)', shrink=0.7)
             return zfig    
         
         def get_outliers(self, sigma_min=4):
@@ -139,7 +142,6 @@ class PixelTable(dict):
             return pd.DataFrame( dict(pixel=self.ring_to_nested(pix[out]), data=d[out], model=m[out], sigma=r[out] )) 
          
        
-
     def __init__(self, root, *, ring=False):
         """ 
         Load Kerr model from files root+'.npz' and root+'.pickle'
@@ -158,7 +160,7 @@ class PixelTable(dict):
             # print('keyes', f.keys())
             self.diffuse = f['diffuse']
             self.ptsrc  = f['pointsources']
-            self.photons = f['counts']
+            self.photons = f['counts'].astype(np.int32)
             self.pix = f['indices']
             if 'extendedsources' in f:
                 self.extsrc = f['extendedsources']
@@ -202,13 +204,10 @@ class PixelTable(dict):
 
             # it seems that the Band arrays are copies. So copy back pix changes
             for b in self.values():
-                key = b.key
-                nocc = b.nocc
-                start = sum(self[k].nocc for k in self if k<key)
-                # self.diffuse[start:start+nocc] = b.diffuse
-                # self.ptsrc[start:start+nocc] = b.ptsrc
-                # self.photons[start:start+nocc] = b.photons
-                self.pix[start:start+nocc] = b.pix
+                # key = b.key
+                # nocc = b.nocc
+                start = sum(self[k].b.nocc for k in self if k<b.key)
+                self.pix[start:start+b.nocc] = b.pix
         
         
 
@@ -328,7 +327,7 @@ class ResidualPlotter:
             ax.set_title('Percent residuals with polynomial fit')
             # ax.legend()
 
-    def residual_hist(self, ax=None, rnorm=None, ylim=np.array([-5,5])):
+    def residual_hist(self, ax=None, rnorm=None, ylim=np.array([-5,5]), legend_fontsize=14):
         """ax : optional axis to plot on
         rnorm : optional residuals to plot: if None, use self.rnorm
         """
@@ -344,7 +343,7 @@ class ResidualPlotter:
                 histtype='stepfilled', alpha=0.5,)
         ax.plot((x:=np.linspace(*ylim,num=25)), norm.pdf(x, *nfit), 'r-', lw=4,
             label =rf'$\mu$={nfit[0]:.2f}'+'\n'+ rf'$\sigma$={nfit[1]:.2f}')
-        ax.legend(fontsize=10, loc='lower center')
+        ax.legend(fontsize=legend_fontsize, loc='lower center')
         ax.set(xlabel=r'residual ($\sigma$ units)', ylabel='density', 
                yscale='log',xlim=ylim, ylim=(1e-4, 0.5))
 
@@ -370,14 +369,8 @@ class ResidualPlotter:
     
         fig, (ax1,ax2) = plt.subplots(ncols=2, figsize=(15,4), gridspec_kw={'width_ratios': [2.5, 1]})
         ylim=np.array([-5,5])
-
-        # ax1.scatter(model, self.rnorm.clip(*ylim),  s=10, )
-        # ax1.axhline(0, color='0.5', ls='--', lw=2)
-        # ax1.set(xlabel='model counts/pixel', ylabel=r'residual ($\sigma$ units)', xscale='log', 
-        #    ylim = ylim, yscale='linear') 
         residual_scatter(self.model, self.rnorm, ax=ax1, ylim=ylim)
-        # ax1.set_title('Residuals vs model counts/pixel')
-        
+
         self.residual_hist(ax=ax2, ylim=ylim)
         plt.show()
 
@@ -407,7 +400,7 @@ def multi_residual_plotter(self, nside=64):
             ax.set_visible(False)
             continue
         rp = ResidualPlotter(band, nside=nside)
-        rp.residual_hist(ax=ax) 
+        rp.residual_hist(ax=ax, legend_fontsize=10) 
         ax.set(ylabel='', xlabel='', yticks=[])
     ax.set(ylim=(1e-4, 0.5)) 
     plt.show()
@@ -458,17 +451,17 @@ class KerrDataFile:
         kerrmodel : 
         order
         """
-        self.kerrmodel = kerrmodel
+        self.pixeltable = kerrmodel
         self.order = order
 
     def __repr__(self):
-        return f'KerrDataFile for {self.kerrmodel}'
+        return f'KerrDataFile for {self.pixeltable}'
     
 
     def skymap_hdu(self):
         """ create a skymap HDU            
         """
-        km = self.kerrmodel
+        km = self.pixeltable
 
         # make the channel list
         et = km.meta_df.event_type.apply(lambda x: int(x[-1])+2)
@@ -487,7 +480,7 @@ class KerrDataFile:
         hdu.header.update(
             PIXTYPE='HEALPIX',
             INDXSCHM='SPARSE',
-            ORDERING='RING' if self.kerrmodel.ring else 'NESTED',
+            ORDERING='RING' if self.pixeltable.ring else 'NESTED',
             COORDSYS='GAL',
             BANDSHDU='BANDS',
             AXCOLS='E_MIN,E_MAX',
@@ -497,7 +490,7 @@ class KerrDataFile:
     def band_hdu(self, version=5):
         """ create a bands HDU
         """
-        df = self.kerrmodel.meta_df
+        df = self.pixeltable.meta_df
         band_cols = [
             fits.Column(name='NSIDE', format='J', array=df.nside),
             fits.Column(name='E_MIN', format='D', array=df.emin*1e+3, unit='keV'),
@@ -515,7 +508,7 @@ class KerrDataFile:
               self.skymap_hdu(), 
               self.band_hdu()] 
         fits.HDUList(hdus).writeto(filename, overwrite=overwrite)
-        print(f'wrote file {filename}' + (f' (ring={self.kerrmodel.ring})' if self.kerrmodel.ring else ''))
+        print(f'wrote file {filename}' + (f' (ring={self.pixeltable.ring})' if self.pixeltable.ring else ''))
 
     @classmethod
     def readfrom(cls, filename, kerrmodel):
@@ -528,11 +521,11 @@ class KerrDataFile:
 
     
     @classmethod
-    def to_fits(cls, kerrfile, fitsfile, *, ring=False):
-        """ Translage Kerr format to FITS
+    def to_fits(cls, kerrfile, fitsfile, *, ring=False, overwrite=True):
+        """ Translate Kerr format to FITS
         """
         km = PixelTable(kerrfile, ring=ring )
-        cls(km).writeto(fitsfile)
+        cls(km).writeto(fitsfile, overwrite=overwrite)
 
 def grouper(points, radius,):
     """Group a SkyCoord array of points into connected clusters using a separation threshold.
@@ -594,7 +587,7 @@ def plot_residuals_for_given_energy(pixel_table, energy_index):
         d = band.photons; m = band.diffuse+band.ptsrc+band.sunmoon
         fig, ax = plt.subplots(figsize=(5,5)) if ax is None else (ax.figure, ax)
         ax.scatter(m.clip(1,1e4), ((d-m)/np.sqrt(m)).clip(-5,10), s=2);
-        ax.set(xscale='log',yscale='linear',xlabel='model counts', ylabel=r'residual ($\sigma$ units)', )
+        ax.set(xscale='log',yscale='linear',xlabel='model counts/pixel', ylabel=r'residual ($\sigma$ units)', )
         ax.text(1,8, f'{band.psf}\nnside {band.nside}', fontsize=14)
         
     fig, axx = plt.subplots(2,2, figsize=(12,8), sharey=True, sharex=True)
@@ -607,13 +600,14 @@ def plot_residuals_for_given_energy(pixel_table, energy_index):
     return fig
 
 def histograms_of_residuals_for_given_energy(pixel_table, energy_index):
-    fig, axx = plt.subplots(1,4, figsize=(12,3),sharey=True)
+    fig, axx = plt.subplots(2,2, figsize=(8,6),sharey=True, sharex=True)
     for i, ax in enumerate(axx.flat):
         pt = pixel_table(i, energy_index)
         ResidualPlotter( pt, ).residual_hist(ax=ax,)
         ax.text(0.05, 0.9, f'PSF{i}', transform=ax.transAxes, fontsize=12, ha='left')
-        if i>0: ax.set_ylabel('')
-    fig.suptitle(f'Residual histograms for {pixel_table(0,energy_index).energy} ', fontsize=14)
+        if i%2>0: ax.set_ylabel('')
+        if i<2: ax.set_xlabel('')
+    fig.suptitle(f'Residual histograms for {pixel_table(0,energy_index).energy} ', fontsize=18)
     return fig
 
 class ResidualPoints:
@@ -647,3 +641,39 @@ class ResidualPoints:
         (afig.scatter(self.points, marker='o',s=5*np.sqrt(self.df.data-self.df.model), color='yellow')
         .show()
         )
+
+    def clusterer(self, radius=1.5, ptmin=2):
+        r""" Group the $\sigma>5$ residuals into clusters of nearby points
+            Cluster separation threshold 1.5 deg. Select those with at least 2 points
+        """
+        self.cluster_idx = grouper(self.skycoord, radius)
+        # select only clusters with more than 1 point
+        clgt1 = list(filter(lambda x: len(x)>=ptmin, self.cluster_idx))
+        # make a list of the skycoords of the clusters, choosing the point with largest flux as the cluster center
+        cld = dict() 
+        for idx, cluster in enumerate(clgt1):
+            t = self.df.iloc[clgt1[idx]].sort_values('model', ascending=False).iloc[0]
+            cld[idx] = dict(glon=round(t.glon,3), glat=round(t.glat,3), n=len(clgt1[idx]), 
+                            sigma=round(t.sigma,1), data=t.data.astype(int), model=round(t.model,1), ids=clgt1[idx])  
+            
+        self.cldf = pd.DataFrame.from_dict(cld, orient='index')['glon glat data model sigma n ids'.split()]
+
+    def zea_plot(self, center, size=5, **kwargs):
+        """ Plot the residual clusters in a ZEA projection centered on the given coordinates"""
+        from utilities.skymaps import ZEAfigure
+
+        zfig = ZEAfigure(center, size=size, fig=None, figsize=(8,8), title='Residual clusters', frame='galactic')
+        zfig.scatter(self.skycoord, s=self.df.sigma*10, c=self.df.sigma, cmap='jet', vmin=5, **kwargs)
+        zfig.colorbar(label=r'$\sigma$', shrink=0.7)
+        return zfig
+    
+    def ait_cluster_plot(self, **kwargs):
+        """ Plot the residual clusters in an AIT projection"""
+        from utilities.skymaps import AITfigure
+        self.clpoints = SkyCoord(self.cldf.glon, self.cldf.glat, unit='deg', frame='galactic')
+        kw = dict(figsize=(10,10), title=f"Residual clusters with >{self.sigma_min} sigma and >1 point")
+        kw.update(kwargs)
+        (AITfigure(**kw)
+            .scatter(self.clpoints, s=self.cldf.n*20, c=self.cldf.sigma, cmap='jet', vmin=5)
+            .colorbar(label=r'$\sigma$', shrink=0.4)
+            .show())
