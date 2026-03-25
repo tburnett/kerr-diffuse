@@ -1,34 +1,49 @@
-"""
-Source classes
-$Header: /nfs/slac/g/glast/ground/cvs/pointlike/python/uw/like2/sources.py,v 1.53 2018/01/27 15:37:17 burnett Exp $
+"""Source abstractions and spectral-model adapters for like3.
 
+This module defines:
+- convenience constructors for common spectral model shapes,
+- `Source` base class with model conversion and bounds setup,
+- concrete `PointSource`, `ExtendedSource`, and `GlobalSource` variants.
 """
 import numpy as np
 # from . skydir import SkyDir
 from astropy.coordinates import SkyCoord#, Angle
-from . import  spectral_models
+from . import spectral_models
 from . import response
 
 # convenience adapters 
 def LogParabola(*pars):
+    """Create a LogParabola model with default free-mask settings."""
     model = spectral_models.LogParabola(p=pars, free=[True,True,False,False])
     return model
 def PowerLaw(*pars):   
+    """Create a PowerLaw model."""
     model = spectral_models.PowerLaw(p=pars)
     return model
 def ExpCutoff(*pars):  
+    """Create an ExpCutoff model with default free-mask settings."""
     model = spectral_models.ExpCutoff(p=pars, free=[True, True, False])
     return model
 def PLSuperExpCutoff(*pars):  
+    """Create a PLSuperExpCutoff model with default free-mask settings."""
     model = spectral_models.PLSuperExpCutoff(p=pars, free=[True,True,False,False])
     return model
 def PLSuperExpCutoff4(*pars):  
+    """Create a PLSuperExpCutoff4 model with default free-mask settings."""
     model = spectral_models.PLSuperExpCutoff4(p=pars, free=[True,True,False,False])
     return model
 
-def Constant(*pars, **kw):   return spectral_models.Constant(p=pars, **kw)
-def FBconstant(f,b, **kw): return spectral_models.FrontBackConstant(f,b, **kw)
-def PSR_default(): return spectral_models.PLSuperExpCutoff4( free=[True,True, True, False])
+def Constant(*pars, **kw):
+    """Create a Constant model."""
+    return spectral_models.Constant(p=pars, **kw)
+
+def FBconstant(f,b, **kw):
+    """Create a FrontBackConstant model."""
+    return spectral_models.FrontBackConstant(f,b, **kw)
+
+def PSR_default():
+    """Create default pulsar-like PLSuperExpCutoff4 configuration."""
+    return spectral_models.PLSuperExpCutoff4(free=[True,True,True,False])
     
 def ismodel(model):
     """ check that model is an instance of Models.Model"""
@@ -47,19 +62,6 @@ def set_default_bounds( model, force=False):
     def to_internal(fun, values):
         return [fun(value) if value is not None else None for value in values]
     
-    # for pname, mp in zip(model.param_names, model.mappers):
-    #     plim = (None,None)
-    #     try:
-    #         plim = dict(
-    #             Index=(-1.5, 3.5), 
-    #             Norm=(10**-18, 10**-7),
-    #             Scale=(0.001, 4.0),
-    #             beta=(-0.1, 1.), 
-    #             Cutoff=(100., 2e5),
-    #             )[pname.split('_')[0]]
-    #     except: pass
-    #     bounds.append( to_internal(mp.tointernal, plim) )
-
     for pname, mp in zip(model.param_names, model.mappers):
         lim = model.default_limits.get(pname, None)
         if lim is not None:
@@ -68,33 +70,27 @@ def set_default_bounds( model, force=False):
         else:
             bounds.append( (None, None) )
 
-    model.bounds = np.array(bounds) # convert to array so can mask with free
+    # Convert to ndarray so the free-parameter mask can index bounds directly.
+    model.bounds = np.array(bounds)
 
 class Source(object):
-    """ base class for all pointlike/like2 sources
-    Subclasses are:
-        PointSource
-        ExtendedSource
-        GlobalSource
-        
-    All instances have the folloiwng properties:
-    * model, a Models.Model object
-    * ICRS :  (ra,dec)  | None]
-        
-    Subclasses must implement a function response(band), which, given a EnergyBand parameter, 
-        returns a Response object appropriate for the source. This provides the angular dependence 
-        of the response specific the band energy and event type.
-    
+    """Base class for all source types used by like3.
+
+    Subclasses must implement `response(band, ...)` and provide source-type-
+    specific behavior (point, extended, global/diffuse).
     """
     def __init__(self, **kwargs):
+        """Initialize source metadata and normalize model representation."""
         self.__dict__.update(kwargs)
         self.changed = False # flag for bandlike
         assert self.name is not None, 'bad source name'
         self.name = str(self.name) # force to be a string
         if self.skydir is None:
-            # global source: keep original model
+            # Global source: keep original model setup and exit early.
             self.free = np.array(self.model.free).copy() if self.model is not None else None  # save copy of initial free array to restore
             return
+        elif isinstance(self.skydir, SkyCoord):
+            pass # already a SkyCoord, nothing to do
         elif hasattr(self.skydir, '__iter__'): #allow a tuple of (ra,dec)
             self.skydir = SkyCoord(*self.skydir, unit='deg', frame=kwargs.get('frame', 'icrs'))
         if 'model' not in kwargs or self.model is None:
@@ -110,7 +106,8 @@ class Source(object):
                 
         if self.model.name=='PowerLaw':
             # convert from PowerLaw to LogParabola
-            par,sig = self.model.statistical()
+            stats = self.model.statistical()
+            par, sig = stats[:2]
             free = self.model.free[:]
             self.model = LogParabola(*(list(par)+[0, self.model.e0]))
             self.model.free[:2] = free
@@ -156,23 +153,25 @@ class Source(object):
     def get_spectral_model(self):
         return self.model
     def set_spectral_model(self, newmodel):
-        t =self.model
         self.model = newmodel
-        return t
+        self.changed = True
     spectral_model = property(get_spectral_model, set_spectral_model)
 
     def freeze(self, parname, value=None):
+        """Freeze one model parameter and optionally force its value."""
         self.model.freeze(parname)
         if value is not None: self.model.setp(parname, value)
         self.changed=True
         #assert sum(self.model.free)>0, 'cannot freeze all parameters this way'
 
     def thaw(self, parname):
+        """Unfreeze one model parameter."""
         self.model.freeze(parname, freeze=False)
         self.changed = True
 
     def __str__(self):
-        sdir = f'({self.skydir.ra.deg:07.3f}, {self.skydir.dec.deg:+05.3f})'
+        sdir = 'None' if self.skydir is None\
+                    else f'({self.skydir.icrs.ra.deg:07.3f}, {self.skydir.icrs.dec.deg:+05.3f})'
         return '\tname  : %s\n\tICRS  : %s\n\tmodel : %s\n\t\t%s' %\
     (self.name, sdir, self.model.name, self.model.__str__(indent='\t\t'))
     
@@ -188,21 +187,31 @@ class Source(object):
         return self.skydir is None
 
 class PointSource(Source):
+    """Point-like source with PSF-based response construction."""
+
     def __init__(self, **kwargs):
         kwargs.update(spatial_model=None) # allow test for extent (no extent!)
         super(PointSource, self).__init__(**kwargs)
+
     def near(self, otherdir, distance=10):
-        return self.skydir.difference(otherdir) < np.radians(distance)
-    def copy(self):
+        """Return True if separation from `otherdir` is below `distance` (deg)."""
+        return self.skydir.separation(otherdir).deg < distance
+
+    def copy(self, **kwargs):
         """ return a new PointSource object, with a copy of the model, others"""
-        ret = PointSource(**self.__dict__)
+        kw = self.__dict__.copy()
+        kw.update(kwargs)
+        ret = PointSource(**kw)
         ret.model = self.model.copy()
         return ret
+
     def response(self, band,  ):
+        """Construct point-source response object for a given band."""
         return response.PointResponse(self, band, )
 
 
 class ExtendedSource(Source):
+    """Extended source with spatial model (`dmodel`) and convolved response."""
 
     #def __str__(self):
     #    return self.name + ' '+ self.model.name \
@@ -213,7 +222,8 @@ class ExtendedSource(Source):
  
   
     def near(self, otherdir, distance=10):
-        return self.skydir.difference(otherdir) < np.radians(distance)
+        """Return True if separation from `otherdir` is below `distance` (deg)."""
+        return self.skydir.separation(otherdir).deg < distance
         
     def copy(self):
         """ return a new ExtendSource object, with a copy of the model object"""
@@ -230,46 +240,3 @@ class ExtendedSource(Source):
         return response.ExtendedResponse(self, band, roi, **kwargs)
 
         
-class GlobalSource(Source):
-    def __init__(self, **kwargs):
-        super(GlobalSource, self).__init__(**kwargs)
-        self.dmodel= kwargs.get('dmodel', None)
-        assert self.skydir is None # used as a flag
-        # Special option "free_diffuse" from config['input_model'] to free spectral model for diffuse sources
-        free = kwargs.pop('free', None) # expect a list of names
-        if free is not None and self.name in free:
-            self.model.free[0]=True
-            if self.model.name=='PowerLaw': self.model.free[1]=True,
-            #print '{}, free={}'.format(self, free)
-
-    def copy(self):
-        """ return a new GlobalSource object, with a copy of the model, others"""
-        ret = GlobalSource(**self.__dict__)
-        ret.model = self.model.copy()
-        return ret
-
-    def response(self, band, roi=None, **kwargs):
-        """ return a Response class for the band"""
-        assert self.dmodel, 'Need DiffuseBase object to determine response'
-        try:
-            resp_class =  dict(
-                Isotropic =response.IsotropicResponse,
-                MapCube   =response.DiffuseResponse,
-                CachedMapCube=response.CachedDiffuseResponse,
-                Healpix   =response.DiffuseResponse,
-                HealpixCube = response.DiffuseResponse,
-                FitsMapCube = response.DiffuseResponse,
-                FitsMapCubeList = response.DiffuseResponse,
-                IsotropicSpectralFunction = response.IsotropicResponse,
-                AziLimb = response.IsotropicResponse,
-                GulliLimb = response.IsotropicResponse,
-                )[self.dmodel.type]
-        except Exception as msg:
-            raise Exception('Could not find a response class for source %s:"%s"' %(self,msg))
-        try:
-            return resp_class(self,band,roi, **kwargs) 
-        except Exception: # assume no overlap
-            raise
-            return response.NoResponse(self, band, roi, **kwargs)
-    
-

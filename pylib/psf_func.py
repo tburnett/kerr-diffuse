@@ -15,6 +15,8 @@ class PSFlist(list):
         """ the PSF fumctor, in degrees, for a band
         Note that it is the density per square degree (180/pi)**2 = 3283 per sr)
         """
+        et_name = ['FRONT', 'BACK', 'PSF0', 'PSF1', 'PSF2', 'PSF3',]
+        
         def __init__(self, table, which):
             from scipy.interpolate import CubicSpline
             self.which = which # an index from input table
@@ -87,10 +89,13 @@ class PSFlist(list):
     def demo_df(cls,):
         """
         Create a DataFrame of PSF functions for each band, to be used in BandList"""
+        
+        nsides = np.array([  16,   32,   64,  128,  256,  512,  512,  512, 1024, 2048, 2048, 2048])
         plist = cls(event_type=0)[:12]
         df = pd.DataFrame(plist)
         df.drop(['event_type','r68'], axis=1, inplace=True)
         df['psf'] = plist
+        df['nside'] = nsides
         return df
 
     # @classmethod

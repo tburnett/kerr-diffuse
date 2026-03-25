@@ -1,8 +1,9 @@
-"""
-Manage the instrument rsponse for non-diffuse sources
+"""Instrument-response utilities for non-diffuse source components.
+
+This module currently provides point-source PSF response evaluation and
+visualization helpers, plus placeholders for extended-source response support.
 """
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 from astropy.coordinates import SkyCoord, Angle
 from astropy_healpix import HEALPix 
@@ -10,22 +11,20 @@ from astropy_healpix import HEALPix
 
 
 class Response:
-    def __init__(self, source, band, roi=None, **kwargs):
-        """
-        Given a source and a band, set values for set of pixels
-        """    
+    """Base response interface for source/band combinations."""
+
+    def __init__(self, source, band,):
+        """Store shared source/band references for derived response classes."""
         self.source = source
         self.band = band   
         raise NotImplementedError(f'Called with source {source.name}')
 
 
 class PointResponse(HEALPix):
-    """
-    Class to evaluate and visualize the PSF response of a given Fermi-LAT PSF model (e.g., PSF3)
-     at any sky direction."""
+    """Evaluate and visualize a point-source PSF response on a HEALPix grid."""
 
     def __init__(self, source, band): 
-        """Initialize with a PSF band (e.g., PSF3) which contains the R68 and PSF function."""
+        """Initialize from a source and a band carrying PSF and nside metadata."""
         self.source = source
         self.sdir = source.skydir
         self.band = band
@@ -33,17 +32,30 @@ class PointResponse(HEALPix):
         super().__init__(nside=band.nside, order='ring', frame='galactic')
     
     def evaluate(self,  cpix=None, *,r68_radius=3):
-        """Evaluate the PSF response at a given sky direction `sdir` (SkyCoord). 
-        Returns a tuple of HEALPix pixel indices and corresponding PSF values times the pixel area."""
+        """Evaluate PSF weights over pixels near the source direction.
+
+        Parameters
+        ----------
+        cpix : array-like or None
+            Optional explicit pixel index list. If omitted, uses a cone search.
+        r68_radius : float
+            Cone radius in units of `r68` when `cpix` is not supplied.
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray]
+            Pixel indices and pixel-integrated PSF weights.
+        """
         
         if cpix is None:
             cpix = self.cone_search_skycoord(self.sdir, Angle(r68_radius*self.r68, 'deg'))
+        # Evaluate PSF at angular distance to each selected pixel center.
         aa = self.sdir.separation(self.healpix_to_skycoord(cpix)).deg
         vpix = np.array(list(map(self.band.psf, aa))) * self.pixel_area.value
         return cpix, vpix
 
     def plot_response(self, *, r68_radius=3):
-        """Plot the PSF response as a function of angular separation from `sdir`, for pixels within `r68_radius`*R68."""
+        """Plot PSF value versus angular distance from source center."""
         cpix, vpix = self.evaluate(r68_radius=r68_radius)
         aa = self.sdir.separation(self.healpix_to_skycoord(cpix)).deg
         
@@ -58,21 +70,32 @@ class PointResponse(HEALPix):
         plt.show()
 
     def add_response_to_map(self,  pixmap):
-        """Add the PSF response centered on `sdir` to an existing HEALPix map `pixmap`."""
+        """Accumulate this source response into an existing HEALPix map."""
         cpix, vpix = self.evaluate()
         pixmap[cpix] += vpix
     
     def plot_psf_map(self, *, frame='galactic', **kwargs):
-        """Plot the PSF response as a HEALPix map centered on `sdir`."""
+        """Render local PSF-response map around the source direction."""
         from utilities.skymaps import ZEAfigure
         k,v = self.evaluate()
         pixmap = np.zeros(self.npix)
         pixmap[k] = v
-        pixmap[pixmap == 0] = np.nan  # Set zero values to NaN for log evaluation
-        kw = dict(size=8*self.r68, pixelsize=self.r68/50,  fig=None, figsize=(6,5))
-        kw.update(kwargs)
-        
-        zfig = ZEAfigure(self.sdir, frame=frame, **kw)
+        # Hide zero bins before log scaling to avoid `-inf` in the image.
+        pixmap[pixmap == 0] = np.nan
+        size = kwargs.pop('size', 8 * self.r68)
+        pixelsize = kwargs.pop('pixelsize', self.r68 / 50)
+        fig = kwargs.pop('fig', None)
+        figsize = kwargs.pop('figsize', (6, 5))
+
+        zfig = ZEAfigure(
+            self.sdir,
+            frame=frame,
+            size=size,
+            pixelsize=pixelsize,
+            fig=fig,
+            figsize=figsize,
+            **kwargs,
+        )
         zfig.imshow(np.log10(pixmap), )
         zfig.colorbar(label='log(PSF value)')
         zfig.scatter(self.sdir, c='red', marker='x', label='Center')
@@ -81,12 +104,15 @@ class PointResponse(HEALPix):
 
     @classmethod
     def example_plots(cls, band, sdir=None):
-        """Class method to demonstrate the PSF response and map plotting."""   
-        self = cls(None, band)
+        """Demonstrate response curve and local PSF map for one band."""
+        # Construct a lightweight source-like object with `skydir` for demo use.
         if sdir is None:
             sdir = SkyCoord(10,10, unit='deg', frame='galactic')
-        elif type(sdir) is tuple:
+        elif isinstance(sdir, tuple):
             sdir = SkyCoord(*sdir, unit='deg', frame='galactic')
+
+        demo_source = type('DemoSource', (), {'skydir': sdir})()
+        self = cls(demo_source, band)
         self.sdir = sdir
         self.plot_response()
         self.plot_psf_map()
@@ -94,4 +120,5 @@ class PointResponse(HEALPix):
 
     
 class ExtendedResponse(Response):
+    """Placeholder for future extended-source response implementation."""
     pass

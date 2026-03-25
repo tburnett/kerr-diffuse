@@ -1,20 +1,25 @@
-"""
-Basic fitter utilities
+"""Numerical fitting utilities used by like3 models.
 
-Authors: Matthew Kerr, Toby Burnett
-$Header: /nfs/slac/g/glast/ground/cvs/pointlike/python/uw/utilities/fitter.py,v 1.10 2013/07/28 15:27:44 burnett Exp $
+This module provides:
+- `Fitted`: lightweight interface for fit-capable function objects.
+- `Minimizer`: wrappers around SciPy (and optional Minuit) optimizers.
+- `Projector` / `Profile`: adapters for subset and 1D profile fits.
+- `TestFunc` and `test(...)`: simple sanity checks against parabola-like inputs.
 
+Authors
+-------
+Matthew Kerr, Toby Burnett
 """
-import types
 import numpy as np
 from scipy import optimize #for fmin,fmin_powell,fmin_bfgs
 from numpy import linalg  #for inv
 import numdifftools
 
-class FitterException(Exception): pass
+class FitterException(Exception):
+    """Raised for fitter-interface and parameter-selection errors."""
 
 class Fitted(object):
-    """ base class for a function object to define fit properties """
+    """Base protocol for function objects consumed by the fitter utilities."""
     @property
     def bounds(self):
         return None
@@ -22,14 +27,14 @@ class Fitted(object):
     def parameter_names(self):
         return None
     def get_parameters(self):
+        """Return current internal parameter vector."""
         raise FitterException('get_parameters is not implemented')
     def set_parameters(self, par):
+        """Update current internal parameter vector."""
         raise FitterException('set_parameters is not implemented')
         
     def minimize(self, **kwargs):
-        """ minimize the function using optimize.fmin_l_bfgs_b
-
-        """
+        """Minimize with L-BFGS-B starting from current parameters."""
         use_gradient = kwargs.pop('use_gradient',True)#, self.gradient(self.get_parameters()) is None)
         ret =optimize.fmin_l_bfgs_b(self, self.get_parameters(), 
             bounds=self.bounds, 
@@ -44,17 +49,19 @@ class Fitted(object):
         return ret
         
     def hessian(self, pars=None, **kwargs):
-        """    
-        Return the Hessian matrix  
-         For sigmas and correlation coefficients, invert to covariance
-                cov =  self.hessian().I
-                sigs = np.sqrt(cov.diagonal())
-                corr = cov / np.outer(sigs,sigs)
+        """Return numerical Hessian matrix at `pars` (or current parameters).
+
+        Notes
+        -----
+        For 1-sigma errors and correlation estimates, invert the Hessian:
+            `cov = self.hessian().I`
+            `sigs = np.sqrt(cov.diagonal())`
+            `corr = cov / np.outer(sigs, sigs)`
         """
         if pars is None: pars = self.get_parameters()
         return np.matrix(numdifftools.Hessian(self,  **kwargs)(pars))
 
-def test(fn = None, p0=None, pars=None):
+def _make_testfunc(fn=None, p0=None, pars=None):
     if fn is None:
         pars=[1.0, 2.]
         fn = lambda p: 1.+ 0.5*((p[0]-pars[0])/pars[1])**2
@@ -62,12 +69,21 @@ def test(fn = None, p0=None, pars=None):
  
        
 class Minimizer(object):
-    """ this is mostly extracted as is from uw.like.specfitter and turned into a utility
-    """
+    """General-purpose minimizer wrapper around several optimization methods."""
 
     def __init__(self, fn, parameters=None, args=(), quiet=True):
-        """ fn : function object
-                note that it will be minimized, so should be negative of log likelihood
+        """Initialize minimizer.
+
+        Parameters
+        ----------
+        fn : callable
+            Objective function to minimize (typically negative log-likelihood).
+        parameters : array-like or None
+            Optional explicit parameter vector. If None, `fn.get_parameters()` is used.
+        args : tuple
+            Extra arguments forwarded to objective evaluations.
+        quiet : bool
+            Controls optimizer logging.
         """
         self.quiet = quiet
         self.par = parameters
@@ -77,8 +93,7 @@ class Minimizer(object):
         self.cov_matrix=np.zeros([npar,npar])
     
     def gradient(self,parameters,*args):
-        """ access gradient if defined by the function
-        """
+        """Return analytic gradient from the wrapped objective."""
         assert hasattr(self.fn, 'gradient'), 'Minimize: use_gradient set, but function did not define a gradient'
         return self.fn.gradient(parameters)
 
@@ -102,10 +117,18 @@ class Minimizer(object):
     def __call__(self, method='simplex', tolerance = 0.01, save_values = True, 
                       estimate_errors=True, error_for_steps=False,
                      use_gradient = True, gtol = 1e-1, **kwargs):
-        """Maximize likelihood and estimate errors.
-            method     -- ['simplex'] fitter; 'powell' or 'simplex' or 'minuit'
-            tolerance -- (approximate) absolute tolerance 
-            
+        """Run minimization and optional covariance/error estimation.
+
+        Parameters
+        ----------
+        method : str
+            One of `simplex`, `powell`, `minuit`, or `l-bfgs-b`.
+        tolerance : float
+            Approximate absolute convergence tolerance.
+        estimate_errors : bool
+            If true, estimate covariance at optimum and return errors.
+        use_gradient : bool
+            If true, prefer analytic-gradient paths when available.
         """
         if method.lower() not in ['simplex','powell','minuit', 'l-bfgs-b']:
             raise Exception('Unknown fitting method for F.fit(): "%s"' % method)
@@ -113,12 +136,19 @@ class Minimizer(object):
         use_gradient = use_gradient and hasattr(self.fn, 'gradient')
         use_bounds = kwargs.pop('use_bounds', self.fn.bounds is not None)
         if method == 'minuit':
-            return self.minuit()
-        # scipy
+            return self.minuit(
+                tolerance=tolerance,
+                save_values=save_values,
+                estimate_errors=estimate_errors,
+                error_for_steps=error_for_steps,
+                use_gradient=use_gradient,
+            )
+        # Evaluate objective scale once for relative tolerance settings.
         ll_0 = self.fn(self.get_parameters(), *self.args) 
         if ll_0==0: ll_0=1.0
         if use_gradient and not use_bounds:
             f0 = optimize.fmin_bfgs(self.fn,self.get_parameters(),self.gradient,full_output=1,maxiter=500,gtol=gtol,disp=0)
+            # Retry BFGS if first attempt does not stabilize objective.
             for i in range(10):
                 f = self._save_bfgs = optimize.fmin_bfgs(self.fn,self.get_parameters(),self.gradient,
                         full_output=1,maxiter=500,gtol=gtol,disp=0)
@@ -158,7 +188,8 @@ class Minimizer(object):
             return f[1], f[0], np.sqrt(diag)
         return f[1], f[0]
     
-    def minuit(self):
+    def minuit(self, tolerance=0.01, save_values=True, estimate_errors=True,
+               error_for_steps=False, use_gradient=True):
         from uw.utilities.minuit import Minuit
         temp_params = self.get_parameters()
         npars = temp_params.shape[0]
@@ -197,15 +228,16 @@ class Minimizer(object):
         #self.psm.set_covariance_matrix(self.cov_matrix,current_position = len(self.bgm.parameters()))
 
     def sigmas(self):
-        """ quietly return nan for negative diagonal terms """
+        """Return 1-sigma estimates from covariance diagonal (NaN if invalid)."""
         diag = self.cov_matrix.diagonal()
         bad = diag<0
         if np.any(bad): diag[bad]=np.nan
         return np.sqrt(diag)
 
     def correlations(self, percent=False):
-        """Return the linear correlation coefficients for the estimated covariance matrix.
-           any rows or columns with a zero error (failed fit) will be nan
+        """Return linear correlation coefficients derived from covariance matrix.
+
+        Any rows/columns with zero uncertainty are returned as NaN.
         """
         s = self.sigmas()
         s[s==0] = np.nan
@@ -213,6 +245,7 @@ class Minimizer(object):
         return t*100. if percent else t
 
     def __set_error__(self,use_gradient=False):
+        """Estimate covariance matrix near current optimum."""
 
         npar = len(self.get_parameters())
         if use_gradient:
@@ -243,7 +276,7 @@ class Minimizer(object):
             if np.any(np.isnan(self.cov_matrix)):
                 if not self.quiet: print('Found NaN in covariance matrix!')
                 raise Exception('Found NaN in covariance matrix!')
-            # now expand if necesary
+            # Expand reduced covariance back to full parameter-space shape.
             if not full:
                 # must be better way to expand a matrix
                 self.cov_matrix =np.zeros([npar,npar])
@@ -255,7 +288,7 @@ class Minimizer(object):
                         self.cov_matrix[ki,k[j]] =self.cov_matrix[k[j],ki] = t[i,j]
             success = True
         except linalg.LinAlgError as e:
-            if not qself.quiet:
+            if not self.quiet:
                 print('Error generating cov matrix, %s' % e)
             self.cov_matrix = np.zeros([npar,npar])
             success = False
@@ -263,13 +296,21 @@ class Minimizer(object):
 
     @staticmethod
     def hessian(mf, pars, quiet=True, *args):
-        """Calculate the Hessian matrix using finite differences (adapted from specfitter.SpectralModelFitter.hessian)
-        
-         mf:   minimizing function
-         pars: parameters at the minimum,
-         args: additional arguments for mf.
-        
-        returns matrix, error code array
+        """Calculate Hessian by finite differences around `pars`.
+
+        Parameters
+        ----------
+        mf : callable
+            Objective function.
+        pars : array-like
+            Parameter vector (typically at optimum).
+        args : tuple
+            Extra args passed to `mf`.
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray]
+            Hessian matrix and per-parameter return/error code array.
         """
         p  = pars.copy()
         npar = len(pars)
@@ -280,11 +321,13 @@ class Minimizer(object):
 
         l0 = mf(p, *args)
 
-        #find good values with which to estimate the covariance matrix -- look at diagonal deviations
-        #iterate until change in function consistent with ~1 sigma conditional error
+        # Tune per-parameter step sizes so diagonal finite differences are
+        # informative but numerically stable.
         for i in range(npar):
             if not quiet: print('Working on parameter %d'%(i))
             h,l = p.copy(),p.copy()
+            delta_f_1 = 0.0
+            delta_f_2 = 0.0
             for j in range(10):
                 h[:] = p[:]; l[:] = p[:];
                 h[i] += deltas[i]
@@ -300,7 +343,8 @@ class Minimizer(object):
                 # no constraint on parameter -- ignore it in further fittingor :
                 bad_mask[i] = True
                 return_code[i] = 1
-            if (delta_f_1/delta_f_2 > 10 or delta_f_1/delta_f_2 < 1./10):
+            ratio = np.inf if delta_f_2 == 0 else (delta_f_1 / delta_f_2)
+            if (ratio > 10 or ratio < 1./10):
                 # significant asymmetry in likelihood             
                 bad_mask[i] = True
                 return_code[i] = 2
@@ -334,7 +378,7 @@ class Minimizer(object):
 
     @staticmethod
     def mycov(grad,par,full_output=False,init_step=0.04,min_step=1e-6,max_step=1,max_iters=5,target=0.5,min_func=1e-4,max_func=4):
-        """Perform finite differences on the _analytic_ gradient provided by user to calculate hessian/covariance matrix.
+        """Estimate covariance from finite differences of analytic gradients.
 
         Positional args:
             grad                : a function to return a gradient
@@ -362,10 +406,10 @@ class Minimizer(object):
 
         def revised_step(delta_f,current_step,index):
             if (current_step == max_step):
-                max_flags[i] = True
+                max_flags[index] = True
                 return True,0
             elif (current_step == min_step):
-                min_flags[i] = True
+                min_flags[index] = True
                 return True,0
             else:
                 adf = abs(delta_f)
@@ -385,6 +429,9 @@ class Minimizer(object):
         iters = np.zeros(nparams)
         for i in range(nparams):
             converged = False
+            # Initialize in case `max_iters` is set to 0 by caller.
+            g_up = grad(par)
+            g_dn = g_up.copy()
             for j in range(max_iters):
                 iters[i] += 1
                 di = step_size[i]
@@ -413,8 +460,10 @@ class Minimizer(object):
             return cov
 
 class Projector(Fitted):
-    """ adapt a function object to create a projection, a function of a subset of its parameters
-    Require that it has a methods __call__, set_parmeters, get_parameters, and perhaps gradient
+    """Adapter exposing a subset of parameters as the active optimization vector.
+
+    The wrapped function is still evaluated in full parameter space; non-selected
+    parameters are held fixed at their current values.
     """
     def __init__(self, fn, select=[0], par=None, ):
         """ 
@@ -442,7 +491,7 @@ class Projector(Fitted):
         self.fn.set_parameters(self.fpar) # note this sets the original set
         
     def __call__(self, x):
-        """ len of x must be number of selected parameters"""
+        """Evaluate wrapped function for selected-parameter vector `x`."""
         self.fpar[self.mask]=x
         ret= self.fn(self.fpar)
         #print 'value(%.2f)=%.2f' % (x,ret)
@@ -480,15 +529,21 @@ class Projector(Fitted):
         """
         self.fitter = Minimizer(self, par0)
         
-        c2, par, dpar = self.fitter(**fit_kw)
+        result = self.fitter(**fit_kw)
+        if len(result) == 3:
+            c2, par, dpar = result
+        else:
+            c2, par = result
+            dpar = None
         self.par = par
         self.set_parameters(par)
         return c2, par, dpar
 
 
 class Profile(Fitted):
-    """ Manage a function of one parameter, projected from a multi-parameter function,
-    with option evaluate by either optimizing on the remaining parameters or not
+    """One-parameter profile/projection view of a multi-parameter objective.
+
+    Optionally profiles out the remaining parameters via internal minimization.
     """
 
     def __init__(self, fn, index, par=None, profile=True):
@@ -531,10 +586,13 @@ class Profile(Fitted):
         self.fitter = Minimizer(self.pfun) 
         
     def __call__(self, x):
+        """Evaluate profile function at scalar parameter value `x[0]`."""
         self.fpar[self.index]=x[0]
         # if don't optimize the other parameters
         if self.profile: 
-            v,p,s =self.fitter() #fit value, parameters, errors
+            fit_result = self.fitter()
+            p = fit_result[1]
+            v = fit_result[0]
             self.fpar[self.mask]=p
             r = self.fn(self.fpar)
             print(v,r)
@@ -556,6 +614,7 @@ class Profile(Fitted):
         
     
 class TestFunc(Fitted):
+    """Minimal `Fitted` implementation for simple functional tests."""
     def __init__(self, fn, pars):
         self.fn = fn
         self.pars = pars
@@ -570,7 +629,7 @@ class TestFunc(Fitted):
 
  
 def test(x0=1.1, pars=[1.0, 1.5], **kwargs):
-    """ test with a parabola corresponding to a Gaussian with mean, sigma in pars
+    """Run a simple parabola minimization test and print fitted result.
     
     >>> pars=[1.0, 1.5]; x0=1.1
     >>> testf = lambda p: 1.+ 0.5*((p[0]-pars[0])/pars[1])**2

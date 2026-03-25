@@ -1,26 +1,31 @@
-"""
-Set up and manage the model for all the sources in an ROI
+"""Source-list management utilities for like3 ROI-style models.
 
-$Header: /nfs/slac/g/glast/ground/cvs/pointlike/python/uw/like2/roimodel.py,v 1.29 2018/01/27 15:37:17 burnett Exp $
-
+`SourceList` is a list-like container with helpers for:
+- aggregating flux and gradients across sources,
+- managing free-parameter views via `parameterset`,
+- finding, adding, deleting, and updating source models.
 """
 
 import numpy as np
 import pandas as pd
 
-from . import (sources, parameterset) 
-class SourceListException(Exception):pass        
+from . import (sources, parameterset)
+
+
+class SourceListException(Exception):
+    """Raised for source-lookup and source-list management errors."""
 
 class SourceList(list):
-    """ Manage the list of free sources, Note that it inherits from list.
-    
-    In particular, provide an interface to serialize the set of free parameters, or define a subset thereof.
-    This is delegated to the classes ParameterSet and ParSubSet in the module parameterset
-    
-    Methods are provided to add or remove sources, and change the model associated with a source.
+    """List-like container for model sources plus parameter-management helpers.
+
+    Notes
+    -----
+    Parameter serialization/subselection is delegated to
+    `parameterset.ParameterSet` and `parameterset.ParSubSet`.
     """
 
     def __init__(self, sources):
+        """Initialize from an iterable of source objects."""
 
         for source in sources:
             self.add_source(source)
@@ -29,14 +34,13 @@ class SourceList(list):
 
         # print(self.__repr__())
         self.selected_source = None
+        self.selected_source_index = -1
 
     def __repr__(self):
-        ns = len(self)
-        n_free = len(self.parameters)
         return f'{len(self)} sources, {len(self.parameters)} free parameters'
 
     def flux(self, energies):
-        """ Compute flux values for given parameter set """
+        """Return summed model flux over all sources at `energies`."""
                 
         r = np.zeros_like(energies)
         for source in self:
@@ -44,8 +48,7 @@ class SourceList(list):
         return r
     
     def gradient(self, energies):
-        """ Return the gradient of the flux with respect to free parameters
-        """    
+        """Return flux gradient with respect to active free parameters."""
         energies = np.atleast_1d(energies)           
         g = np.vstack([source.model.gradient(energies)[source.model.free]*1.0
                           for source in self])
@@ -53,13 +56,11 @@ class SourceList(list):
        
 
     def initialize(self, **kw):
-        """For fast parameter access: must be called if any source changes
-        """
+        """Rebuild flattened parameter view after any source/model changes."""
         self.parameters = parameterset.ParameterSet(self, **kw)
   
     def parsubset(self, *select):
-        """ return a ParSubSet object with possible initial selection of a subset of the parameters
-        """
+        """Return a `ParSubSet` view with optional initial selection."""
         return parameterset.ParSubSet(self, *select)
         
     
@@ -70,19 +71,18 @@ class SourceList(list):
     def models(self): return np.array([s.model for s in self])
     @property
     def free(self): 
-        """ mask which defines variable sources: all global and local sources with at least one variable parameter 
-        """
+        """Mask selecting sources with at least one free model parameter."""
         return np.array([ np.any(s.model.free) for s in self])
     
     @property 
     def bounds(self):
-        """ fitter representation of applied bounds """
+        """Concatenated fitter-space bounds for all free parameters."""
         return np.concatenate([m.bounds[m.free] for m in self.models])
     
         
     @property
     def parameter_names(self):
-        """ array of free parameter names """
+        """Array of free parameter names formatted as `source_parameter`."""
         names = []
         for source_name, model in zip(self.source_names, self.models):
             for pname in np.array(model.param_names)[np.array(model.free)]: # mod for future warning
@@ -103,10 +103,11 @@ class SourceList(list):
                 raise SourceListException('No source is selected')
             return self.selected_source
         elif isinstance(source_name, sources.Source):
-            if source_name in self.sources:
+            if source_name in self:
                 self.selected_source = source_name
                 return self.selected_source
-            not_found()
+            self.selected_source = None
+            raise SourceListException('source %s not found' % source_name.name)
             
         names = [s.name for s in self]
         def not_found():
@@ -116,12 +117,12 @@ class SourceList(list):
             self.selected_source=s
             self.selected_source_index = names.index(s.name)
             return s
-        if source_name[-1]=='*':
+        if isinstance(source_name, str) and len(source_name) > 0 and source_name[-1]=='*':
             for name in names:
                 if name.startswith(source_name[:-1]): 
                     return found(self[names.index(name)])
             not_found()
-        if source_name[0]=='*':
+        if isinstance(source_name, str) and len(source_name) > 0 and source_name[0]=='*':
             for name in names:
                 if name.endswith(source_name[1:]): 
                     return found(self[names.index(name)])
@@ -137,7 +138,7 @@ class SourceList(list):
             not_found()
 
     def add_source(self, newsource=None, **kw):
-        """ add a source to the ROI
+        """Add a source to the model and rebuild parameter indexing.
         
         parameters
         ----------
@@ -163,15 +164,14 @@ class SourceList(list):
         return newsource
      
     def del_source(self, source_name):
-        """ remove a source from the model for this ROI
-        """
+        """Remove a source from the model and rebuild parameter indexing."""
         source = self.find_source(source_name) # first get it
         self.remove(source)
         self.initialize()
         return source
         
     def set_model(self, model, source_name=None):
-        """ replace the current model, return reference to previous
+        """Replace selected source model and return `(source, old_model)`.
         
         model : string, or like.Models.Model object
             if string, evaluate. Note that 'PowerLaw(1e-11,2.0)' will work. Also supported:
@@ -180,8 +180,10 @@ class SourceList(list):
             if None, use currently selected source
         """
         src = self.find_source(source_name)
+        if src is None:
+            raise SourceListException(f'source {source_name} not found')
         old_model = src.model
-        if isinstance(model, str): 
+        if isinstance(model, str):
             model = eval(model) 
         assert sources.ismodel(model), 'model must inherit from Model class'
         src.model = model
@@ -191,15 +193,15 @@ class SourceList(list):
         return src, old_model
         
     def list_sources(self):
-        """ print the list of sources in the model, with indication of which are free
-        """
+        """Print all sources currently in the model."""
         for source in self:
             print(source)
         return
     
     @classmethod
     def demo(cls,  src_key=2,) :
-        """ Create a simple model with one (or two) point sources 
+        """Create a toy source list for quick experiments.
+
             0 : PLSuperExpCutoff source
             1 : PowerLaw source
             2 : both sources
