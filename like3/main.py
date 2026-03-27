@@ -2,10 +2,10 @@
 Docstring for main
 """
 from . parameterset import ParameterSet
-from . sourcelist import SourceList
+from . sourcelist import SourceModel
 
 
-class Main(SourceList):
+class Main(SourceModel):
 
     def __init__(self, sources):
         """

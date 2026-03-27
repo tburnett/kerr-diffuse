@@ -12,10 +12,10 @@ import pandas as pd
 from . import (sources, parameterset)
 
 
-class SourceListException(Exception):
+class SourceModelException(Exception):
     """Raised for source-lookup and source-list management errors."""
 
-class SourceList(list):
+class SourceModel(list):
     """List-like container for model sources plus parameter-management helpers.
 
     Notes
@@ -37,8 +37,34 @@ class SourceList(list):
         self.selected_source_index = -1
 
     def __repr__(self):
-        return f'{len(self)} sources, {len(self.parameters)} free parameters'
+        return f'SourceModel: {len(self)} sources with {len(self.parameters)} free parameters'
 
+    def model_counts(self, band, pix):
+        """Return predicted counts for pixels in one energy band.
+
+        Parameters
+        ----------
+        band : object
+            Band descriptor providing:
+            - ``energy`` for model evaluation,
+            - ``response(source, pix)`` returning per-pixel PSF weights,
+            - ``exposure_map(pix)`` returning per-pixel exposure.
+        pix : array-like
+            Pixel indices (or IDs) for which counts are requested.
+
+        Returns
+        -------
+        numpy.ndarray
+            Predicted counts per input pixel, summed over all sources.
+        """
+        pixel_flux = np.zeros_like(pix)
+        for source in self:
+            source_flux = source.model(band.energy)
+            _, source_pixel_psf = band.response(source, pix)
+            pixel_flux += source_pixel_psf * source_flux
+        # finally multiply by exposure to get counts 
+        return pixel_flux * band.exposure_map(pix)
+        
     def flux(self, energies):
         """Return summed model flux over all sources at `energies`."""
                 
@@ -54,7 +80,6 @@ class SourceList(list):
                           for source in self])
         return g [ self.parameters.mask]
        
-
     def initialize(self, **kw):
         """Rebuild flattened parameter view after any source/model changes."""
         self.parameters = parameterset.ParameterSet(self, **kw)
@@ -79,7 +104,6 @@ class SourceList(list):
         """Concatenated fitter-space bounds for all free parameters."""
         return np.concatenate([m.bounds[m.free] for m in self.models])
     
-        
     @property
     def parameter_names(self):
         """Array of free parameter names formatted as `source_parameter`."""
@@ -89,7 +113,6 @@ class SourceList(list):
                 names.append(source_name.strip()+'_'+pname)
         return np.array(names)
     
-
     def find_source(self, source_name):
         """ Search for the source with the given name
         
@@ -100,19 +123,19 @@ class SourceList(list):
         """
         if source_name is None:
             if self.selected_source is None:
-                raise SourceListException('No source is selected')
+                raise SourceModelException('No source is selected')
             return self.selected_source
         elif isinstance(source_name, sources.Source):
             if source_name in self:
                 self.selected_source = source_name
                 return self.selected_source
             self.selected_source = None
-            raise SourceListException('source %s not found' % source_name.name)
+            raise SourceModelException('source %s not found' % source_name.name)
             
         names = [s.name for s in self]
         def not_found():
             self.selected_source_index =-1
-            raise SourceListException('source %s not found' %source_name)
+            raise SourceModelException('source %s not found' %source_name)
         def found(s):
             self.selected_source=s
             self.selected_source_index = names.index(s.name)
@@ -181,7 +204,7 @@ class SourceList(list):
         """
         src = self.find_source(source_name)
         if src is None:
-            raise SourceListException(f'source {source_name} not found')
+            raise SourceModelException(f'source {source_name} not found')
         old_model = src.model
         if isinstance(model, str):
             model = eval(model) 
@@ -197,6 +220,13 @@ class SourceList(list):
         for source in self:
             print(source)
         return
+    
+    
+    def setposition(self, skydir):
+        """Set the position of the selected source.
+        Return self to allow chaining, e.g. ``with sl.localization_view('Blazar').setposition((ra,dec)) as view:``"""
+        self.selected_source.skydir = skydir
+   
     
     @classmethod
     def demo(cls,  src_key=2,) :
@@ -223,6 +253,136 @@ class SourceList(list):
 
         print(f'Model: {str(model)}')
         return model
+
+    def view(self):
+        """Return a context-manager view that restores all source model state on exit.
+
+        Within the ``with`` block the caller receives the original ``SourceList``
+        and may freely add, remove, or mutate sources and their models.  When the
+        block exits (whether normally or via an exception) every source and its
+        spectral model are rolled back to the state captured at block entry.
+
+        Usage
+        -----
+        .. code-block:: python
+
+            with source_list.view() as sl:
+                sl.find_source('Blazar').model.free[0] = False
+                # ... trial computation ...
+            # source_list is fully restored here
+
+        Returns
+        -------
+        SourceListView
+        """
+        ret = SourceListView(self)
+        # print('Entering SourceList view context: snapshot taken, original list is available as "sl"', ret.__class__)
+        return ret
+    
+    def localization_context(self, source_name=None):
+        """Set up context-manager that restores only the position of the selected source on exit.
+
+        Within the ``with`` block the caller receives the original ``SourceList``
+        and may freely add, remove, or mutate sources and their models.  When the
+        block exits (whether normally or via an exception) the position of the selected source is rolled back to the state captured at block entry.
+
+        Usage
+        -----
+        .. code-block:: python
+
+            with source_list.localization_view('Blazar') as sl:
+                sl.find_source('Blazar').model.free[0] = False
+                # ... trial computation ...
+            # source_list is fully restored here
+
+        Returns
+        -------
+        SourceListView
+        """
+        if self.selected_source is None or self.selected_source.name != source_name:
+            self.find_source(source_name)
+        if self.selected_source is None:
+            raise SourceListException(f'source {source_name} not found')
+        return SourceListContext(self,  position_only=True)
+
+
+class SourceListContext:
+    """Context-manager snapshot/restore wrapper for a :class:`SourceList`.
+
+    On ``__enter__`` a lightweight snapshot of the source-list contents and
+    every source's spectral-model state is captured.  On ``__exit__`` the
+    original list is rewound to that snapshot, regardless of whether the block
+    raised an exception.
+
+    Do not instantiate directly; use :meth:`SourceList.view` instead.
+    """
+
+    def __init__(self, source_list,  position_only=False):
+        """Bind to *source_list*; snapshot is taken lazily on ``__enter__``."""
+        self._sl = source_list
+        self._snapshot = None
+        self._source_name = source_list.selected_source.name if source_list.selected_source else None
+        self._position_only = position_only
+        
+        
+    # ------------------------------------------------------------------
+    # Snapshot helpers
+    # ------------------------------------------------------------------
+
+    def _take_snapshot(self):
+        """Capture the current source-list state.
+
+        Stores which sources are present and a ``model.copy()`` for each so
+        that parameter values, free masks, and bounds can all be restored.
+        """
+        if self._position_only:
+            return self._sl.selected_source.skydir
+        return {
+            'sources': list(self._sl),  # ordered list of source objects
+            'models': {src.name: src.model.copy() for src in self._sl},
+            'selected_source': self._sl.selected_source,
+            'selected_source_index': self._sl.selected_source_index,
+        }
+
+    def _restore(self, snapshot):
+        """Rewind *self._sl* to the given snapshot."""
+        if self._position_only:
+            self._sl.selected_source.skydir = snapshot
+            return
+        
+        # Restore the membership list (handles add_source / del_source calls).
+        del self._sl[:]
+        self._sl.extend(snapshot['sources'])
+
+        # Restore each source's model to the saved copy.
+        for src in self._sl:
+            src.model = snapshot['models'][src.name]
+            src.changed = True
+
+        # Restore selection bookkeeping.
+        self._sl.selected_source = snapshot['selected_source']
+        self._sl.selected_source_index = snapshot['selected_source_index']
+
+        # Rebuild the flattened parameter view.
+        self._sl.initialize()
+
+    # ------------------------------------------------------------------
+    # Context-manager protocol
+    # ------------------------------------------------------------------
+
+    def __enter__(self):
+        """Capture a snapshot and return the original ``SourceList``."""
+        self._snapshot = self._take_snapshot()
+        return self._sl
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Restore the ``SourceList`` to its pre-block state.
+
+        Always restores, even when the block raised an exception.
+        Never suppresses exceptions (returns ``False``).
+        """
+        self._restore(self._snapshot)
+        return False  # propagate any exception unchanged
 
 
 

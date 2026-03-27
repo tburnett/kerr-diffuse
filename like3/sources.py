@@ -172,7 +172,7 @@ class Source(object):
     def __str__(self):
         sdir = 'None' if self.skydir is None\
                     else f'({self.skydir.icrs.ra.deg:07.3f}, {self.skydir.icrs.dec.deg:+05.3f})'
-        return '\tname  : %s\n\tICRS  : %s\n\tmodel : %s\n\t\t%s' %\
+        return '\tname  : %s\n\ticrs  : %s\n\tmodel : %s\n\t\t%s' %\
     (self.name, sdir, self.model.name, self.model.__str__(indent='\t\t'))
     
     def __repr__(self):

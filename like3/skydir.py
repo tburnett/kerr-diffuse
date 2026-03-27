@@ -55,6 +55,13 @@ class SkyDir(object):
         return 'SkyDir({:.3f}, {:.3f})'.format(self.ra(), self.dec())
     def __repr__(self): return self.__str__()
 
+    @property
+    def galactic(self):    return self.coord.galactic
+    @property
+    def icrs(self):        return self.coord.icrs
+    @property
+    def cartesian(self):    return self.coord.cartesian
+
 class WeightedSkyDir(SkyDir):
     """`SkyDir` with an attached scalar weight."""
     

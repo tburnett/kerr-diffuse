@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from astropy_healpix import HEALPix 
 from astropy.coordinates import SkyCoord
-from .sourcelist import SourceList
+from .sourcelist import SourceModel
 from collections import namedtuple
 
 # Define a namedtuple type for a key,value pair of lists
@@ -42,7 +42,7 @@ class Band(HEALPix):
         ----------
         band_info : dict
             Band metadata. Expected keys include `energy`, `nside`, and `psf`
-        source_model : SourceList
+        source_model : SourceModel
             Source model, a list of sources, used to evaluate count fluxes and gradients for this band.
         exposure_map : optional
             Exposure map for the band, if any. 
@@ -66,21 +66,18 @@ class Band(HEALPix):
     def __repr__(self):
         return f'Band(energy={self.energy:.1f} MeV, et={self.psf.event_type} nside={self.nside})'
 
-    # def flux(self):
-    #     """Return total model flux evaluated at this band's energy."""
-    #     return self.source_model.flux(self.energy)
-    
-    # def flux_gradient(self):
-    #     """Return model gradient vector at this band's energy."""
-    #     return self.source_model.gradient([self.energy])  
-    
     def response(self, source, pixels=None):
         """Return the response, or evaluation of the PSF, for a given source and pixel set.
         """
         return source.response(self).evaluate( pixels)
 
-    def pixel_counts(self):
-        """Evaluate model counts on the sparse set of illuminated pixels
+    def pixel_counts(self, pixels=None):
+        """Evaluate model counts on a set of pixels on the sparse set of illuminated pixels
+
+        Parameters
+        ----------
+        pixels : array-like, optional
+            Pixel indices to evaluate. If None, all illuminated pixels are used.
 
         Returns
         -------
@@ -95,7 +92,7 @@ class Band(HEALPix):
         for src in self.source_model:
 
             flux = src.model(self.energy)
-            k, v = self.response(src)
+            k, v = self.response(src, pixels)
             for pix, value in zip(k, v):
                 accum[pix] += value * flux
 
@@ -104,6 +101,10 @@ class Band(HEALPix):
         v *= self.exposure_map(k)  # apply exposure scaling to model flux
         return k, v
 
+    def counts(self):
+        """Return predicted total counts."""
+        return np.sum(self.pixel_counts()[1])
+    
     def pixel_gradient(self, data):
         """Evaluate per-pixel count gradients for the currently free model parameters.
 
@@ -165,26 +166,24 @@ class Band(HEALPix):
             # Apply Poisson noise when a seed or Generator is provided.
             rng = np.random.default_rng(random_state)
             counts = rng.poisson(counts)
+        else:
+            counts = counts.astype(int)
         
         # return only non-zero pixels to avoid unnecessary computation in likelihood evaluation
         select = counts > 0
         return k[select], counts[select]
 
-    def loglike(self, test_source):
-        """Compute the log-likelihood for the source parameters given the data."""
+    def loglike(self, skydir=None):
+        """Compute the Poisson log-likelihood ."""
 
+        if skydir is not None:
+            self.source_model.setposition(skydir)
+            
         data_pix, counts = self.data
-        flux = test_source.model(self.energy)
-        source_pix, v = test_source.response(self).evaluate()
 
-        mask = np.isin(source_pix, data_pix)
-        
-        model = v[mask]
-        model *= self.exposure_map(source_pix[mask]) * flux
-        model = np.clip(model, 1e-6, None)
+        _, model = self.pixel_counts(data_pix)
 
-        return np.sum(counts[np.isin(data_pix, source_pix)] * np.log(model) - model)
-
+        return np.sum(counts * np.log(model) - model)
 
     def plot_pixel_map(self, center, *, data=None, fig=None, label=None, log=True, **kwargs):
         """Plot per-pixel values for this band in a local ZEA projection.
@@ -234,7 +233,6 @@ class Band(HEALPix):
                 color='white', ha='right', va='top', fontsize=12)
         
 
-
 class BandList(list):
     """Collection of `Band` objects sharing a single source model.
 
@@ -250,7 +248,7 @@ class BandList(list):
 
         Parameters
         ----------
-        source_model : SourceList
+        source_model : SourceModel
             Source model to compute flux and gradient for each band.
         band_info : DataFrame or None
             Table containing `energy`, `nside`, and `psf` for each band. If
@@ -279,7 +277,7 @@ class BandList(list):
 
     def counts(self):
         """Return predicted total counts per band."""
-        return np.array([ band.pixel_counts() for band in self])
+        return np.array([ band.counts() for band in self])
             
     def count_gradient(self):
         """Return count gradient array for all free model parameters by band."""
@@ -295,13 +293,13 @@ class BandList(list):
             Random state for reproducibility. If None, no noise is added.
         """
         # compute predicted counts with current parameters
-        predicted = self.pixel_counts()
-        if random_state is None:
-            return predicted
+        # predicted = self.pixel_counts()
+        # if random_state is None:
+        #     return predicted
 
-        # Draw one Poisson realization per band.
-        rng = np.random.default_rng(random_state)
-        return rng.poisson(predicted)
+        # # Draw one Poisson realization per band.
+        # rng = np.random.default_rng(random_state)
+        # return rng.poisson(predicted)
 
     def source_position_loglike(self, source_name, data=None, frame='galactic', clip=1e-30):
         """Return a callable Poisson log-likelihood as a function of source position.
@@ -313,7 +311,7 @@ class BandList(list):
         Parameters
         ----------
         source_name : str or Source
-            Source identifier accepted by `SourceList.find_source`.
+            Source identifier accepted by `SourceModel.find_source`.
         data : sequence[tuple[np.ndarray, np.ndarray]] or None
             Per-band observed data as `(pixels, counts)`. If omitted, uses
             `band.data` for each band and requires all bands to have data set.
@@ -372,7 +370,7 @@ class BandList(list):
     def demo(cls, model=None):
         """Build a demo `BandList` and print per-band flux/count summaries."""
         if model is None:
-            model = SourceList.demo()
+            model = SourceModel.demo()
         print(f'Creating BandList for model: {model}')
         band_list = cls(model)
         for band in band_list:
@@ -389,7 +387,7 @@ class BandList(list):
         df = PSFlist.demo_df()  # get PSF functions for each band in a DataFrame
         df['nside'] = BandList.nsides
       
-        model = SourceList.demo()
+        model = SourceModel.demo()
         print(f'Creating BandList with PSF for model: {model}')
         band_list = cls(model, df)
         print('Counts per band:', band_list.counts().astype(int))

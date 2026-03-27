@@ -4,7 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from astropy_healpix import HEALPix 
 
-from . sourcelist import SourceList
+from . sourcelist import SourceModel
 from . sources import PointSource 
 from . parameterset import ParameterSet
 from . spectral_models import (LogParabola, PLSuperExpCutoff4, PowerLaw)   
@@ -33,9 +33,9 @@ class Pixels:
         return source_model.gradient(self.energies) * self.exposure_factor
     
 
-class DemoModel(SourceList, Pixels):  
+class DemoModel(SourceModel, Pixels):  
     """
-    Inherit from a SourceList, which encapsulates a list of sources, to create a model.
+    Inherit from a SourceModel, which encapsulates a list of sources, to create a model.
     
     Inherot from a special Pixels class encapsulating the pixel descriptonn
 
