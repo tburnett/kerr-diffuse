@@ -1,6 +1,6 @@
 """Source-list management utilities for like3 ROI-style models.
 
-`SourceList` is a list-like container with helpers for:
+`SourceModel` is a list-like container with helpers for:
 - aggregating flux and gradients across sources,
 - managing free-parameter views via `parameterset`,
 - finding, adding, deleting, and updating source models.
@@ -221,12 +221,13 @@ class SourceModel(list):
             print(source)
         return
     
-    
     def setposition(self, skydir):
         """Set the position of the selected source.
         Return self to allow chaining, e.g. ``with sl.localization_view('Blazar').setposition((ra,dec)) as view:``"""
+        if self.selected_source is None:
+            raise SourceModelException('No source is selected')
         self.selected_source.skydir = skydir
-   
+
     
     @classmethod
     def demo(cls,  src_key=2,) :
@@ -257,7 +258,7 @@ class SourceModel(list):
     def view(self):
         """Return a context-manager view that restores all source model state on exit.
 
-        Within the ``with`` block the caller receives the original ``SourceList``
+        Within the ``with`` block the caller receives the original ``SourceModel``
         and may freely add, remove, or mutate sources and their models.  When the
         block exits (whether normally or via an exception) every source and its
         spectral model are rolled back to the state captured at block entry.
@@ -273,48 +274,56 @@ class SourceModel(list):
 
         Returns
         -------
-        SourceListView
+        SourceModelContext
         """
-        ret = SourceListView(self)
-        # print('Entering SourceList view context: snapshot taken, original list is available as "sl"', ret.__class__)
+        ret = SourceModelContext(self)
+        # print('Entering SourceModel view context: snapshot taken, original list is available as "sl"', ret.__class__)
         return ret
     
-    def localization_context(self, source_name=None):
-        """Set up context-manager that restores only the position of the selected source on exit.
+    def localization_view(self, source_name=None):
+        """Set up context-manager that restores only the selected-source position on exit.
 
-        Within the ``with`` block the caller receives the original ``SourceList``
-        and may freely add, remove, or mutate sources and their models.  When the
-        block exits (whether normally or via an exception) the position of the selected source is rolled back to the state captured at block entry.
+        Within the ``with`` block the caller receives a ``LocalizedSourceView``
+        bound to the selected source. The view delegates attribute access to the
+        original ``SourceModel`` and adds a ``delta_ts`` helper for localization
+        scans. When the block exits (whether normally or via an exception), the
+        selected source position is rolled back to the state captured at block
+        entry.
 
         Usage
         -----
         .. code-block:: python
 
-            with source_list.localization_view('Blazar') as sl:
-                sl.find_source('Blazar').model.free[0] = False
+            with source_list.localization_view('Blazar') as loc:
+                ts = loc.delta_ts(my_loglike_callable)
                 # ... trial computation ...
-            # source_list is fully restored here
+            # selected source position is restored here
 
         Returns
         -------
-        SourceListView
+        SourceModelContext
+            Context manager whose ``__enter__`` returns ``LocalizedSourceView``.
         """
         if self.selected_source is None or self.selected_source.name != source_name:
             self.find_source(source_name)
         if self.selected_source is None:
-            raise SourceListException(f'source {source_name} not found')
-        return SourceListContext(self,  position_only=True)
+            raise SourceModelException(f'source {source_name} not found')
+        return SourceModelContext(self,  position_only=True)
+
+    def localization_context(self, source_name=None):
+        """Backward-compatible alias for :meth:`localization_view`."""
+        return self.localization_view(source_name)
 
 
-class SourceListContext:
-    """Context-manager snapshot/restore wrapper for a :class:`SourceList`.
+class SourceModelContext:
+    """Context-manager snapshot/restore wrapper for a :class:`SourceModel`.
 
     On ``__enter__`` a lightweight snapshot of the source-list contents and
     every source's spectral-model state is captured.  On ``__exit__`` the
     original list is rewound to that snapshot, regardless of whether the block
     raised an exception.
 
-    Do not instantiate directly; use :meth:`SourceList.view` instead.
+    Do not instantiate directly; use :meth:`SourceModel.view` instead.
     """
 
     def __init__(self, source_list,  position_only=False):
@@ -371,18 +380,101 @@ class SourceListContext:
     # ------------------------------------------------------------------
 
     def __enter__(self):
-        """Capture a snapshot and return the original ``SourceList``."""
+        """Capture a snapshot and return a context view object.
+
+        Returns
+        -------
+        SourceModel or LocalizedSourceView
+            Returns the original ``SourceModel`` for full-state contexts.
+            For position-only localization contexts, returns a
+            ``LocalizedSourceView`` centered on the selected source.
+        """
         self._snapshot = self._take_snapshot()
+        if self._position_only:
+            return LocalizedSourceView(self._sl)
         return self._sl
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Restore the ``SourceList`` to its pre-block state.
+        """Restore the ``SourceModel`` to its pre-block state.
 
         Always restores, even when the block raised an exception.
         Never suppresses exceptions (returns ``False``).
         """
         self._restore(self._snapshot)
         return False  # propagate any exception unchanged
+
+
+class LocalizedSourceView:
+    """Selected-source helper view for localization workflows.
+
+    Instances are returned by ``SourceModelContext`` when created via
+    ``SourceModel.localization_view``. The object delegates unknown
+    attributes to the underlying ``SourceModel`` and adds a ``delta_ts``
+    helper for likelihood-ratio scans of the currently selected source.
+    """
+
+    def __init__(self, source_model):
+        self.source_model = source_model
+        self.source = source_model.selected_source
+        if self.source is None:
+            raise SourceModelException('No source is selected')
+
+    def __getattr__(self, name):
+        """Delegate unknown attributes to the wrapped ``SourceModel``."""
+        return getattr(self.source_model, name)
+
+    def _evaluate_loglike(self, loglike, position=None):
+        """Evaluate a log-likelihood callable at an optional trial position.
+
+        Supports two callable styles:
+        - ``loglike(position)`` taking the trial sky position directly.
+        - ``loglike()`` where this helper sets ``self.source.skydir`` first.
+        """
+        if position is None:
+            try:
+                return float(loglike())
+            except TypeError:
+                return float(loglike(self.source.skydir))
+
+        try:
+            return float(loglike(position))
+        except TypeError:
+            saved = self.source.skydir
+            self.source.skydir = position
+            try:
+                return float(loglike())
+            finally:
+                self.source.skydir = saved
+
+    def delta_ts(self, loglike, position=None, baseline=None):
+        """Evaluate or build a delta-TS function for the selected source.
+
+        Parameters
+        ----------
+        loglike : callable
+            Log-likelihood evaluator. It may accept a trial position argument
+            (`loglike(position)`) or use current model state (`loglike()`).
+        position : optional
+            If provided, return the delta-TS evaluated at this position.
+            If omitted, return a callable `f(position)`.
+        baseline : float, optional
+            Reference log-likelihood value. If omitted, uses the current
+            selected-source position as the baseline.
+
+        Returns
+        -------
+        float or callable
+            `2 * (loglike(position) - baseline)` for one position, or a
+            callable that computes this value for arbitrary trial positions.
+        """
+        l0 = self._evaluate_loglike(loglike) if baseline is None else float(baseline)
+
+        def eval_delta(position_value):
+            return 2.0 * (self._evaluate_loglike(loglike, position_value) - l0)
+
+        if position is None:
+            return eval_delta
+        return eval_delta(position)
 
 
 

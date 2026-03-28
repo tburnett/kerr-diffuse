@@ -11,7 +11,74 @@ a quadratic surface through TS values sampled on an octagon ring around a candid
 
 
 import numpy as np
-from . skydir import SkyDir
+from typing import Any, cast
+from astropy.coordinates import SkyCoord
+
+
+def _as_skycoord(position: Any) -> SkyCoord:
+    """Normalize supported position inputs to an ICRS SkyCoord.
+
+    Supported inputs are:
+    - ``SkyCoord``
+    - SkyDir-like objects exposing ``ra()`` and ``dec()``
+    - ``(ra_deg, dec_deg)`` tuples/lists
+    """
+    if isinstance(position, SkyCoord):
+        return cast(SkyCoord, position.icrs)
+
+    if hasattr(position, 'ra') and hasattr(position, 'dec'):
+        ra = position.ra() if callable(position.ra) else position.ra
+        dec = position.dec() if callable(position.dec) else position.dec
+        ra_deg: float = float(cast(Any, ra))
+        dec_deg: float = float(cast(Any, dec))
+        return SkyCoord(ra_deg, dec_deg, unit='deg', frame='icrs')
+
+    if isinstance(position, (tuple, list, np.ndarray)) and len(position) == 2:
+        return SkyCoord(float(position[0]), float(position[1]), unit='deg', frame='icrs')
+
+    raise TypeError(f'Unsupported position type for SkyCoord conversion: {type(position)!r}')
+
+
+class _LocalizationTargetAdapter:
+    """Normalize supported localization inputs to a common interface.
+
+    Supported inputs are either:
+    - legacy point-source-like objects exposing ``dir()``, ``errorCircle()``, ``TSmap()``
+    - localization views exposing ``skydir`` (or ``source.skydir``) and ``delta_ts()``
+    """
+
+    def __init__(self, target: Any, sigma: float | None = None):
+        if all(hasattr(target, name) for name in ('dir', 'errorCircle', 'TSmap')):
+            self._dir = _as_skycoord(target.dir())
+            self._sigma = float(target.errorCircle())
+            self._tsmap = target.TSmap
+            return
+
+        if hasattr(target, 'delta_ts'):
+            if hasattr(target, 'skydir'):
+                self._dir = _as_skycoord(target.skydir)
+            elif hasattr(target, 'source') and hasattr(target.source, 'skydir'):
+                self._dir = _as_skycoord(target.source.skydir)
+            else:
+                raise TypeError('Localization view target must expose skydir or source.skydir')
+
+            self._sigma = float(0.1 if sigma is None else sigma)
+            self._tsmap = target.delta_ts()
+            return
+
+        raise TypeError(
+            'Localize requires either a point-source-like object with dir/errorCircle/TSmap '
+            'or a localization view with skydir and delta_ts()'
+        )
+
+    def dir(self) -> SkyCoord:
+        return self._dir
+
+    def errorCircle(self) -> float:
+        return self._sigma
+
+    def TSmap(self, position: Any) -> float:
+        return float(self._tsmap(_as_skycoord(position)))
 
 
 def quadfun(r, p):
@@ -234,7 +301,7 @@ class Ellipse:
              + ((c * dy + s * dx) / self.q[1]) ** 2 \
              + self.q[5]
 
-    def contour(self, r=1, count=50):
+    def contour(self, r: float = 1.0, count: int = 50):
         """Return points tracing an ellipse contour at scaled radius r.
 
         Parameters
@@ -313,7 +380,7 @@ class Localize:
     """Iterative source localization using elliptical TS surface fitting.
 
     The algorithm:
-    1. Evaluate TS at 9 canonical points: the center plus 8 on an octagon ring.
+    1. Evaluate TS at nine canonical points: the center plus 8 on an octagon ring.
     2. Fit a quadratic form to those TS values.
     3. Convert the quadratic to ellipse parameters.
     4. Shift the source position and uncertainty toward the ellipse center.
@@ -325,24 +392,29 @@ class Localize:
 
     fit_radius = 2.5  # Ring radius in sigma units for TS sampling (modified from 2.0)
 
-    def __init__(self, psl, verbose=True):
+    def __init__(self, psl, verbose=True, sigma=None):
         """Initialize localization with a source and initial TS evaluation.
 
         Parameters
         ----------
         psl : object
-            Point source-like object with methods:
-            - dir() -> SkyDir: source position
-            - errorCircle() -> float: initial position uncertainty (sigma)
-            - TSmap(skydir) -> float: TS value at skydir
+            Localization target. Supported forms are:
+            - point source-like objects with ``dir()``, ``errorCircle()``, ``TSmap()``
+            - localization views with ``skydir`` (or ``source.skydir``) and ``delta_ts()``
         verbose : bool
             If True, print iteration progress and diagnostics.
+        sigma : float or None, optional
+            Initial position uncertainty in degrees when ``psl`` is a localization
+            view without an ``errorCircle()`` method. Ignored for legacy point
+            source-like inputs. Defaults to ``0.1`` for localization views.
         """
         self.verbose = verbose
-        self.psl = psl
-        self.dir = psl.dir()
-        self.ra, self.dec = self.dir.ra(), self.dir.dec()
-        self.sigma = psl.errorCircle()
+        self.psl = _LocalizationTargetAdapter(psl, sigma=sigma)
+        self.dir: SkyCoord = self.psl.dir()
+        dir_icrs = cast(Any, self.dir.icrs)
+        self.ra = float(dir_icrs.ra.deg)
+        self.dec = float(dir_icrs.dec.deg)
+        self.sigma = self.psl.errorCircle()
         self.qual_cache = -1
         if verbose:
             print(('initial: ra,dec, sigma:' + 3 * '%10.4f') % (self.ra, self.dec, self.sigma))
@@ -369,16 +441,16 @@ class Localize:
         idir = np.arange(9)[tsmax == ts][0]
         mdir = self.rcirc[idir]
         if self.verbose:
-            print('try ra,dec,ts =', mdir.ra(), mdir.dec(), tsmax)
-        self.ra = mdir.ra()
-        self.dec = mdir.dec()
+            print('try ra,dec,ts =', mdir.icrs.ra.deg, mdir.icrs.dec.deg, tsmax)
+        self.ra = float(mdir.icrs.ra.deg)
+        self.dec = float(mdir.icrs.dec.deg)
 
-    def TS(self, sdir):
+    def TS(self, position):
         """Evaluate TS at a sky direction.
 
         Parameters
         ----------
-        sdir : SkyDir
+        position : SkyCoord or SkyDir-like
             Sky direction.
 
         Returns
@@ -386,7 +458,7 @@ class Localize:
         float
             TS value at that direction.
         """
-        return self.psl.TSmap(sdir)
+        return self.psl.TSmap(_as_skycoord(position))
 
     def fit(self, update=True):
         """Evaluate TS on the ring and fit an ellipse; optionally update position.
@@ -417,7 +489,7 @@ class Localize:
             self.ra += self.ellipse.q[3] * self.sigma * radius
             self.dec += self.ellipse.q[4] * self.sigma * radius
 
-            self.dir = SkyDir(self.ra, self.dec)
+            self.dir = SkyCoord(self.ra, self.dec, unit='deg', frame='icrs')
             self.sigma = np.sqrt(self.ellipse.q[0] * self.ellipse.q[1]) * self.sigma * radius
             if verbose:
                 print(('update:  ra,dec, sigma:' + 3 * '%10.4f') % (self.ra, self.dec, self.sigma))
@@ -435,18 +507,18 @@ class Localize:
         ]
 
     def circle(self):
-        """Generate 9 SkyDir points for the TS evaluation ring.
+        """Generate 9 SkyCoord points for the TS evaluation ring.
 
         Returns
         -------
-        list[SkyDir]
+        list[SkyCoord]
             The points: center, then 8 on an octagon around it.
         """
         d = 1 / np.sqrt(2.)
         points = [(0, 0), (1, 0), (d, d), (0, 1), (-d, d), (-1, 0), (-d, -d), (0, -1), (d, -d)]
         ddec = Localize.fit_radius * self.sigma
         dra = ddec / np.cos(np.radians(self.dec))
-        return [SkyDir(self.ra + x * dra, self.dec + y * ddec) for x, y in points]
+        return [SkyCoord(self.ra + x * dra, self.dec + y * ddec, unit='deg', frame='icrs') for x, y in points]
 
     def quality(self, radius=2.5):
         """Compute a quality metric for the fit.
@@ -471,9 +543,9 @@ class Localize:
         xp, yp = qf.ellipse.contour(qf.fit_radius, 8)  # Get points at standard radius.
         ddec = radius * qf.sigma
         dra = ddec / np.cos(np.radians(qf.dec))
-        points = [SkyDir(qf.ra - x * dra, qf.dec + y * ddec) for x, y in zip(xp, yp)]
+        points = [SkyCoord(qf.ra - x * dra, qf.dec + y * ddec, unit='deg', frame='icrs') for x, y in zip(xp, yp)]
 
-        tszero = qf.TS(SkyDir(qf.ra, qf.dec)) - radius ** 2
+        tszero = qf.TS(SkyCoord(qf.ra, qf.dec, unit='deg', frame='icrs')) - radius ** 2
         ts = np.asarray([qf.TS(p) for p in points])  # Evaluate TS at the contour points.
         qual = np.sqrt(((ts - tszero) ** 2).sum())
         self.qual_cache = qual

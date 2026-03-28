@@ -6,6 +6,7 @@ This module defines:
 - concrete `PointSource`, `ExtendedSource`, and `GlobalSource` variants.
 """
 import numpy as np
+from typing import Any, cast
 # from . skydir import SkyDir
 from astropy.coordinates import SkyCoord#, Angle
 from . import spectral_models
@@ -73,6 +74,7 @@ def set_default_bounds( model, force=False):
     # Convert to ndarray so the free-parameter mask can index bounds directly.
     model.bounds = np.array(bounds)
 
+
 class Source(object):
     """Base class for all source types used by like3.
 
@@ -92,7 +94,7 @@ class Source(object):
         elif isinstance(self.skydir, SkyCoord):
             pass # already a SkyCoord, nothing to do
         elif hasattr(self.skydir, '__iter__'): #allow a tuple of (ra,dec)
-            self.skydir = SkyCoord(*self.skydir, unit='deg', frame=kwargs.get('frame', 'icrs'))
+            self.skydir = SkyCoord(*cast(tuple, self.skydir), unit='deg', frame=kwargs.get('frame', 'icrs'))
         if 'model' not in kwargs or self.model is None:
             self.model=LogParabola(1e-14, 2.2, 0, 1e3)
             self.model.free[2:]=False
@@ -116,13 +118,13 @@ class Source(object):
         elif self.model.name=='ExpCutoff':
             try:
                 print('converting %s to PLSuperExpCutoff' %self.name)
-                self.model = self.model.create_super_cutoff()
+                self.model = cast(spectral_models.ExpCutoff, self.model).create_super_cutoff()
             except FloatingPointError:
                 print('Failed')
                 
         elif self.model.name=='PowerLawFlux':
             f, gamma = self.model.get_all_parameters() #10**self.model.p
-            emin = self.model.emin
+            emin = cast(spectral_models.PowerLawFlux, self.model).emin  # type: ignore[attr-defined]
             try:
                 self.model=LogParabola(f*(gamma-1)/emin, gamma, 0, emin)
             except Exception as msg:
@@ -171,7 +173,7 @@ class Source(object):
 
     def __str__(self):
         sdir = 'None' if self.skydir is None\
-                    else f'({self.skydir.icrs.ra.deg:07.3f}, {self.skydir.icrs.dec.deg:+05.3f})'
+                    else f'({self.skydir.icrs.ra.deg:07.3f}, {self.skydir.icrs.dec.deg:+05.3f})'  # type: ignore[union-attr]
         return '\tname  : %s\n\ticrs  : %s\n\tmodel : %s\n\t\t%s' %\
     (self.name, sdir, self.model.name, self.model.__str__(indent='\t\t'))
     
@@ -186,8 +188,10 @@ class Source(object):
     def isglobal(self):
         return self.skydir is None
 
+
 class PointSource(Source):
     """Point-like source with PSF-based response construction."""
+    skydir: SkyCoord
 
     def __init__(self, **kwargs):
         kwargs.update(spatial_model=None) # allow test for extent (no extent!)
@@ -195,7 +199,7 @@ class PointSource(Source):
 
     def near(self, otherdir, distance=10):
         """Return True if separation from `otherdir` is below `distance` (deg)."""
-        return self.skydir.separation(otherdir).deg < distance
+        return float(self.skydir.separation(otherdir).deg) < distance  # type: ignore[arg-type]
 
     def copy(self, **kwargs):
         """ return a new PointSource object, with a copy of the model, others"""
@@ -212,6 +216,8 @@ class PointSource(Source):
 
 class ExtendedSource(Source):
     """Extended source with spatial model (`dmodel`) and convolved response."""
+    skydir: SkyCoord
+    dmodel: Any  # spatial model, set via kwargs
 
     #def __str__(self):
     #    return self.name + ' '+ self.model.name \
@@ -223,7 +229,7 @@ class ExtendedSource(Source):
   
     def near(self, otherdir, distance=10):
         """Return True if separation from `otherdir` is below `distance` (deg)."""
-        return self.skydir.separation(otherdir).deg < distance
+        return float(self.skydir.separation(otherdir).deg) < distance  # type: ignore[arg-type]
         
     def copy(self):
         """ return a new ExtendSource object, with a copy of the model object"""

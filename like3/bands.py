@@ -51,17 +51,20 @@ class Band(HEALPix):
             If provided, this is used for sparcifationn of model evaluation and gradient calculation.
             It can be set with the `simulate` method if not provided at initialization.
         """
+        from typing import Callable
         self.source_model = source_model
-        self.exposure_map = exposure_map
+        self.exposure_map: Callable = exposure_map  # type: ignore[assignment]
         self.data = data
-        for attr in 'energy nside psf'.split():
-            setattr(self, attr, band_info.get(attr))
+        self.energy = band_info.get("energy")
+        self.nside = band_info.get("nside")
+        self.psf = band_info.get("psf")
 
         # Initialize the HEALPix geometry used by response evaluators.
         super().__init__(self.nside, order='ring', frame='galactic')
         # set up exposure calculation function for this band based on energy, if not provided by a data-based exposure model
         if self.exposure_map is None:
             self.exposure_map = lambda pix: np.ones_like(pix) * 1e13 * self.energy / 100
+        assert callable(self.exposure_map), "exposure_map must be a callable function of pixel indices"
 
     def __repr__(self):
         return f'Band(energy={self.energy:.1f} MeV, et={self.psf.event_type} nside={self.nside})'
@@ -128,14 +131,9 @@ class Band(HEALPix):
             grad = src.model.gradient(self.energy)[src.model.free]
             _, v = src.response(self).evaluate(keys)
             g.append(v[:, None] * grad[None, :])
+        g = np.hstack(g)  # stack before scaling to avoid list * array error
         g *= self.exposure_map(keys)[:, None]  # apply exposure scaling to gradients
-        return  np.hstack(g)    
-
-    def predicted_counts(self):
-        """Return predicted counts in occupied pixels """
-        k, v = self.pixel_counts() 
-        v *= self.exposure_map(k)
-        return k, v
+        return g
 
     def simulate(self, random_state=None, total_counts=None,):
         """Simulate pixel counts for this band.
@@ -174,17 +172,62 @@ class Band(HEALPix):
         return k[select], counts[select]
 
     def loglike(self, skydir=None):
-        """Compute the Poisson log-likelihood ."""
+        """Evaluate the Poisson log-likelihood for the band's stored data.
+
+        Parameters
+        ----------
+        skydir : SkyCoord or None, optional
+            Trial sky position to apply before evaluating the likelihood.
+            When provided, this is forwarded to
+            `self.source_model.setposition(skydir)` and therefore mutates the
+            currently selected source model position. The position is not
+            restored by this method.
+
+        Returns
+        -------
+        float
+            The summed Poisson log-likelihood,
+            `sum(counts * log(model) - model)`, evaluated only on the pixels
+            stored in `self.data`.
+
+        Notes
+        -----
+        This method assumes `self.data` is a `(pixels, counts)` tuple. The
+        model is evaluated sparsely on those same pixel indices via
+        `pixel_counts(data_pix)`, so pixels not present in `self.data` do not
+        contribute to the result.
+        """
 
         if skydir is not None:
             self.source_model.setposition(skydir)
             
-        data_pix, counts = self.data
+        data_pix, counts = self.data if self.data is not None else (np.nan, np.nan)
 
         _, model = self.pixel_counts(data_pix)
 
         return np.sum(counts * np.log(model) - model)
 
+    def TSmap(self, skydir_grid):
+        """Evaluate a TS map on a grid of trial sky positions.
+
+        Parameters
+        ----------
+        skydir_grid : array-like of SkyCoord
+            Grid of trial sky positions to evaluate the TS map on.
+
+        Returns
+        -------
+        np.ndarray
+            TS values evaluated at each position in `skydir_grid`.
+        """
+        ts_values = []
+        for skydir in skydir_grid:
+            ll_null = self.loglike()  # log-likelihood under null hypothesis (no source)
+            ll_alt = self.loglike(skydir)  # log-likelihood under alternative hypothesis (source at skydir)
+            ts = 2 * (ll_alt - ll_null)  # TS is defined as twice the log-likelihood ratio
+            ts_values.append(ts)
+        return np.array(ts_values)
+    
     def plot_pixel_map(self, center, *, data=None, fig=None, label=None, log=True, **kwargs):
         """Plot per-pixel values for this band in a local ZEA projection.
 
@@ -233,6 +276,95 @@ class Band(HEALPix):
                 color='white', ha='right', va='top', fontsize=12)
         
 
+class BandListLocalizationView:
+    """Localization view for a BandList centered on the selected source.
+
+    Wraps a ``LocalizedSourceView`` and provides a pre-bound ``delta_ts``
+    method that uses the aggregated ``BandList.loglike`` for efficiency.
+    """
+
+    def __init__(self, bandlist, source_model_view):
+        """Bind to a BandList and its underlying SourceModel localization view."""
+        self.bandlist = bandlist
+        self.source_model_view = source_model_view
+        self.source = source_model_view.source
+
+    @property
+    def skydir(self):
+        """Current sky position from the underlying source model view."""
+        return self.source.skydir
+
+    def __getattr__(self, name):
+        """Delegate unknown attributes to the wrapped ``LocalizedSourceView``."""
+        return getattr(self.source_model_view, name)
+
+    def delta_ts(self, position=None, baseline=None):
+        """Evaluate delta TS using aggregated BandList likelihood.
+
+        Parameters
+        ----------
+        position : SkyCoord or None, optional
+            Trial sky position. If provided, return delta TS at that position.
+            If omitted, return a callable `f(position)`.
+        baseline : float, optional
+            Reference log-likelihood. If omitted, uses current selected-source position.
+
+        Returns
+        -------
+        float or callable
+            `2 * (loglike(position) - baseline)` for a single position, or callable.
+        """
+        return self.source_model_view.delta_ts(self.bandlist.loglike, position=position, baseline=baseline)
+
+    def make_grid(self, func, step=0.02, n=21,):
+        """Make a local grid of function values for a given position-dependent function.
+        
+        Parameters
+        ----------
+        func : callable
+            Function to evaluate on the grid. Should accept a `SkyCoord` and return a scalar.
+        step : float, optional
+            Grid spacing in degrees. Default is 0.02.
+        n : int, optional
+            Number of grid points along each axis. Default is 21.
+
+        Returns
+        -------
+        ra_grid, dec_grid, func_grid : ndarray
+            Grids of RA, Dec, and function values.
+        """
+
+        ra0  = self.source.skydir.icrs.ra.deg
+        dec0 = self.source.skydir.icrs.dec.deg
+
+        delta = np.linspace(-n // 2 * step, n // 2 * step, n)
+
+        ra_grid, dec_grid = np.meshgrid(ra0 + delta, dec0 + delta)
+
+        func_grid = np.array([
+            func(SkyCoord(ra, dec, unit='deg', frame='icrs')) 
+            for ra, dec in zip(ra_grid.ravel(), dec_grid.ravel())
+        ]).reshape(n, n)
+        return ra_grid, dec_grid, func_grid
+
+class _BandListLocalizationContext:
+    """Context-manager wrapper for BandList localization views."""
+
+    def __init__(self, bandlist, source_model_context):
+        """Bind to a BandList and its source-model context manager."""
+        self.bandlist = bandlist
+        self.source_model_context = source_model_context
+
+    def __enter__(self):
+        """Enter the source-model context and return a BandListLocalizationView."""
+        source_model_view = self.source_model_context.__enter__()
+        return BandListLocalizationView(self.bandlist, source_model_view)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit the source-model context, restoring selected-source position."""
+        return self.source_model_context.__exit__(exc_type, exc_val, exc_tb)
+
+
 class BandList(list):
     """Collection of `Band` objects sharing a single source model.
 
@@ -278,10 +410,25 @@ class BandList(list):
     def counts(self):
         """Return predicted total counts per band."""
         return np.array([ band.counts() for band in self])
+
+    def loglike(self, skydir=None):
+        """Return total Poisson log-likelihood summed over all bands.
+
+        Parameters
+        ----------
+        skydir : SkyCoord or None, optional
+            Trial sky position forwarded to each ``Band.loglike`` call.
+
+        Returns
+        -------
+        float
+            Sum of per-band log-likelihood values.
+        """
+        return float(np.sum([band.loglike(skydir=skydir) for band in self]))
             
     def count_gradient(self):
         """Return count gradient array for all free model parameters by band."""
-        g = np.array([band.pixel_gradient()  for band in self])
+        g = np.array([band.pixel_gradient(band.data) for band in self])
         return g[:, :, 0].T
     
     def simulate(self, random_state=42): 
@@ -292,79 +439,101 @@ class BandList(list):
         random_state : int or None
             Random state for reproducibility. If None, no noise is added.
         """
-        # compute predicted counts with current parameters
-        # predicted = self.pixel_counts()
-        # if random_state is None:
-        #     return predicted
+        for band in self:
+            band.data = band.simulate(random_state=random_state)
 
-        # # Draw one Poisson realization per band.
-        # rng = np.random.default_rng(random_state)
-        # return rng.poisson(predicted)
+    # def source_position_loglike(self, source_name, data=None, frame='galactic', clip=1e-30):
+    #     """Return a callable Poisson log-likelihood as a function of source position.
 
-    def source_position_loglike(self, source_name, data=None, frame='galactic', clip=1e-30):
-        """Return a callable Poisson log-likelihood as a function of source position.
+    #     The returned function evaluates the model log-likelihood while shifting a
+    #     single source to each trial position and keeping all other model elements
+    #     fixed.
 
-        The returned function evaluates the model log-likelihood while shifting a
-        single source to each trial position and keeping all other model elements
-        fixed.
+    #     Parameters
+    #     ----------
+    #     source_name : str or Source
+    #         Source identifier accepted by `SourceModel.find_source`.
+    #     data : sequence[tuple[np.ndarray, np.ndarray]] or None
+    #         Per-band observed data as `(pixels, counts)`. If omitted, uses
+    #         `band.data` for each band and requires all bands to have data set.
+    #     frame : str
+    #         Coordinate frame used when trial positions are given as `(lon, lat)`.
+    #     clip : float
+    #         Lower bound applied to model counts to avoid `log(0)`.
+
+    #     Returns
+    #     -------
+    #     callable
+    #         Function `f(position) -> loglike`, where `position` can be a
+    #         `SkyCoord` or a 2-tuple of degrees.
+    #     """
+    #     src = self.sources.find_source(source_name)
+    #     if src.skydir is None:
+    #         raise ValueError('source_position_loglike requires a localized source with skydir')
+
+    #     if data is None:
+    #         data = [band.data for band in self]
+    #     if len(data) != len(self):
+    #         raise ValueError('data length must match number of bands')
+    #     if any(d is None for d in data):
+    #         raise ValueError('missing band data; pass data explicitly or set band.data for all bands')
+
+    #     def to_coord(position):
+    #         if isinstance(position, SkyCoord):
+    #             return position
+    #         if hasattr(position, '__iter__') and len(position) == 2:
+    #             return SkyCoord(position[0], position[1], unit='deg', frame=frame)
+    #         raise ValueError(f'unrecognized position: {position}')
+
+    #     original_skydir = src.skydir
+
+    #     def loglike(position):
+    #         src.skydir = to_coord(position)
+    #         try:
+    #             total = 0.0
+    #             for band, band_data in zip(self, data):
+    #                 keys, counts = band_data
+    #                 model = np.zeros_like(counts, dtype=float)
+    #                 for source in band.source_model:
+    #                     flux = source.model(band.energy)
+    #                     _, response_values = source.response(band).evaluate(keys)
+    #                     model += response_values * flux
+    #                 model *= band.exposure_map(keys)
+    #                 model = np.clip(model, clip, None)
+    #                 total += np.sum(counts * np.log(model) - model)
+    #             return float(total)
+    #         finally:
+    #             src.skydir = original_skydir
+
+    #     return loglike
+    
+    def localization_view(self, source_name=None):
+        """Return a localization context-manager view for the selected source.
+
+        The returned context manager yields a ``BandListLocalizationView``
+        bound to the selected source, providing a pre-bound ``delta_ts``
+        method that uses the aggregated ``BandList.loglike`` for efficiency.
 
         Parameters
         ----------
-        source_name : str or Source
-            Source identifier accepted by `SourceModel.find_source`.
-        data : sequence[tuple[np.ndarray, np.ndarray]] or None
-            Per-band observed data as `(pixels, counts)`. If omitted, uses
-            `band.data` for each band and requires all bands to have data set.
-        frame : str
-            Coordinate frame used when trial positions are given as `(lon, lat)`.
-        clip : float
-            Lower bound applied to model counts to avoid `log(0)`.
+        source_name : str or None
+            Source identifier accepted by ``SourceModel.find_source``.
 
         Returns
         -------
-        callable
-            Function `f(position) -> loglike`, where `position` can be a
-            `SkyCoord` or a 2-tuple of degrees.
+        _BandListLocalizationContext
+            Context manager that yields ``BandListLocalizationView`` on ``__enter__``.
+
+        Usage
+        -----
+        .. code-block:: python
+
+            with bandlist.localization_view('Blazar') as loc:
+                delta_ts = loc.delta_ts()
+                ts_value = delta_ts(trial_position)
         """
-        src = self.sources.find_source(source_name)
-        if src.skydir is None:
-            raise ValueError('source_position_loglike requires a localized source with skydir')
-
-        if data is None:
-            data = [band.data for band in self]
-        if len(data) != len(self):
-            raise ValueError('data length must match number of bands')
-        if any(d is None for d in data):
-            raise ValueError('missing band data; pass data explicitly or set band.data for all bands')
-
-        def to_coord(position):
-            if isinstance(position, SkyCoord):
-                return position
-            if hasattr(position, '__iter__') and len(position) == 2:
-                return SkyCoord(position[0], position[1], unit='deg', frame=frame)
-            raise ValueError(f'unrecognized position: {position}')
-
-        original_skydir = src.skydir
-
-        def loglike(position):
-            src.skydir = to_coord(position)
-            try:
-                total = 0.0
-                for band, band_data in zip(self, data):
-                    keys, counts = band_data
-                    model = np.zeros_like(counts, dtype=float)
-                    for source in band.source_model:
-                        flux = source.model(band.energy)
-                        _, response_values = source.response(band).evaluate(keys)
-                        model += response_values * flux
-                    model *= band.exposure_map(keys)
-                    model = np.clip(model, clip, None)
-                    total += np.sum(counts * np.log(model) - model)
-                return float(total)
-            finally:
-                src.skydir = original_skydir
-
-        return loglike
+        sm_context = self.sources.localization_view(source_name)
+        return _BandListLocalizationContext(self, sm_context)
     
     @classmethod
     def demo(cls, model=None):
@@ -374,7 +543,7 @@ class BandList(list):
         print(f'Creating BandList for model: {model}')
         band_list = cls(model)
         for band in band_list:
-            print(f'{band}: counts={band.pixel_counts():.2e}')
+            print(f'{band}: counts={band.counts():.2e}')
         print('Counts per band:', band_list.counts().astype(int))
         return band_list
     

@@ -121,4 +121,8 @@ class PointResponse(HEALPix):
     
 class ExtendedResponse(Response):
     """Placeholder for future extended-source response implementation."""
-    pass
+
+    def __init__(self, source, band, roi=None, **kwargs):
+        self.source = source
+        self.band = band
+        self.roi = roi
