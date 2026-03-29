@@ -304,7 +304,16 @@ class SourceModel(list):
         SourceModelContext
             Context manager whose ``__enter__`` returns ``LocalizedSourceView``.
         """
-        if self.selected_source is None or self.selected_source.name != source_name:
+        # Accept either a source-name string or a source-like object.
+        # We do object membership resolution here so it works even when the
+        # instance originates from a reloaded module and fails isinstance checks.
+        if source_name is not None and not isinstance(source_name, str) and hasattr(source_name, 'name'):
+            if source_name in self:
+                self.selected_source = source_name
+                self.selected_source_index = self.index(source_name)
+            else:
+                self.find_source(source_name.name)
+        elif self.selected_source is None or self.selected_source.name != source_name:
             self.find_source(source_name)
         if self.selected_source is None:
             raise SourceModelException(f'source {source_name} not found')

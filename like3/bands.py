@@ -407,6 +407,45 @@ class BandList(list):
         # energies = [band.energy for band in self]
         # self.exposure_factor = np.full_like(energies, 1e13) * energies / 100
 
+        # Active band selection; None means all bands.
+        self._selected: list | None = None
+
+        # Fit outputs from the most recent ``fit`` call.
+        self.fit_info = {'correlation': None, 'errors': None}
+
+    def __iter__(self):
+        """Iterate over selected bands, or all bands if no selection is active."""
+        if self._selected is None:
+            return super().__iter__()
+        return (self[i] for i in self._selected)
+
+    def select(self, indices=None):
+        """Set active band selection for all iteration-based operations.
+
+        Parameters
+        ----------
+        indices : array-like of int or None
+            Band indices (0-based) to include in iteration. Pass ``None`` to
+            reset to all bands.
+
+        Returns
+        -------
+        self : BandList
+            Returns ``self`` for method chaining.
+
+        Examples
+        --------
+        Select only the first four bands (low energy)::
+
+            bandlist.select(range(4)).simulate()
+
+        Reset to all bands::
+
+            bandlist.select()
+        """
+        self._selected = None if indices is None else list(indices)
+        return self
+
     def counts(self):
         """Return predicted total counts per band."""
         return np.array([ band.counts() for band in self])
@@ -516,8 +555,10 @@ class BandList(list):
 
         Parameters
         ----------
-        source_name : str or None
-            Source identifier accepted by ``SourceModel.find_source``.
+        source_name : str, Source-like, or None
+            Source identifier accepted by ``SourceModel.localization_view``.
+            May be a source name string, a source object with ``name``, or
+            ``None`` to use the currently selected source.
 
         Returns
         -------
@@ -534,7 +575,156 @@ class BandList(list):
         """
         sm_context = self.sources.localization_view(source_name)
         return _BandListLocalizationContext(self, sm_context)
-    
+
+    def localize(self, source_name=None, sigma=0.1, verbose=True):
+        """Run localization for a source and return a ``quadform.Localize`` result.
+
+        Parameters
+        ----------
+        source_name : str, Source-like, or None
+            Source identifier accepted by ``SourceModel.localization_view``.
+            May be a source name string, a source object with ``name``, or
+            ``None`` to use the currently selected source.
+        sigma : float, optional
+            Initial localization uncertainty in degrees passed to
+            ``quadform.Localize``.
+        verbose : bool, optional
+            If True, print localization diagnostics.
+
+        Returns
+        -------
+        like3.quadform.Localize
+            Completed localization result object.
+
+        Notes
+        -----
+        This is a convenience wrapper around::
+
+            with bandlist.localization_view(source_name) as loc:
+                result = Localize(loc, sigma=sigma, verbose=verbose)
+        """
+        from .quadform import Localize
+
+        with self.localization_view(source_name) as loc:
+            return Localize(loc, sigma=sigma, verbose=verbose)
+
+    def fit(self, method='l-bfgs-b', quiet=True, use_gradient=True, **kwargs):
+        """Optimize the free spectral parameters of the source model.
+
+        Minimizes the negative log-likelihood summed over the active bands
+        using :class:`~like3.fitter.Minimizer`.
+
+        Parameters
+        ----------
+        method : str, optional
+            Optimization method forwarded to ``Minimizer.__call__``.  One of
+            ``'simplex'`` (default), ``'powell'``, or ``'l-bfgs-b'``.
+        quiet : bool, optional
+            Suppress optimizer diagnostic output.
+        use_gradient : bool, optional
+            If True, use the analytic gradient of the negative log-likelihood
+            when the selected optimizer supports gradients.
+        **kwargs
+            Additional keyword arguments forwarded to ``Minimizer.__call__``.
+
+        Returns
+        -------
+        fitvalue : float
+            Negative log-likelihood at the optimum.
+        parameters : np.ndarray
+            Best-fit free-parameter vector (in fitter space).
+        errors : np.ndarray
+            1-sigma uncertainties on free parameters (NaN if estimation failed).
+
+        Side Effects
+        ------------
+        Stores fit diagnostics on the instance in ``self.fit_info`` with keys
+        ``'correlation'`` and ``'errors'`` from the most recent fit.
+
+        Notes
+        -----
+        The fit updates the source model in place via ``parameters.set_parameters``.
+        The active band selection (``self._selected``) is respected — only the
+        selected bands contribute to the likelihood.
+        """
+        from .fitter import Minimizer, Fitted
+
+        pset = self.sources.parameters
+        bandlist = self  # capture for closure
+        initial_loglike = self.loglike()
+        use_gradient = kwargs.pop('use_gradient', use_gradient)
+
+        class _Objective(Fitted):
+            def __init__(self):
+                self._cache_pars = None
+                self._cache_value = None
+                self._cache_grad = None
+
+            @property
+            def bounds(self):
+                return bandlist.sources.bounds
+
+            @property
+            def parameter_names(self):
+                return bandlist.sources.parameter_names
+
+            def get_parameters(self):
+                return pset.get_parameters()
+
+            def set_parameters(self, par):
+                pset.set_parameters(par)
+
+            def _evaluate(self, pars, need_grad=False):
+                pars = np.asarray(pars, dtype=float)
+                if (
+                    self._cache_pars is not None
+                    and np.array_equal(pars, self._cache_pars)
+                    and (not need_grad or self._cache_grad is not None)
+                ):
+                    return self._cache_value, self._cache_grad
+
+                self.set_parameters(pars)
+                loglike = 0.0
+                grad = np.zeros_like(pars, dtype=float) if need_grad else None
+
+                for band in bandlist:
+                    if band.data is None:
+                        continue
+                    data_pix, counts = band.data
+                    _, model = band.pixel_counts(data_pix)
+                    model = np.clip(model, 1e-30, None)
+                    loglike += np.sum(counts * np.log(model) - model)
+
+                    if need_grad:
+                        dm_dtheta = band.pixel_gradient(band.data)
+                        grad -= ((counts / model - 1.0)[:, None] * dm_dtheta).sum(axis=0)
+
+                value = -float(loglike) + initial_loglike
+                self._cache_pars = np.array(pars, copy=True)
+                self._cache_value = value
+                self._cache_grad = None if grad is None else np.array(grad, copy=True)
+                return value, grad
+
+            def __call__(self, pars, *args):
+                value, _ = self._evaluate(pars, need_grad=use_gradient)
+                return value
+
+            def gradient(self, pars):
+                """Return gradient of the objective at ``pars``."""
+                _, grad = self._evaluate(pars, need_grad=True)
+                return grad
+
+        objective = _Objective()
+        minimizer = Minimizer(objective, quiet=quiet)
+        fit_out = minimizer(method=method, use_gradient=use_gradient, **kwargs)
+        best_pars = np.array(fit_out[1], copy=True)
+        self.fit_info = {
+            'correlation': np.array(minimizer.correlations(), copy=True),
+            'errors': np.array(minimizer.sigmas(), copy=True),
+            'gradient': np.array(objective.gradient(best_pars), copy=True),
+        }
+        return fit_out
+
     @classmethod
     def demo(cls, model=None):
         """Build a demo `BandList` and print per-band flux/count summaries."""

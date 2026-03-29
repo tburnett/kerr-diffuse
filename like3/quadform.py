@@ -39,48 +39,6 @@ def _as_skycoord(position: Any) -> SkyCoord:
     raise TypeError(f'Unsupported position type for SkyCoord conversion: {type(position)!r}')
 
 
-class _LocalizationTargetAdapter:
-    """Normalize supported localization inputs to a common interface.
-
-    Supported inputs are either:
-    - legacy point-source-like objects exposing ``dir()``, ``errorCircle()``, ``TSmap()``
-    - localization views exposing ``skydir`` (or ``source.skydir``) and ``delta_ts()``
-    """
-
-    def __init__(self, target: Any, sigma: float | None = None):
-        if all(hasattr(target, name) for name in ('dir', 'errorCircle', 'TSmap')):
-            self._dir = _as_skycoord(target.dir())
-            self._sigma = float(target.errorCircle())
-            self._tsmap = target.TSmap
-            return
-
-        if hasattr(target, 'delta_ts'):
-            if hasattr(target, 'skydir'):
-                self._dir = _as_skycoord(target.skydir)
-            elif hasattr(target, 'source') and hasattr(target.source, 'skydir'):
-                self._dir = _as_skycoord(target.source.skydir)
-            else:
-                raise TypeError('Localization view target must expose skydir or source.skydir')
-
-            self._sigma = float(0.1 if sigma is None else sigma)
-            self._tsmap = target.delta_ts()
-            return
-
-        raise TypeError(
-            'Localize requires either a point-source-like object with dir/errorCircle/TSmap '
-            'or a localization view with skydir and delta_ts()'
-        )
-
-    def dir(self) -> SkyCoord:
-        return self._dir
-
-    def errorCircle(self) -> float:
-        return self._sigma
-
-    def TSmap(self, position: Any) -> float:
-        return float(self._tsmap(_as_skycoord(position)))
-
-
 def quadfun(r, p):
     """Evaluate a 2D quadratic form at point r.
 
@@ -392,29 +350,39 @@ class Localize:
 
     fit_radius = 2.5  # Ring radius in sigma units for TS sampling (modified from 2.0)
 
-    def __init__(self, psl, verbose=True, sigma=None):
+    @staticmethod
+    def _get_skydir(target: Any) -> SkyCoord:
+        """Return current localization center as SkyCoord from a view-like target."""
+        if hasattr(target, 'skydir'):
+            return _as_skycoord(target.skydir)
+        if hasattr(target, 'source') and hasattr(target.source, 'skydir'):
+            return _as_skycoord(target.source.skydir)
+        raise TypeError('Localize requires target.skydir or target.source.skydir')
+
+    def __init__(self, psl, verbose=True, sigma=0.1):
         """Initialize localization with a source and initial TS evaluation.
 
         Parameters
         ----------
         psl : object
-            Localization target. Supported forms are:
-            - point source-like objects with ``dir()``, ``errorCircle()``, ``TSmap()``
-            - localization views with ``skydir`` (or ``source.skydir``) and ``delta_ts()``
+            Localization-view target exposing ``skydir`` (or ``source.skydir``)
+            and ``delta_ts()``.
         verbose : bool
             If True, print iteration progress and diagnostics.
         sigma : float or None, optional
-            Initial position uncertainty in degrees when ``psl`` is a localization
-            view without an ``errorCircle()`` method. Ignored for legacy point
-            source-like inputs. Defaults to ``0.1`` for localization views.
+            Initial position uncertainty in degrees. Defaults to ``0.1``.
         """
         self.verbose = verbose
-        self.psl = _LocalizationTargetAdapter(psl, sigma=sigma)
-        self.dir: SkyCoord = self.psl.dir()
+        if not hasattr(psl, 'delta_ts'):
+            raise TypeError('Localize requires a localization view exposing delta_ts()')
+
+        self.psl = psl
+        self._delta_ts = psl.delta_ts()
+        self.dir: SkyCoord = self._get_skydir(psl)
         dir_icrs = cast(Any, self.dir.icrs)
         self.ra = float(dir_icrs.ra.deg)
         self.dec = float(dir_icrs.dec.deg)
-        self.sigma = self.psl.errorCircle()
+        self.sigma = sigma
         self.qual_cache = -1
         if verbose:
             print(('initial: ra,dec, sigma:' + 3 * '%10.4f') % (self.ra, self.dec, self.sigma))
@@ -458,7 +426,7 @@ class Localize:
         float
             TS value at that direction.
         """
-        return self.psl.TSmap(_as_skycoord(position))
+        return float(self._delta_ts(_as_skycoord(position)))
 
     def fit(self, update=True):
         """Evaluate TS on the ring and fit an ellipse; optionally update position.
