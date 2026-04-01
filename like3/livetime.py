@@ -6,9 +6,13 @@ exploration in ``exposure.ipynb`` so they can be imported from code.
 
 from __future__ import annotations
 
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+import os
 from pathlib import Path
 import pickle
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import numpy as np
 import astropy.units as u
@@ -24,6 +28,94 @@ __all__ = [
     "read_livetime_map",
     "write_healpix_map",
 ]
+
+
+def _ensure_scipy_trapz_compat() -> None:
+    """Provide scipy.integrate.trapz for older healpy compatibility."""
+    try:
+        import scipy.integrate as sp_integrate
+    except Exception:
+        return
+    if not hasattr(sp_integrate, "trapz"):
+        sp_integrate.trapz = np.trapz
+
+
+def _write_livetime_output(path: str | Path, livetime_map: np.ndarray, overwrite: bool) -> Path:
+    """Write livetime output to FITS or NPY based on file extension."""
+    outpath = Path(path)
+    suffix = outpath.suffix.lower()
+    if suffix == ".fits":
+        return write_healpix_map(outpath, livetime_map.astype(np.float32), overwrite=overwrite)
+    if suffix == ".npy":
+        if outpath.exists() and not overwrite:
+            raise FileExistsError(f"Refusing to overwrite existing file: {outpath}")
+        np.save(outpath, livetime_map.astype(np.float32))
+        return outpath
+    raise ValueError("Output filename must end with '.fits' or '.npy'.")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Create a GTI-filtered livetime map file for an MJD interval."
+    )
+    parser.add_argument(
+        "output",
+        type=Path,
+        help="Output livetime file path (.fits or .npy)",
+    )
+    parser.add_argument(
+        "--nside",
+        type=int,
+        default=128,
+        help="HEALPix NSIDE for the output map (default: 128)",
+    )
+    parser.add_argument(
+        "--mjd-min",
+        type=float,
+        required=False,
+        default=0.0,
+        help="Minimum MJD (inclusive), default: 0.0 (no lower limit)",
+    )
+    parser.add_argument(
+        "--mjd-max",
+        type=float,
+        required=True,
+        help="Maximum MJD (inclusive)",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite an existing output file",
+    )
+    parser.add_argument(
+        "--preprocess-workers",
+        type=int,
+        default=None,
+        help="Worker count for weekly GTI preprocessing (default: auto)",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.nside <= 0:
+        parser.error("--nside must be a positive integer")
+    if args.mjd_min >= args.mjd_max:
+        parser.error("Require --mjd-min < --mjd-max")
+
+    result = build_livetime_map(
+        nside=int(args.nside),
+        save=False,
+        mjd_range=(float(args.mjd_min), float(args.mjd_max)),
+        preprocess_workers=args.preprocess_workers,
+    )
+    livetime_map = np.asarray(result["livetime_map"], dtype=np.float32)
+    outpath = _write_livetime_output(args.output, livetime_map, overwrite=bool(args.overwrite))
+
+    total_livetime = float(result["total_livetime"])
+    print(f"Wrote livetime map to {outpath} ({livetime_map.size} pixels, total livetime={total_livetime:.3f})")
+    return 0
 
 
 def write_healpix_map(
@@ -99,6 +191,20 @@ def merge_exclusions(*interval_sets: Iterable[float]) -> np.ndarray:
     return np.asarray(merged, dtype=float).ravel()
 
 
+def _extract_week_exclusion_edges(
+    week_file: str | Path,
+    mjd_converter: Callable[[np.ndarray], np.ndarray],
+) -> np.ndarray | None:
+    """Extract MJD exclusion edges from one weekly pickle file."""
+    with open(week_file, "rb") as inp:
+        wk = pickle.load(inp)
+    gti_times = wk.get("gti_times", None)
+    if gti_times is None or len(gti_times) < 4:
+        return None
+    # Week files store good intervals in MET; GTI expects excluded in MJD.
+    return np.asarray(mjd_converter(gti_times)[1:-1], dtype=float)
+
+
 def build_livetime_map(
     config=None,
     nside: int = 64,
@@ -107,6 +213,7 @@ def build_livetime_map(
     save: bool = True,
     overwrite: bool = True,
     mjd_range: tuple[float, float] | None = None,
+    preprocess_workers: int | None = None,
 ) -> dict:
     """Build a GTI-filtered livetime map and optionally save it.
 
@@ -131,12 +238,16 @@ def build_livetime_map(
     mjd_range : tuple[float, float] or None
         Optional MJD interval ``(mjd_min, mjd_max)`` used to limit spacecraft
         data in ``DataView``. If None, uses all available times.
+    preprocess_workers : int or None
+        Worker count for parallel weekly GTI preprocessing. ``None`` uses an
+        automatic value and ``1`` disables parallel preprocessing.
 
     Returns
     -------
     dict
         Dictionary with map and metadata, plus output paths if saved.
     """
+    _ensure_scipy_trapz_compat()
     from wtlike.config import Config, MJD
     from wtlike.data_man import GTI, DataView, get_week_files
 
@@ -155,15 +266,23 @@ def build_livetime_map(
             raise ValueError("Require mjd_min < mjd_max")
         interval = (mjd_min, mjd_max)
 
-    exclusion_edges = []
-    for wf in week_files_all:
-        with open(wf, "rb") as inp:
-            wk = pickle.load(inp)
-        gti_times = wk.get("gti_times", None)
-        if gti_times is None or len(gti_times) < 4:
-            continue
-        # Week files store good intervals in MET; GTI expects excluded in MJD.
-        exclusion_edges.append(MJD(gti_times)[1:-1])
+    if preprocess_workers is not None and int(preprocess_workers) < 1:
+        raise ValueError("preprocess_workers must be >= 1 or None")
+
+    if preprocess_workers is None:
+        auto_workers = min(32, (os.cpu_count() or 1) + 4)
+        worker_count = min(auto_workers, max(1, len(week_files_all)))
+    else:
+        worker_count = min(int(preprocess_workers), max(1, len(week_files_all)))
+
+    if worker_count == 1 or len(week_files_all) < 2:
+        extracted = [_extract_week_exclusion_edges(wf, MJD) for wf in week_files_all]
+    else:
+        extract_fn = partial(_extract_week_exclusion_edges, mjd_converter=MJD)
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            extracted = list(executor.map(extract_fn, week_files_all))
+
+    exclusion_edges = [arr for arr in extracted if arr is not None]
 
     if len(exclusion_edges) == 0:
         raise RuntimeError("No GTI information found in weekly files.")
@@ -237,6 +356,7 @@ def zenith_angle_map_from_sc(
     np.ndarray
         Livetime-weighted mean zenith angle per pixel in degrees.
     """
+    _ensure_scipy_trapz_compat()
     from wtlike.config import Config
     from wtlike.data_man import get_week_files
 
@@ -341,3 +461,7 @@ def read_livetime_map(path: str | Path, dtype=np.float32) -> np.ndarray:
     if not inpath.exists():
         raise FileNotFoundError(f"Could not find {inpath}")
     return _read_healpix_fits(inpath, dtype=dtype)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

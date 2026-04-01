@@ -14,13 +14,44 @@ import matplotlib.pyplot as plt
 from astropy.coordinates import SkyCoord, Angle
 from astropy_healpix import HEALPix 
 from pathlib import Path
+from typing import cast
+
+
+def _event_type_to_int(value):
+    """Normalize event-type labels/codes to the FITS integer convention."""
+    if isinstance(value, str):
+        label = value.strip().upper()
+        if label == 'FRONT':
+            return 0
+        if label == 'BACK':
+            return 1
+        if label.startswith('PSF'):
+            return int(label[3:]) + 2
+        if label.isdigit():
+            return int(label)
+    if isinstance(value, (int, np.integer)):
+        ivalue = int(value)
+        if 0 <= ivalue <= 5:
+            return ivalue
+    raise ValueError(f'Unsupported event type: {value!r}')
+
+
+def _event_type_to_label(value):
+    """Convert FITS event-type integers to band labels."""
+    ivalue = _event_type_to_int(value)
+    if ivalue == 0:
+        return 'FRONT'
+    if ivalue == 1:
+        return 'BACK'
+    return f'PSF{ivalue - 2}'
 
 
 class PixelTable(dict):
     """Container for pixel table bands and their sparse per-pixel arrays.
 
-    The class loads `<root>.npz` payloads and `<root>.pickle` metadata, then
-    exposes each `(psf_index, energy_index)` band through dictionary access.
+    The class loads either Kerr `<root>.npz` and `<root>.pickle` companions or
+    a Kerr-style FITS file, then exposes each `(psf_index, energy_index)` band
+    through dictionary access.
     """
 
     class Band(HEALPix):
@@ -32,29 +63,57 @@ class PixelTable(dict):
 
         def __init__(self, meta):
             self.psf, self.e0, self.e1, nside, self.nocc = meta
+            self.event_type = _event_type_to_int(self.psf)
             self.counts = 0
+            self.pix = np.array([], dtype=np.int64)
+            self.photons = np.array([], dtype=np.int32)
+            self.diffuse = np.array([], dtype=float)
+            self.ptsrc = np.array([], dtype=float)
+            self.extsrc: np.ndarray | None = None
+            self.sunmoon: np.ndarray | None = None
+            self.exposure: float | None = None
+            self.pixel_exposure: np.ndarray | None = None
+            self.exposure_map = None
+            self.exposure_map_values: np.ndarray | None = None
+            self.aeff_costheta = None
+            self.slice = slice(0, 0)
+            self.totals: dict[str, object] = {}
             ekey = lambda energy: (np.log10(energy) * 4 - 8).astype(int)
 
             # key is (psf index, energy index) tuple
-            self.key = (int(self.psf[-1]), ekey(self.e0))
+            psf_index = self.event_type if self.event_type < 2 else self.event_type - 2
+            self.key = (int(psf_index), ekey(self.e0))
             self.energy = f'{np.sqrt(self.e0 * self.e1) * 1e-3:.2f} GeV'
             super().__init__(nside, frame='galactic', order='nested')
 
         def __repr__(self) -> str:
             return f"Band{self.key}: {self.psf}@{self.energy} nside {self.nside} occ {self.nocc/(12*self.nside**2):.3f}"
 
+        def _optional_component(self, name):
+            """Return an optional model component array when present."""
+            component = getattr(self, name)
+            return component if component is not None else None
+
         def _model_counts(self):
             """Return the full model counts vector for this band."""
+            extsrc = self._optional_component('extsrc')
+            sunmoon = self._optional_component('sunmoon')
             return (
                 self.diffuse
                 + self.ptsrc
-                + (self.extsrc if hasattr(self, 'extsrc') else 0)
-                + (self.sunmoon if hasattr(self, 'sunmoon') else 0)
+                + (extsrc if extsrc is not None else 0)
+                + (sunmoon if sunmoon is not None else 0)
             )
 
         def _component_values(self, component):
             """Resolve component name to a per-pixel values array."""
             model = self._model_counts()
+            extsrc = self._optional_component('extsrc')
+            sunmoon = self._optional_component('sunmoon')
+            if component == 'exposure':
+                if self.pixel_exposure is None:
+                    raise ValueError('No pixel exposure has been attached to this band')
+                return self.pixel_exposure
             if component == 'resid':
                 return self.photons - model
             if component == 'sigma':
@@ -66,8 +125,8 @@ class PixelTable(dict):
                 'data': self.photons,
                 'diffuse': self.diffuse,
                 'ptsrc': self.ptsrc,
-                'extsrc': self.extsrc if hasattr(self, 'extsrc') else np.zeros_like(self.photons),
-                'sunmoon': self.sunmoon if hasattr(self, 'sunmoon') else np.zeros_like(self.photons),
+                'extsrc': extsrc if extsrc is not None else np.zeros_like(self.photons),
+                'sunmoon': sunmoon if sunmoon is not None else np.zeros_like(self.photons),
             }
             return components[component]
 
@@ -85,6 +144,12 @@ class PixelTable(dict):
                 # converted to ring: must convert back to nested first
                 return self.ring_to_nested(pix)
             return pix
+
+        def _pixels_for_map_order(self, *, nest=False):
+            """Return current sparse pixels in the requested map ordering."""
+            if nest:
+                return self.pix if self.order == 'nested' else self.ring_to_nested(self.pix)
+            return self.pix if self.order == 'ring' else self.nested_to_ring(self.pix)
 
         def pix_to_ring(self, *, inplace=False):
             """Convert and optionally store pixel indices using RING ordering."""
@@ -110,10 +175,31 @@ class PixelTable(dict):
             # return  np.in1d(self.pix, cone_pix)
 
         def ring_map(self, nside=None, component='data', frame='galactic'):
-            """Return, for display purposes, a HEALPix RING map of the selected component or combination.
-                nside: if set, and less than the Band's, combine pixels to this nside
-                component: 'data', 'diffuse', 'ptsrc', 'model' (diffuse+ptsrc), 'resid' (data-model)
-                frame: 'galactic', 'geocentricmeanecliptic', 'equatorial', etc.
+            """Create a HEALPix RING map of a component at specified resolution.
+
+            Parameters
+            ----------
+            nside : int, optional
+                Target HEALPix resolution. If None or greater than band nside,
+                uses band's native nside. Must be a valid HEALPix value.
+            component : str, optional
+                Component to map:
+                - 'data': observed photon counts
+                - 'diffuse': diffuse model component
+                - 'ptsrc': point-source model component
+                - 'model': combined model (diffuse + ptsrc + extsrc + sunmoon)
+                - 'resid': residuals (data - model)
+                - 'sigma': normalized residuals (resid / sqrt(model))
+                Default is 'data'.
+            frame : str, optional
+                Astropy coordinate frame for output map. Common values:
+                'galactic' (default), 'icrs', 'geocentricmeanecliptic'.
+
+            Returns
+            -------
+            np.ndarray
+                1D array of length 12*nside^2 in RING ordering.
+                Zero values replaced with NaN for display purposes.
             """
             from astropy_healpix import HEALPix
 
@@ -132,7 +218,37 @@ class PixelTable(dict):
         
         def ait_plot(self, component, *, nside=128, figsize=(12,6), fig=None, colorbar=True, 
                      shrink=0.7, cmap='viridis', frame='galactic', log=True, **kwargs):
-            """Render an all-sky AIT projection for one band component."""
+            """Render an all-sky AIT projection for one band component.
+
+            Parameters
+            ----------
+            component : str
+                Component to visualize (see `ring_map` for valid names).
+            nside : int, optional
+                Map resolution. Default is 128.
+            figsize : tuple, optional
+                Figure size (width, height). Default is (12, 6).
+            fig : matplotlib.figure.Figure, optional
+                Existing figure to draw on; creates new if None.
+            colorbar : bool, optional
+                Whether to display a colorbar. Default is True.
+            shrink : float, optional
+                Colorbar size relative to axis. Default is 0.7.
+            cmap : str, optional
+                Matplotlib colormap name. Default is 'viridis'.
+            frame : str, optional
+                Sky coordinate frame. Default is 'galactic'.
+            log : bool, optional
+                If True, display log10(counts) with log scale; zero values shown as NaN.
+                Default is True.
+            **kwargs
+                Additional arguments passed to imshow().
+
+            Returns
+            -------
+            utilities.skymaps.AITfigure
+                Chainable figure object. Call .show() to display.
+            """
             from utilities.skymaps import AITfigure
 
             mp = self.ring_map(nside, component=component, frame=frame)
@@ -147,7 +263,39 @@ class PixelTable(dict):
         def zea_plot(self, component, center, *, nside=256, figsize=(8,8), 
                     pixelsize=0.05, size=5, fig=None,
                      cmap='viridis', colorbar=True, title=None,**kwargs):
-            """Render a local ZEA projection around `center` for one component."""
+            """Render a local Zero Equal Area projection around a center coordinate.
+
+            Parameters
+            ----------
+            component : str
+                Component to visualize (see `ring_map` for valid names).
+            center : astropy.coordinates.SkyCoord or tuple
+                Center of projection. If tuple, interpreted as (lon, lat) in degrees
+                using the frame parameter.
+            nside : int, optional
+                Map resolution. Default is 256.
+            figsize : tuple, optional
+                Figure size. Default is (8, 8).
+            pixelsize : float, optional
+                Pixel size in degrees. Default is 0.05.
+            size : float, optional
+                Field of view side length in degrees. Default is 5.
+            fig : matplotlib.figure.Figure, optional
+                Existing figure; creates new if None.
+            cmap : str, optional
+                Matplotlib colormap. Default is 'viridis'.
+            colorbar : bool, optional
+                Display colorbar. Default is True.
+            title : str, optional
+                Plot title; auto-generated if None.
+            **kwargs
+                Additional arguments to imshow().
+
+            Returns
+            -------
+            utilities.skymaps.ZEAfigure
+                Chainable figure object.
+            """
             from utilities.skymaps import ZEAfigure
 
             zfig = ZEAfigure(center, size=size, fig=fig, figsize=figsize, pixelsize=pixelsize,
@@ -163,10 +311,21 @@ class PixelTable(dict):
             return zfig    
         
         def get_outliers(self, sigma_min=4):
-            """Return pixels whose normalized residual exceeds `sigma_min`.
+            """Extract pixels with normalized residual exceeding a threshold.
 
-            Returns a DataFrame with NESTED pixel ids plus data/model/sigma
-            values computed from full-resolution maps.
+            Parameters
+            ----------
+            sigma_min : float, optional
+                Significance threshold in sigma units. Default is 4.
+
+            Returns
+            -------
+            pd.DataFrame
+                Outlier data with columns:
+                    - pixel (int): NESTED pixel index
+                    - data (float): observed counts
+                    - model (float): model counts
+                    - sigma (float): normalized residual (data-model)/sqrt(model)
             """
             
             d, m = self.ring_map(None, 'data',), self.ring_map(None, 'model')
@@ -176,29 +335,39 @@ class PixelTable(dict):
             return pd.DataFrame( dict(pixel=self.ring_to_nested(pix[out]), data=d[out], model=m[out], sigma=r[out] )) 
          
        
-    def __init__(self, root, *, ring=False):
-        """Load a pixel table from companion `.npz` and `.pickle` files.
+    def __init__(self, root, *, ring=None):
+        """Load a pixel table from Kerr `.npz/.pickle` or FITS input.
 
         Parameters
         ----------
         root : str or Path
-            Common path stem for the serialized pixel-table files.
-        ring : bool, optional
-            If true, convert stored pixel indices to RING ordering after load.
+            Either a path stem for `<root>.npz` and `<root>.pickle`, or a FITS
+            filename containing `SKYMAP` and `BANDS` HDUs.
+        ring : bool or None, optional
+            Output pixel ordering. For Kerr `.npz/.pickle` input, `None` and
+            `False` both preserve NESTED ordering while `True` converts to RING.
+            For FITS input, `None` infers ordering from the `SKYMAP` header.
         """
-
-        import pickle
         root = Path(root).expanduser()
-  
-        filename, meta = root.with_suffix('.npz'), root.with_suffix('.pickle')
         super().__init__()
+
+        name = root.name.lower()
+        if any(name.endswith(ext) for ext in ('.fits', '.fit', '.fits.gz', '.fit.gz', '.fts')):
+            self._load_from_fits(root, ring=ring)
+        else:
+            self._load_from_kerr(root, ring=ring)
+
+    def _load_from_kerr(self, root, *, ring=None):
+        """Load sparse arrays and metadata from a Kerr `.npz/.pickle` pair."""
+        import pickle
+
+        filename, meta_file = root.with_suffix('.npz'), root.with_suffix('.pickle')
         self.name = root.name
-        self.ring = ring
+        self.ring = False
 
         with np.load(filename) as f:
-            # print('keyes', f.keys())
             self.diffuse = f['diffuse']
-            self.ptsrc  = f['pointsources']
+            self.ptsrc = f['pointsources']
             self.photons = f['counts'].astype(np.int32)
             self.pix = f['indices']
             if 'extendedsources' in f:
@@ -206,18 +375,91 @@ class PixelTable(dict):
             if 'sunmoon' in f:
                 self.sunmoon = f['sunmoon']
 
-        with open(meta, 'rb') as inp:
+        with open(meta_file, 'rb') as inp:
             meta = pickle.load(inp)
-            self.meta_df = pd.DataFrame(meta, columns='event_type emin emax nside nocc'.split())
-        self.meta_df['occupancy']= (self.meta_df.nocc/(12*self.meta_df.nside**2)).round(3)
+
+        self._setup_from_arrays(meta, source=filename, ring=bool(ring))
+
+    def _load_from_fits(self, filename, *, ring=None):
+        """Load sparse arrays and metadata from a Kerr-style FITS file."""
+        filename = Path(filename).expanduser()
+        self.name = filename.stem
+        self.ring = False
+
+        with fits.open(filename) as hdul:
+            skymap = cast(fits.BinTableHDU, hdul['SKYMAP'])
+            bands = cast(fits.BinTableHDU, hdul['BANDS'])
+            skymap_data = skymap.data
+            bands_data = bands.data
+            if skymap_data is None or bands_data is None:
+                raise ValueError(f'Invalid FITS table payload in {filename}')
+
+            pix = np.asarray(skymap_data['PIX'], dtype=np.int64)
+            chn = np.asarray(skymap_data['CHANNEL'], dtype=np.int64)
+            photons = np.asarray(skymap_data['VALUE'], dtype=np.int32)
+            pixel_exposure = None
+            skymap_names = skymap_data.names or ()
+            if 'EXPOSURE' in skymap_names:
+                pixel_exposure = np.asarray(skymap_data['EXPOSURE'], dtype=float)
+
+            if chn.size == 0:
+                raise ValueError(f'No rows found in SKYMAP HDU: {filename}')
+
+            order_idx = np.argsort(chn, kind='stable')
+            pix = pix[order_idx]
+            chn = chn[order_idx]
+            photons = photons[order_idx]
+            if pixel_exposure is not None:
+                pixel_exposure = pixel_exposure[order_idx]
+
+            nside = np.asarray(bands_data['NSIDE'], dtype=int)
+            emin = np.asarray(bands_data['E_MIN'], dtype=float) * 1e-3
+            emax = np.asarray(bands_data['E_MAX'], dtype=float) * 1e-3
+            event_type = np.asarray(bands_data['EVENT_TYPE'], dtype=int)
+            band_exposure = None
+            band_names = bands_data.names or ()
+            if 'EXPOSURE' in band_names:
+                band_exposure = np.asarray(bands_data['EXPOSURE'], dtype=float)
+
+            nbands = len(nside)
+            nocc = np.bincount(chn, minlength=nbands)
+
+            event_labels = [_event_type_to_label(et) for et in event_type]
+            meta = [
+                (event_labels[i], float(emin[i]), float(emax[i]), int(nside[i]), int(nocc[i]))
+                for i in range(nbands)
+            ]
+
+            ordering = str(skymap.header.get('ORDERING', 'NESTED')).strip().upper()
+            inferred_ring = ordering == 'RING'
+
+        self.photons = photons
+        self.pix = pix
+        if pixel_exposure is not None:
+            self.pixel_exposure = pixel_exposure
+        # FITS SKYMAP stores counts; initialize model arrays for API compatibility.
+        self.diffuse = np.zeros_like(photons, dtype=float)
+        self.ptsrc = np.zeros_like(photons, dtype=float)
+
+        target_ring = inferred_ring if ring is None else bool(ring)
+        self._setup_from_arrays(meta, source=filename, ring=target_ring)
+        if band_exposure is not None:
+            self.meta_df = self.meta_df.copy()
+            self.meta_df['exposure'] = np.asarray(band_exposure, dtype=float)
+            for band, value in zip(self.values(), band_exposure):
+                band.exposure = float(value)
+
+    def _setup_from_arrays(self, meta, *, source, ring=False):
+        """Build per-band objects from flattened sparse arrays and metadata."""
+        self.meta_df = pd.DataFrame(meta, columns='event_type emin emax nside nocc'.split())
+        self.meta_df['occupancy'] = (self.meta_df.nocc / (12 * self.meta_df.nside**2)).round(3)
 
         nbands = len(meta)
         offset = 0
         for i, m in enumerate(meta):
             b = self.Band(m)
-            # Each band points into a contiguous slice of the sparse arrays.
             self[b.key] = b
-            nocc = m[-1]
+            nocc = int(m[-1])
             sl = slice(offset, offset + nocc)
             b.slice = sl
             for attr in ('diffuse', 'ptsrc', 'photons', 'pix'):
@@ -227,26 +469,229 @@ class PixelTable(dict):
                     setattr(b, attr, getattr(self, attr)[sl])
             offset += nocc
             b.totals = dict(diffuse=self.diffuse[-nbands + i], ptsrc=self.ptsrc[-nbands + i])
-        # the total pixel sums
-        self.totals = dict(diffuse=self.diffuse[offset:], ptsrc=self.ptsrc[offset:])
-            
-        print(f"""Loaded pixel table from "{filename}":
-            {len(self)} bands {self[(0,4)]} ... {self[(3,11)]}
+
+        self.meta_df['event_type_code'] = [self[key].event_type for key in self.keys()]
+
+        if len(self.diffuse) >= offset + nbands and len(self.ptsrc) >= offset + nbands:
+            self.totals = dict(diffuse=self.diffuse[offset:], ptsrc=self.ptsrc[offset:])
+        else:
+            self.totals = dict(
+                diffuse=np.array([self.diffuse.sum()], dtype=float),
+                ptsrc=np.array([self.ptsrc.sum()], dtype=float),
+            )
+
+        keys = sorted(self.keys())
+        if keys:
+            band_summary = f"{self[keys[0]]} ... {self[keys[-1]]}"
+        else:
+            band_summary = "no bands"
+
+        print(f"""Loaded pixel table from "{source}":
+            {len(self)} bands {band_summary}
             {self.photons.sum().astype(int):,d} photons
             {len(self.pix):,d} pixels
             """)
-        
+
         if ring:
             for b in self.values():
                 b.pix_to_ring(inplace=True)
-
-            # Band pixel arrays are views/copies detached from `self.pix`, so
-            # copy their updated ordering back into the flattened storage.
             for b in self.values():
                 self.pix[b.slice] = b.pix
+            self.ring = True
+
+        if hasattr(self, 'pixel_exposure'):
+            self._set_pixel_exposure_from_flat(self.pixel_exposure)
+        elif 'exposure' in self.meta_df.columns:
+            exposure = np.asarray(self.meta_df['exposure'], dtype=float)
+            for band, value in zip(self.values(), exposure):
+                band.exposure = float(value)
+
+    @staticmethod
+    def _frame_name(frame):
+        name = getattr(frame, 'name', frame)
+        return str(name).lower()
+
+    def _set_pixel_exposure_from_flat(self, values):
+        """Populate per-band exposure arrays from a flattened sparse array."""
+        flat = np.asarray(values, dtype=float)
+        if flat.shape != self.pix.shape:
+            raise ValueError(
+                f'Flat exposure array shape {flat.shape} does not match pixel array shape {self.pix.shape}'
+            )
+
+        self.pixel_exposure = flat
+        per_band = []
+        for band in self.values():
+            pixel_exp = flat[band.slice]
+            band.pixel_exposure = pixel_exp
+            band.exposure = float(np.nanmean(pixel_exp)) if pixel_exp.size else np.nan
+            per_band.append(band.exposure)
+
+        self.meta_df = self.meta_df.copy()
+        self.meta_df['exposure'] = np.asarray(per_band, dtype=float)
+        self._refresh_pixel_exposure_df()
+
+    def _refresh_pixel_exposure_df(self):
+        """Build the long-form per-pixel exposure table from attached band arrays."""
+        records = []
+        for band in self.values():
+            if band.pixel_exposure is None:
+                continue
+            records.append(
+                pd.DataFrame({
+                    'band_key': [band.key] * len(band.pix),
+                    'pix': np.asarray(band.pix, dtype=int),
+                    'pixel_exposure': np.asarray(band.pixel_exposure, dtype=float),
+                })
+            )
+        if records:
+            self.pixel_exposure_df = pd.concat(records, ignore_index=True)
+        elif hasattr(self, 'pixel_exposure_df'):
+            delattr(self, 'pixel_exposure_df')
+
+    def _resolve_band_exposure(self, band, source, *, frame='galactic', nest=False):
+        """Evaluate one exposure source into a per-pixel array for a band."""
+        from like3.exposure import ExposureMap
+
+        exposure_map_obj = None
+        map_values = None
+
+        if source is None or (np.isscalar(source) and not np.isfinite(source)):
+            pixel_exp = np.full(len(band.pix), np.nan, dtype=float)
+            return pixel_exp, exposure_map_obj, map_values
+
+        if np.isscalar(source):
+            scalar = float(np.asarray(source, dtype=float))
+            pixel_exp = np.full(len(band.pix), scalar, dtype=float)
+            return pixel_exp, exposure_map_obj, map_values
+
+        if isinstance(source, ExposureMap):
+            exposure_map_obj = source
+            map_values = np.asarray(source.values, dtype=float)
+            pixel_exp = np.asarray(source(band.skycoords), dtype=float)
+            return pixel_exp, exposure_map_obj, map_values
+
+        if callable(source):
+            for arg in (band.skycoords, np.asarray(band.pix, dtype=int)):
+                try:
+                    values = source(arg)
+                except Exception:
+                    continue
+                values = np.asarray(values, dtype=float)
+                if values.ndim == 0:
+                    return np.full(len(band.pix), float(values), dtype=float), exposure_map_obj, map_values
+                if values.shape == (len(band.pix),):
+                    return values.astype(float, copy=False), exposure_map_obj, map_values
+            raise ValueError(f'Exposure callable for band {band.key} did not return scalar or len(band.pix) values')
+
+        arr = np.asarray(source, dtype=float)
+        if arr.ndim != 1:
+            raise ValueError(f'Exposure for band {band.key} must be scalar, callable, or 1D array')
+
+        if arr.shape == (len(band.pix),):
+            return arr.astype(float, copy=False), exposure_map_obj, map_values
+
+        nside = int(np.sqrt(arr.size / 12.0))
+        if 12 * nside**2 != arr.size:
+            raise ValueError(
+                f'Exposure array for band {band.key} has length {arr.size}; expected len(band.pix)={len(band.pix)} '
+                'or a full-sky HEALPix map'
+            )
+
+        same_frame = self._frame_name(frame) == self._frame_name(getattr(band, 'frame', 'galactic'))
+        exposure_map_obj = ExposureMap(arr, nside=nside, nest=nest, frame=frame)
+        map_values = np.asarray(arr, dtype=float)
+        if same_frame and int(nside) == int(band.nside):
+            indices = band._pixels_for_map_order(nest=bool(nest))
+            pixel_exp = arr[np.asarray(indices, dtype=int)]
+        else:
+            pixel_exp = np.asarray(exposure_map_obj(band.skycoords), dtype=float)
+        return pixel_exp.astype(float, copy=False), exposure_map_obj, map_values
+
+    def attach_exposure(self, exposure_by_band, *, frame='galactic', nest=False):
+        """Attach per-pixel exposure arrays to each band.
+
+        Parameters
+        ----------
+        exposure_by_band : mapping
+            Dict keyed by ``band.key``. Values may be scalars, arrays aligned
+            with ``band.pix``, full-sky HEALPix arrays, callables, or
+            ``like3.exposure.ExposureMap`` instances.
+        frame : str, optional
+            Sky frame for full-sky HEALPix maps. Default is ``'galactic'``.
+        nest : bool, optional
+            Ordering for input full-sky HEALPix arrays. Default is ``False``.
+        """
+        self.meta_df = self.meta_df.copy()
+        self.meta_df['band_key'] = [band.key for band in self.values()]
+
+        flat = np.full(len(self.pix), np.nan, dtype=float)
+        per_band = {}
+        for band in self.values():
+            source = exposure_by_band.get(band.key)
+            pixel_exp, exposure_map_obj, map_values = self._resolve_band_exposure(
+                band,
+                source,
+                frame=frame,
+                nest=nest,
+            )
+            band.pixel_exposure = np.asarray(pixel_exp, dtype=float)
+            band.exposure = float(np.nanmean(band.pixel_exposure)) if band.pixel_exposure.size else np.nan
+            if exposure_map_obj is not None:
+                band.exposure_map = exposure_map_obj
+            if map_values is not None:
+                band.exposure_map_values = np.asarray(map_values, dtype=float)
+            flat[band.slice] = band.pixel_exposure
+            per_band[band.key] = band.exposure
+
+        self.pixel_exposure = flat
+        self.meta_df['exposure'] = self.meta_df['band_key'].map(per_band).astype(float)
+        self._refresh_pixel_exposure_df()
+        return self
+
+    def build_exposure(self, livetime, **kwargs):
+        """Compute and attach band exposure maps using like3.exposure utilities."""
+        from like3.exposure import build_pixel_table_exposure
+
+        return build_pixel_table_exposure(self, livetime, **kwargs)
+
+    # @classmethod
+    # def from_fits(cls, filename, *, ring=None):
+    #     """Create a PixelTable by reading a Kerr-style FITS file.
+
+    #     Parameters
+    #     ----------
+    #     filename : str or Path
+    #         FITS file path containing SKYMAP and BANDS HDUs.
+    #     ring : bool or None, optional
+    #         If None, infer output ordering from SKYMAP ORDERING header.
+    #         If bool, force NESTED (False) or RING (True) pixel ordering.
+    #     """
+    #     return cls(filename, ring=ring)
  
     def __call__(self, *pars):
-        """Return a band by `(psf_index, energy_index)` tuple."""
+        """Return a band by (psf_index, energy_index) tuple.
+
+        Parameters
+        ----------
+        *pars : int
+            Exactly 2 positional arguments: psf_index (0-3) and energy_index (0-11 typical).
+
+        Returns
+        -------
+        PixelTable.Band
+            The requested band object.
+
+        Raises
+        ------
+        ValueError
+            If not exactly 2 indices provided.
+
+        Examples
+        --------
+        >>> pt = PixelTable('files/toby_v4')
+        >>> band = pt(2, 4)  # PSF2, energy bin 4
+        """
         if len(pars) != 2:
             raise ValueError("Provide psf and energy bin index")
         return self[pars]
@@ -300,25 +745,74 @@ class PixelTable(dict):
             zfig.colorbar(label='log10(counts)', shrink=0.7)
         return zfig
 
+    def to_fits(self, filename, *, overwrite=True):
+        """Write this PixelTable to a Kerr-style FITS file.
+
+        Parameters
+        ----------
+        filename : str or Path
+            Output FITS filename.
+        overwrite : bool, optional
+            Overwrite existing file. Default is True.
+
+        Returns
+        -------
+        Path
+            Path to the written FITS file.
+        """
+        out = Path(filename).expanduser()
+        KerrDataFile(self).writeto(out, overwrite=overwrite)
+        return out
+
         
-def multi_ait(self, et, component='diffuse'):
+def multi_ait(pixel_table, et, component='diffuse'):
     """Generate a 3x4 panel of band-level AIT plots for one event-type prefix.
+
+    Parameters
+    ----------
+    pixel_table : PixelTable
+        Pixel table object holding band entries.
+    et : str or int
+        Event type selector. Accepts integer PSF index (0-3), strings like
+        '0', 'PSF0', 'psf3', or legacy labels ending with a digit.
+    component : str, optional
+        Component name to visualize ('diffuse', 'ptsrc', 'data', etc.).
+        Defaults to 'diffuse'.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Figure containing 3x4 AIT projections (one per band with energy labels).
 
     Notes
     -----
-    `self` should be a dictionary-like object holding band entries keyed by
-    strings such as `psf0123...`.
+    Creates a grid with 3 rows (event types) and 4 columns (energy bins),
+    displaying AIT projections for each band with automatic nside=128 resolution.
     """
+    if isinstance(et, str):
+        s = et.strip().upper()
+        if s.startswith('PSF'):
+            psf_idx = int(s[3:])
+        elif s.isdigit():
+            psf_idx = int(s)
+        else:
+            psf_idx = int(s[-1])
+    else:
+        psf_idx = int(et)
+
+    band_keys = sorted([k for k in pixel_table.keys() if int(k[0]) == psf_idx], key=lambda k: k[1])
+
     fig = plt.figure(layout='constrained', figsize=(13,5))
     subfigs = fig.subfigures(3,4, wspace=0.07)
-    keys = [f'{et}'+ k for k in '0123456789ABCDEF']
 
-    for sfig, key in zip(subfigs.flat, keys):
-        if key not in self:
+    for sfig, key in zip(subfigs.flat, band_keys):
+        if key not in pixel_table:
             continue
-        b  = self[key]
+        b = pixel_table[key]
         ait = b.ait_plot( component, nside=128, fig=sfig, colorbar=False)
         ait.title(str(b), fontsize=10)
+
+    return fig
 
 def residual_scatter(model, norm, ax=None, ylim=np.array([-5,5])):
     """Plot normalized residuals against model counts per pixel.
@@ -326,6 +820,28 @@ def residual_scatter(model, norm, ax=None, ylim=np.array([-5,5])):
     The x-axis is shown in log10(model-count) space, with tick labels rendered
     as powers of ten for readability. A binned mean and standard deviation are
     overlaid on top of the raw point cloud.
+
+    Parameters
+    ----------
+    model : np.ndarray
+        Model counts per pixel (linear scale).
+    norm : np.ndarray
+        Normalized residual values (sigma units).
+    ax : matplotlib.axes.Axes, optional
+        Axis to draw on. If None, creates a new figure/axis.
+    ylim : np.ndarray, optional
+        Y-axis range (in sigma units). Default is [-5, 5].
+
+    Returns
+    -------
+    matplotlib.axes.Axes
+        The plot axis.
+
+    Notes
+    -----
+    - X-axis displays log10(model) with scientific notation tick labels
+    - Binned statistics (mean ± std) overlaid in yellow
+    - Raw points clipped and plotted with light transparency
     """
     x = np.log10(model)
     y = norm
@@ -355,7 +871,31 @@ class ResidualPlotter:
     """Compute and visualize per-band residual diagnostics."""
 
     def __init__(self, band, nside=64):
-        """Precompute residual, model, and normalized residual maps."""
+        """Precompute residual, model, and normalized residual maps.
+
+        Parameters
+        ----------
+        band : PixelTable.Band
+            Band to analyze.
+        nside : int, optional
+            Target resolution for map degradation. Default is 64.
+            Uses minimum of requested nside and band's native nside.
+
+        Attributes Set
+        ---------------
+        band : Band
+            Reference to input band.
+        nside : int
+            Effective resolution (min of input and band nside).
+        photons : np.ndarray
+            Observed photon counts map (RING, length 12*nside^2).
+        model : np.ndarray
+            Model counts map (RING).
+        resid : np.ndarray
+            Residual map: photons - model (RING).
+        rnorm : np.ndarray
+            Normalized residuals: resid / sqrt(model) (RING).
+        """
         self.nside = min(nside, band.nside) if nside is not None else band.nside
         self.resid = band.ring_map(component='resid', nside=self.nside) 
         self.model = band.ring_map(component='model', nside=self.nside)
@@ -368,13 +908,25 @@ class ResidualPlotter:
     def residual_adjustment(self, ylim=np.array([-10,10]), ax=None):
         """Fit a quadratic trend to percent residuals versus model level.
 
+        Computes a polynomial correction to the model based on residual bias
+        as a function of model intensity. Stores coefficients and adjusted model
+        for later use.
+
         Parameters
         ----------
         ylim : np.ndarray, optional
-            Y-range used for the diagnostic scatter plot.
+            Y-range for diagnostic scatter plot, in percent. Default is [-10, 10].
         ax : matplotlib.axes.Axes, optional
-            Axis to draw the diagnostic plot on. If omitted, only the fit is
-            computed and stored.
+            Axis to draw diagnostic plot on. If None, computes fit but does not
+            plot. Default is None.
+
+        Attributes Set
+        ---------------
+        coefficients : np.ndarray
+            3 polynomial coefficients [a, b, c] for fit: y = a*x^2 + b*x + c
+            where x = log10(model) and y = percent residual.
+        adjusted_model : np.ndarray
+            Bias-corrected model counts using the fitted polynomial.
         """
         rpct = 100*(self.photons/self.model -1)
         # Fit in log-count space to capture broad normalization drift.
@@ -393,18 +945,27 @@ class ResidualPlotter:
             # ax.legend()
 
     def residual_hist(self, ax=None, rnorm=None, ylim=np.array([-5,5]), legend_fontsize=14):
-        """Plot a residual histogram with an overlaid Gaussian fit.
+        """Plot residual histogram with Gaussian fit overlay.
+
+        Renders a normalized histogram of residual values with kernel density
+        estimation and overlaid Gaussian probability density function showing
+        fitted mean and standard deviation.
 
         Parameters
         ----------
         ax : matplotlib.axes.Axes, optional
-            Axis to draw on. A new figure/axis is created if omitted.
+            Axis to draw on. Creates new figure/axis if None. Default is None.
         rnorm : np.ndarray, optional
-            Residual values to histogram. Defaults to `self.rnorm`.
+            Residual values (sigma units) to histogram. Uses self.rnorm if None.
         ylim : np.ndarray, optional
-            Histogram x-range.
+            Histogram x-range (sigma units). Default is [-5, 5].
         legend_fontsize : int, optional
-            Font size for the fitted-parameter legend.
+            Font size for fitted parameters legend. Default is 14.
+
+        Returns
+        -------
+        matplotlib.axes.Axes
+            The plot axis.
         """
         from scipy.stats import norm
 
@@ -423,7 +984,19 @@ class ResidualPlotter:
                yscale='log',xlim=ylim, ylim=(1e-4, 0.5))
 
     def plots(self):
-        """Render a standard diagnostic dashboard for one band."""
+        """Render a standard 4-panel diagnostic dashboard.
+
+        Displays:
+        1. All-sky AIT projection of observed photons
+        2. All-sky AIT projection of normalized residuals (cooled with coolwarm cmap)
+        3. Scatter plot of normalized residuals vs log10(model) with binned statistics
+        4. Normalized residual histogram with Gaussian fit overlay
+
+        Notes
+        -----
+        This is a convenience method for quick per-band diagnostics.
+        For publication-quality plots, consider using individual plot methods.
+        """
 
         from utilities.skymaps import AITfigure
 
@@ -451,8 +1024,29 @@ class ResidualPlotter:
         plt.show()
 
 
-def multi_residual_plotter(self, nside=64):
-    """Plot residual histograms in a PSF x energy grid."""
+def multi_residual_plotter(pixel_table, nside=64):
+    """Plot residual histograms in a PSF x energy grid.
+
+    Parameters
+    ----------
+    pixel_table : PixelTable
+        Pixel table containing bands to plot.
+    nside : int, optional
+        HEALPix resolution for residual map degradation. Default is 64.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Figure with 4 rows (PSF0-3) × 9 columns (energy bins),
+        displaying residual histograms with Gaussian fit overlays.
+
+    Notes
+    -----
+    - Top row contains energy bin labels (e.g., '1.33 GeV')
+    - Left column contains PSF labels (PSF0, PSF1, PSF2, PSF3)
+    - Each cell shows normalized residual distribution with μ and σ from fit
+    - Missing or invalid bands are hidden
+    """
     fig, axx = plt.subplots(
         5, 9, figsize=(15, 6), sharex=True, sharey=True,
         gridspec_kw={'hspace': 0.1, 'wspace': 0,
@@ -464,17 +1058,17 @@ def multi_residual_plotter(self, nside=64):
     # Energy labels across the top row
     for energy_idx, ax in enumerate(axx[0, 1:]):
         ax.axis('off')
-        ax.text(0.5, 0.5, self(3, energy_idx).energy,
+        ax.text(0.5, 0.5, pixel_table(3, energy_idx).energy,
                 transform=ax.transAxes, fontsize=18, ha='center', va='center')
 
     # PSF label column and histogram grid
     for psf_idx, row in enumerate(axx[1:]):
-        row[0].text(0.5, 0.5, self(psf_idx, 7).psf.upper(),
+        row[0].text(0.5, 0.5, pixel_table(psf_idx, 7).psf.upper(),
                     transform=row[0].transAxes, fontsize=18, ha='center', va='center')
         row[0].axis('off')
         for energy_idx, ax in enumerate(row[1:]):
             try:
-                band = self(psf_idx, energy_idx)
+                band = pixel_table(psf_idx, energy_idx)
             except KeyError:
                 ax.set_visible(False)
                 continue
@@ -522,14 +1116,22 @@ class KerrDataFile:
     each channel.
     """
     def __init__(self, kerrmodel, *,order='ring'):
-        """Wrap a `PixelTable` and expose FITS writing helpers.
+        """Wrap a PixelTable and expose FITS export utilities.
 
         Parameters
         ----------
         kerrmodel : PixelTable
-            Source table to serialize.
+            Pixel table instance to serialize.
         order : str, optional
-            Declared output ordering metadata (`ring`/`nested`).
+            Declared pixel ordering in output FITS header ('ring' or 'nested').
+            Default is 'ring'.
+
+        Attributes
+        -----------
+        pixeltable : PixelTable
+            Reference to source pixel table.
+        order : str
+            Declared ordering for FITS export.
         """
         self.pixeltable = kerrmodel
         self.order = order
@@ -539,7 +1141,17 @@ class KerrDataFile:
     
 
     def skymap_hdu(self):
-        """Create the sparse SKYMAP HDU with PIX/CHANNEL/VALUE columns."""
+        """Create sparse SKYMAP HDU with PIX/CHANNEL/VALUE columns.
+
+        Returns
+        -------
+        astropy.io.fits.BinTableHDU
+            Binary table with columns:
+                - PIX (uint32): NESTED pixel indices
+                - CHANNEL (uint32): Band/channel index into BANDS HDU
+                - VALUE (uint32): Photon counts per pixel
+            Includes HEALPix metadata in header (ORDERING, COORDSYS, etc.).
+        """
         km = self.pixeltable
 
         nocc = km.meta_df.nocc.to_numpy()
@@ -551,6 +1163,10 @@ class KerrDataFile:
             fits.Column(name='CHANNEL', format='I',array=chn),
             fits.Column(name='VALUE', format='J',  array=km.photons),
         ]
+        if hasattr(km, 'pixel_exposure'):
+            pixel_exposure = np.asarray(km.pixel_exposure, dtype=float)
+            if pixel_exposure.shape == km.pix.shape:
+                cols.append(fits.Column(name='EXPOSURE', format='D', array=pixel_exposure))
         hdu=fits.BinTableHDU.from_columns(cols, name='SKYMAP')
         hdu.header.update(
             PIXTYPE='HEALPIX',
@@ -563,20 +1179,49 @@ class KerrDataFile:
         return hdu  
 
     def band_hdu(self, version=5):
-        """Create the BANDS HDU containing NSIDE/energy/event-type metadata."""
+        """Create BANDS HDU containing NSIDE/energy/event-type metadata.
+
+        Parameters
+        ----------
+        version : int, optional
+            FITS version number stored in HDU header. Default is 5.
+
+        Returns
+        -------
+        astropy.io.fits.BinTableHDU
+            Binary table with columns:
+                - NSIDE (int64): HEALPix nside per band
+                - E_MIN (float64): Minimum energy in keV
+                - E_MAX (float64): Maximum energy in keV
+                - EVENT_TYPE (int64): Event type code
+        """
         df = self.pixeltable.meta_df
         band_cols = [
             fits.Column(name='NSIDE', format='J', array=df.nside),
             fits.Column(name='E_MIN', format='D', array=df.emin*1e+3, unit='keV'),
             fits.Column(name='E_MAX', format='D', array=df.emax*1e+3, unit='keV'),
-            fits.Column(name='EVENT_TYPE', format='J', array=df.event_type.apply(lambda x: int(x[-1])+2)),
+            fits.Column(name='EVENT_TYPE', format='J', array=df.event_type.apply(_event_type_to_int)),
         ]
+        if 'exposure' in df.columns:
+            band_cols.append(fits.Column(name='EXPOSURE', format='D', array=np.asarray(df.exposure, dtype=float)))
         hdu=fits.BinTableHDU.from_columns(band_cols, name='BANDS')
         hdu.header.update(VERSION=version)
         return hdu
 
     def writeto(self, filename, overwrite=True):
-        """Write primary, SKYMAP, and BANDS HDUs to `filename`."""
+        """Write FITS file with PrimaryHDU, SKYMAP, and BANDS extensions.
+
+        Parameters
+        ----------
+        filename : str or Path
+            Output FITS filename.
+        overwrite : bool, optional
+            Overwrite existing file. Default is True.
+
+        Prints
+        ------
+        Status message indicating successful write and ring/nested ordering.
+        """
 
         hdus=[fits.PrimaryHDU(), 
               self.skymap_hdu(), 
@@ -595,23 +1240,72 @@ class KerrDataFile:
     
     @classmethod
     def to_fits(cls, kerrfile, fitsfile, *, ring=False, overwrite=True):
-        """Translate a Kerr `.npz/.pickle` pair into the FITS representation."""
+        """Translate a Kerr `.npz/.pickle` pair into FITS representation.
+
+        Parameters
+        ----------
+        kerrfile : str or Path
+            Path stem for input .npz/.pickle files.
+        fitsfile : str or Path
+            Output FITS filename.
+        ring : bool, optional
+            If True, convert pixels to RING ordering before export. Default is False.
+        overwrite : bool, optional
+            Overwrite existing FITS file. Default is True.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        This is a convenience classmethod that loads the pixel table and
+        calls writeto() in a single operation.
+        """
         km = PixelTable(kerrfile, ring=ring )
         cls(km).writeto(fitsfile, overwrite=overwrite)
 
-def grouper(points, radius,):
-    """Group a SkyCoord array of points into connected clusters using a separation threshold.
+def grouper(points, radius):
+    """Group SkyCoord points into connected clusters via separation threshold.
+
+    Uses depth-first traversal to find connected components where two points
+    are neighbors if separated by <= radius degrees.
 
     Parameters
     ----------
-    points : SkyCoord array
+    points : astropy.coordinates.SkyCoord
+        Array of sky coordinates (length N).
     radius : float
-        Maximum pairwise separation, in degrees, for two points to be considered neighbors.
+        Maximum pairwise separation in degrees for graph connectivity.
+        Must be > 0.
 
     Returns
     -------
     list[np.ndarray]
-        A list of clusters, where each cluster is an array of point indices.
+        List of clusters, each containing indices of grouped points.
+        Cluster membership is returned as integer arrays into the original
+        points array.
+
+    Raises
+    ------
+    ValueError
+        If radius <= 0.
+
+    Notes
+    -----
+    Algorithm:
+    1. Maintain unvisited set of all point indices
+    2. Starting from unvisited seed, DFS to find all connected neighbors
+    3. Repeat until all points visited
+    4. Return list of clusters
+
+    Examples
+    --------
+    >>> from astropy.coordinates import SkyCoord
+    >>> coords = SkyCoord([0, 1, 5, 6], [0, 1, 0, 1], unit='deg')
+    >>> clusters = grouper(coords, radius=1.5)
+    >>> clusters
+    [array([0, 1]), array([2, 3])]
     """
 
     if radius <= 0:
@@ -653,7 +1347,22 @@ def grouper(points, radius,):
     return clusters
 
 def plot_residuals_for_given_energy(pixel_table, energy_index):
-    """Scatter residuals vs model counts for one energy bin across all PSFs."""
+    """Scatter residuals vs model counts for one energy bin across all PSFs.
+
+    Parameters
+    ----------
+    pixel_table : PixelTable
+        Pixel table to analyze.
+    energy_index : int
+        Energy bin index (0–11 typical).
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Figure with 2×2 grid (one panel per PSF type) showing photons vs model
+        scatter plots with normalized residual on y-axis and model counts (log scale)
+        on x-axis.
+    """
     def mdplot(band,ax=None):
         """Render one PSF panel for the selected energy slice."""
         d = band.photons; m = band.diffuse+band.ptsrc+band.sunmoon
@@ -674,7 +1383,21 @@ def plot_residuals_for_given_energy(pixel_table, energy_index):
     return fig
 
 def histograms_of_residuals_for_given_energy(pixel_table, energy_index):
-    """Plot residual histograms for one energy bin across all PSFs."""
+    """Plot residual histograms for one energy bin across all PSFs.
+
+    Parameters
+    ----------
+    pixel_table : PixelTable
+        Pixel table to analyze.
+    energy_index : int
+        Energy bin index (0–11 typical).
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Figure with 2×2 grid (one panel per PSF type) showing normalized
+        residual distributions with Gaussian fit overlays.
+    """
     fig, axx = plt.subplots(2,2, figsize=(8,6),sharey=True, sharex=True)
     for i, ax in enumerate(axx.flat):
         pt = pixel_table(i, energy_index)
@@ -689,7 +1412,39 @@ class ResidualPoints:
     """Collect and cluster significant residual pixels across PSF bands."""
     
     def __init__(self, pixel_table, energy_index, sigma_min=5):
-        """Build a merged outlier table for one energy index across PSFs."""
+        """Collect outliers across PSF bands at fixed energy and prepare for clustering.
+
+        Parameters
+        ----------
+        pixel_table : PixelTable
+            Pixel table instance.
+        energy_index : int
+            Energy bin index (selects the same energy across all 4 PSF bands).
+        sigma_min : float, optional
+            Significance threshold in sigma units. Outliers with |sigma| >= sigma_min
+            are included. Default is 5.
+
+        Attributes Set
+        ---------------
+        bands : list[Band]
+            List of 4 Band objects (PSF0-3) at specified energy_index.
+        sigma_min : float
+            Threshold used for outlier selection.
+        df : pd.DataFrame
+            Merged outlier table from all bands with columns:
+                - pixel, data, model, sigma (from Band.get_outliers)
+                - glon, glat (in degrees, rescaled to [-180, 180])
+                - psf (PSF index 0-3)
+                - nside (band HEALPix nside)
+        skycoord : SkyCoord
+            Galactic sky coordinates of all outliers.
+        cluster_idx : list[np.ndarray] or None
+            Cluster membership (set by clusterer()). None until clusterer() called.
+        cldf : pd.DataFrame or None
+            Cluster summary (set by clusterer()). None until clusterer() called.
+        clpoints : SkyCoord or None
+            Representative points per cluster (set by ait_cluster_plot()).
+        """
         
         self.bands = [pixel_table(i, energy_index) for i in range(4)]
         self.sigma_min = sigma_min
@@ -711,7 +1466,15 @@ class ResidualPoints:
 
 
     def ait_plot(self):
-        """Plot all selected residual points on an AIT projection."""
+        """Plot all selected residual points on an AIT projection.
+
+        Returns
+        -------
+        utilities.skymaps.AITfigure
+            Chainable AIT figure showing all outlier points. Marker sizes
+            scale with (data - model) to emphasize larger residuals.
+            Title shows count and significance threshold.
+        """
         from utilities.skymaps import AITfigure
         energy = self.bands[0].energy
         afig = AITfigure(
@@ -758,7 +1521,22 @@ class ResidualPoints:
         self.cldf = pd.DataFrame.from_dict(cld, orient='index')['glon glat data model sigma n ids'.split()]
 
     def zea_plot(self, center, size=5, **kwargs):
-        """Plot residual points in a local ZEA projection around `center`."""
+        """Plot residual points in a local ZEA projection.
+
+        Parameters
+        ----------
+        center : SkyCoord or tuple
+            Center of projection.
+        size : float, optional
+            Field of view side length in degrees. Default is 5.
+        **kwargs
+            Additional arguments to ZEAfigure.
+
+        Returns
+        -------
+        utilities.skymaps.ZEAfigure
+            Local projection with points sized and colored by significance.
+        """
         from utilities.skymaps import ZEAfigure
 
         zfig = ZEAfigure(center, size=size, fig=None, figsize=(8,8), title='Residual clusters', frame='galactic')
@@ -767,7 +1545,23 @@ class ResidualPoints:
         return zfig
     
     def ait_cluster_plot(self, *, figsize=(10,10), title=None, **kwargs):
-        """Plot one representative point per cluster in an AIT projection."""
+        """Plot one representative point per cluster in AIT projection.
+
+        Parameters
+        ----------
+        figsize : tuple, optional
+            Figure size. Default is (10, 10).
+        title : str, optional
+            Plot title. Auto-generated if None.
+        **kwargs
+            Additional arguments to AITfigure.
+
+        Notes
+        -----
+        Representative point for each cluster is the pixel with largest model count.
+        Marker sizes scale with cluster size (number of points).
+        Colors scale with maximum significance per cluster.
+        """
         from utilities.skymaps import AITfigure
         self.clpoints = SkyCoord(self.cldf.glon, self.cldf.glat, unit='deg', frame='galactic')
         if title is None:

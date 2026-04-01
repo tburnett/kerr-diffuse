@@ -114,12 +114,31 @@ class SourceModel(list):
         return np.array(names)
     
     def find_source(self, source_name):
-        """ Search for the source with the given name
-        
-        source_name : [string | None | sources.Source instance ]
-            if the first or last character is '*', perform a wild card search, return first match
-            if None, and a source has been selected, return it
-            if an instance, and in the list, just select it and return it
+        """Return and select a source by name or object.
+
+        Parameters
+        ----------
+        source_name : str, Source, or None
+            Selector for the desired source.
+
+            - ``None``: return the currently selected source.
+            - ``Source`` instance: validate membership and select it.
+            - ``str``: exact name match, or wildcard prefix/suffix match
+              when the string begins or ends with ``*``.
+
+              Examples: ``"Blazar"``, ``"Bla*"``, ``"*zar"``.
+
+        Returns
+        -------
+        Source
+            The matched source. On success, updates ``selected_source`` and
+            ``selected_source_index``.
+
+        Raises
+        ------
+        SourceModelException
+            If no source is selected when ``source_name`` is ``None``, or if
+            no matching source is found.
         """
         if source_name is None:
             if self.selected_source is None:
@@ -162,16 +181,22 @@ class SourceModel(list):
 
     def add_source(self, newsource=None, **kw):
         """Add a source to the model and rebuild parameter indexing.
-        
-        parameters
+
+        Parameters
         ----------
-        newsource : Source object or None
-            if None, expect source to be defined as a PointSource by the keywords
-            
-        keywords:
-            name : string
-            model : uw.like.Models object
-            skydir : skymaps.SkyDir object | (ra,dec) 
+        newsource : Source or None
+            Existing source object to append. If ``None``, this method builds
+            a new ``sources.PointSource`` from ``**kw``.
+        **kw : dict
+            Keyword arguments forwarded to ``sources.PointSource`` when
+            ``newsource`` is ``None``. Common keys include ``name``, ``model``,
+            and ``skydir``.
+
+        Returns
+        -------
+        Source or None
+            The appended source on success. Returns ``None`` if a source with
+            the same name already exists.
         """
         if newsource is not None:
             assert isinstance(newsource, sources.Source)
@@ -187,7 +212,18 @@ class SourceModel(list):
         return newsource
      
     def del_source(self, source_name):
-        """Remove a source from the model and rebuild parameter indexing."""
+        """Remove and return a source from the model.
+
+        Parameters
+        ----------
+        source_name : str, Source, or None
+            Source selector accepted by ``find_source``.
+
+        Returns
+        -------
+        Source
+            The removed source object.
+        """
         source = self.find_source(source_name) # first get it
         self.remove(source)
         self.initialize()
@@ -195,12 +231,22 @@ class SourceModel(list):
         
     def set_model(self, model, source_name=None):
         """Replace selected source model and return `(source, old_model)`.
-        
-        model : string, or like.Models.Model object
-            if string, evaluate. Note that 'PowerLaw(1e-11,2.0)' will work. Also supported:
-            ExpCutoff, PLSuperExpCutoff, LogParabola, each with all parameters required.
-        source_name: None or string
-            if None, use currently selected source
+
+        Parameters
+        ----------
+        model : str or Model
+            Replacement spectral model. If a string is provided, it is
+            evaluated and must produce a valid model instance. Example:
+            ``'PowerLaw(1e-11,2.0)'``.
+        source_name : str, Source, or None
+            Target source selector accepted by ``find_source``. If ``None``,
+            applies to the currently selected source.
+
+        Returns
+        -------
+        tuple
+            ``(source, old_model)`` where ``source`` is the updated source and
+            ``old_model`` is the model replaced.
         """
         src = self.find_source(source_name)
         if src is None:
@@ -216,14 +262,27 @@ class SourceModel(list):
         return src, old_model
         
     def list_sources(self):
-        """Print all sources currently in the model."""
+        """Print every source in the model in current order.
+
+        This is a convenience inspection helper and returns ``None``.
+        """
         for source in self:
             print(source)
         return
     
     def setposition(self, skydir):
         """Set the position of the selected source.
-        Return self to allow chaining, e.g. ``with sl.localization_view('Blazar').setposition((ra,dec)) as view:``"""
+
+        Parameters
+        ----------
+        skydir : object
+            Position value compatible with the selected source's ``skydir``
+            attribute.
+
+        Notes
+        -----
+        Requires a currently selected source.
+        """
         if self.selected_source is None:
             raise SourceModelException('No source is selected')
         self.selected_source.skydir = skydir
@@ -233,10 +292,20 @@ class SourceModel(list):
     def demo(cls,  src_key=2,) :
         """Create a toy source list for quick experiments.
 
-            0 : PLSuperExpCutoff source
-            1 : PowerLaw source
-            2 : both sources
-        """ 
+        Parameters
+        ----------
+        src_key : int, default=2
+            Select which demo sources to include.
+
+            - ``0``: Pulsar only
+            - ``1``: Blazar only
+            - ``2``: both sources
+
+        Returns
+        -------
+        SourceModel
+            A newly constructed toy model.
+        """
         ps = sources.PointSource(name='Pulsar',  skydir=(0,0), frame='galactic',
                         model=sources.PLSuperExpCutoff4(1e-11, 2., 0.7, 0.69),)  
         
@@ -254,6 +323,199 @@ class SourceModel(list):
 
         print(f'Model: {str(model)}')
         return model
+
+    @staticmethod
+    def _coerce_catalog_skycoord(skydir, frame='icrs'):
+        """Normalize a catalog cone-center specification to ``SkyCoord``."""
+        from astropy.coordinates import SkyCoord
+
+        if isinstance(skydir, SkyCoord):
+            return skydir
+        if hasattr(skydir, '__iter__'):
+            lon, lat = skydir
+            return SkyCoord(lon, lat, unit='deg', frame=frame)
+        raise TypeError('skydir must be a SkyCoord or a (lon, lat) pair in degrees')
+
+    @staticmethod
+    def _load_fermi_catalog(catalog=None, *, version=None, path='$FERMI/catalog/', reset_index=False):
+        """Return an existing Fermi catalog or construct one on demand."""
+        if catalog is not None:
+            return catalog
+        from utilities.catalogs import Fermi4FGL
+        return Fermi4FGL(version=version, path=path, reset_index=reset_index)
+
+    @staticmethod
+    def _apply_catalog_selection(catalog, select):
+        """Apply explicit row selection to a catalog dataframe."""
+        if callable(select):
+            resolved = select(catalog)
+            if isinstance(resolved, pd.DataFrame):
+                return resolved
+            return SourceModel._apply_catalog_selection(catalog, resolved)
+
+        if isinstance(select, slice):
+            return catalog.iloc[select]
+
+        if isinstance(select, str):
+            if select not in catalog.index:
+                raise SourceModelException(f'source {select} not found in catalog')
+            return catalog.loc[[select]]
+
+        if np.isscalar(select):
+            return catalog.iloc[[int(select)]]
+
+        items = list(select)
+        if len(items) == 0:
+            return catalog.iloc[0:0].copy()
+
+        if all(isinstance(item, (bool, np.bool_)) for item in items):
+            if len(items) != len(catalog):
+                raise SourceModelException('boolean catalog selector length mismatch')
+            return catalog.loc[np.asarray(items, dtype=bool)]
+
+        if all(isinstance(item, (int, np.integer)) for item in items):
+            return catalog.iloc[list(map(int, items))]
+
+        return catalog.loc[items]
+
+    @classmethod
+    def _subset_fermi_catalog(cls, catalog, *, select=None, query=None, skydir=None, cone_size=None, frame='icrs'):
+        """Return a filtered catalog dataframe based on subset arguments."""
+        subset = catalog
+
+        if skydir is not None or cone_size is not None:
+            if skydir is None or cone_size is None:
+                raise ValueError('skydir and cone_size must be provided together')
+            if not hasattr(catalog, 'select_cone'):
+                raise TypeError('catalog does not support cone selection')
+            subset = catalog.select_cone(
+                cls._coerce_catalog_skycoord(skydir, frame=frame),
+                cone_size=cone_size,
+            )
+            if subset is None:
+                subset = catalog.iloc[0:0].copy()
+
+        if query is not None:
+            subset = subset.query(query)
+
+        if select is not None:
+            subset = cls._apply_catalog_selection(subset, select)
+
+        if len(subset) == 0:
+            raise SourceModelException('no sources selected from the Fermi catalog')
+
+        return subset.copy()
+
+    @staticmethod
+    def _convert_fermi_model(specfunc):
+        """Convert a Fermi catalog spectral function into a like3 model."""
+        if sources.ismodel(specfunc):
+            return specfunc.copy()
+
+        model_name = specfunc.__class__.__name__
+        raw_pars = getattr(specfunc, 'pars', None)
+        if raw_pars is None:
+            raise SourceModelException('catalog spectral function is missing parameter values')
+        pars = np.asarray(raw_pars, dtype=float)
+        e0 = getattr(specfunc, 'e0', None)
+
+        spectral_models = sources.spectral_models
+        builders = {
+            'PowerLaw': lambda values, scale: spectral_models.PowerLaw(
+                p=values,
+                e0=1e3 if scale is None else float(scale),
+            ),
+            'LogParabola': lambda values, scale: spectral_models.LogParabola(
+                p=values,
+                free=[True, True, False, False],
+            ),
+            'PLSuperExpCutoff4': lambda values, scale: spectral_models.PLSuperExpCutoff4(
+                p=values,
+                free=[True, True, False, False],
+                e0=1e3 if scale is None else float(scale),
+            ),
+        }
+        if model_name not in builders:
+            raise SourceModelException(f'unsupported catalog spectral model {model_name}')
+
+        return builders[model_name](pars, e0)
+
+    @classmethod
+    def _source_from_fermi_row(cls, source_name, row):
+        """Create a ``PointSource`` from one Fermi catalog row."""
+        resolved_name = row['name'] if 'name' in row.index else source_name
+        return sources.PointSource(
+            name=str(resolved_name),
+            skydir=(float(row.ra), float(row.dec)),
+            frame='icrs',
+            model=cls._convert_fermi_model(row.specfunc),
+        )
+
+    @classmethod
+    def from_fermi_catalog(
+        cls,
+        version=None,
+        *,
+        catalog=None,
+        path='$FERMI/catalog/',
+        reset_index=False,
+        select=None,
+        query=None,
+        skydir=None,
+        cone_size=None,
+        frame='icrs',
+    ):
+        """Build a ``SourceModel`` from a Fermi catalog subset.
+
+        Parameters
+        ----------
+        version : str or None, optional
+            Catalog version forwarded to ``utilities.catalogs.Fermi4FGL`` when
+            ``catalog`` is not provided.
+        catalog : pandas.DataFrame-like, optional
+            Existing Fermi catalog object. If omitted, one is loaded from
+            ``version`` and ``path``.
+        path : str, default='$FERMI/catalog/'
+            Catalog directory or FITS path used when loading a catalog.
+        reset_index : bool, default=False
+            Forwarded to catalog construction.
+        select : selector, optional
+            Explicit subset selector applied after ``query``/cone filtering.
+            Supported forms are source name, integer row index, slices, lists
+            of names or indices, boolean masks, or a callable that returns one
+            of those forms.
+        query : str, optional
+            Pandas query expression applied to the catalog before ``select``.
+        skydir : SkyCoord or tuple, optional
+            Cone center for spatial subset selection.
+        cone_size : float, optional
+            Cone radius in degrees. Must be supplied together with ``skydir``.
+        frame : str, default='icrs'
+            Coordinate frame used when ``skydir`` is provided as a tuple.
+
+        Returns
+        -------
+        SourceModel
+            Source model containing one point source per selected catalog row.
+        """
+        fermi_catalog = cls._load_fermi_catalog(
+            catalog=catalog,
+            version=version,
+            path=path,
+            reset_index=reset_index,
+        )
+        catalog_subset = cls._subset_fermi_catalog(
+            fermi_catalog,
+            select=select,
+            query=query,
+            skydir=skydir,
+            cone_size=cone_size,
+            frame=frame,
+        )
+        return cls([
+            cls._source_from_fermi_row(source_name, row)
+            for source_name, row in catalog_subset.iterrows()
+        ])
 
     def view(self):
         """Return a context-manager view that restores all source model state on exit.
@@ -423,6 +685,18 @@ class LocalizedSourceView:
     """
 
     def __init__(self, source_model):
+        """Bind to a ``SourceModel`` with an already selected source.
+
+        Parameters
+        ----------
+        source_model : SourceModel
+            Backing model used for delegation and source-position updates.
+
+        Raises
+        ------
+        SourceModelException
+            If ``source_model`` has no selected source.
+        """
         self.source_model = source_model
         self.source = source_model.selected_source
         if self.source is None:

@@ -1,3 +1,9 @@
 # Study the M. Kerr Galacic diffuse model
 
 This is the model he calls "Toby_v1"
+
+## Documentation
+
+- Pixel table module: [doc/PIXEL_TABLE_DOCUMENTATION.md](doc/PIXEL_TABLE_DOCUMENTATION.md)
+- Source list API: [doc/SOURCELIST_API_REFERENCE.md](doc/SOURCELIST_API_REFERENCE.md)
+- Residual analysis summary: [doc/RESIDUAL_ANALYSIS_SUMMARY.md](doc/RESIDUAL_ANALYSIS_SUMMARY.md)

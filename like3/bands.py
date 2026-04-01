@@ -9,20 +9,72 @@ This module defines:
 
 import numpy as np
 import pandas as pd
+import copy
 from astropy_healpix import HEALPix 
 from astropy.coordinates import SkyCoord
 from .sourcelist import SourceModel
 from collections import namedtuple
 
 # Define a namedtuple type for a key,value pair of lists
-Pixel = namedtuple('Pixel', ['key', 'value'])
+Pixels = namedtuple('Pixels', ['key', 'value'])
 
-def create_pixel(keys, values):
-    """Create a Pixel namedtuple from lists of keys and values.
+def create_pixels(keys, values):
+    """Create a Pixels namedtuple from lists of keys and values.
     """
     if not isinstance(keys, (list, np.ndarray)) or not isinstance(values, (list, np.ndarray)):
         raise ValueError("Keys and values must be lists or numpy arrays.")
-    return Pixel(keys, values)
+    return Pixels(keys, values)
+
+
+def _event_type_code(value):
+    """Normalize event-type metadata to the standard integer code."""
+    if hasattr(value, 'event_type'):
+        return int(getattr(value, 'event_type'))
+
+    if isinstance(value, str):
+        label = value.strip().upper()
+        if label == 'FRONT':
+            return 0
+        if label == 'BACK':
+            return 1
+        if label.startswith('PSF'):
+            return int(label[3:]) + 2
+        if label.isdigit():
+            return int(label)
+
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+
+    raise ValueError(f'Unsupported event type metadata: {value!r}')
+
+
+def _clone_psf_with_event_type(psf, event_type):
+    """Return a shallow PSF copy whose event_type matches the target band."""
+    cloned = copy.copy(psf)
+    setattr(cloned, 'event_type', int(event_type))
+    if isinstance(cloned, dict):
+        cloned['event_type'] = int(event_type)
+    return cloned
+
+
+def _make_sparse_pixel_lookup(pixel_band, exposure_values):
+    """Build a callable that returns saved sparse-pixel exposure by pixel id."""
+    pix = np.asarray(getattr(pixel_band, 'pix', ()), dtype=int).ravel()
+    values = np.asarray(exposure_values, dtype=float).ravel()
+
+    if pix.size != values.size:
+        raise ValueError(
+            f'Saved pixel exposure for band {getattr(pixel_band, "key", "<unknown>")} has '
+            f'{values.size} values for {pix.size} sparse pixels'
+        )
+
+    lookup = dict(zip(pix.tolist(), values.tolist()))
+
+    def map_from_sparse_pixels(requested_pix, lookup=lookup):
+        requested = np.asarray(requested_pix, dtype=int).ravel()
+        return np.array([lookup.get(int(pix), 0.0) for pix in requested], dtype=float)
+
+    return map_from_sparse_pixels
 
 
 
@@ -58,16 +110,18 @@ class Band(HEALPix):
         self.energy = band_info.get("energy")
         self.nside = band_info.get("nside")
         self.psf = band_info.get("psf")
+        self.order = band_info.get("order", "nested")
 
         # Initialize the HEALPix geometry used by response evaluators.
-        super().__init__(self.nside, order='ring', frame='galactic')
+        super().__init__(self.nside, order=self.order, frame='galactic')
         # set up exposure calculation function for this band based on energy, if not provided by a data-based exposure model
         if self.exposure_map is None:
             self.exposure_map = lambda pix: np.ones_like(pix) * 1e13 * self.energy / 100
         assert callable(self.exposure_map), "exposure_map must be a callable function of pixel indices"
 
     def __repr__(self):
-        return f'Band(energy={self.energy:.1f} MeV, et={self.psf.event_type} nside={self.nside})'
+        event_type = getattr(self.psf, 'event_type', self.psf)
+        return f'Band(energy={self.energy:.1f} MeV, et={event_type} nside={self.nside})'
 
     def response(self, source, pixels=None):
         """Return the response, or evaluation of the PSF, for a given source and pixel set.
@@ -255,6 +309,8 @@ class Band(HEALPix):
             v = np.array(list(data.values()))
         else:
             k, v = data if data is not None else self.pixel_counts()
+        if self.order == 'nested':
+            k = self.nested_to_ring(np.asarray(k, dtype=int))
         pixmap[k] = v
         # Mask empty pixels so they do not dominate the color scale.
         pixmap[pixmap == 0] = np.nan
@@ -383,7 +439,8 @@ class BandList(list):
         source_model : SourceModel
             Source model to compute flux and gradient for each band.
         band_info : DataFrame or None
-            Table containing `energy`, `nside`, and `psf` for each band. If
+            Table containing `energy`, `nside`, and `psf` for each band. May
+            also include optional `exposure_map` and `data` columns. If
             omitted, defaults derived from `bins` and `nsides` are used.
         """
 
@@ -398,7 +455,14 @@ class BandList(list):
             )
   
         for bi in band_info.to_dict(orient='records'):
-            self.append(Band(bi, source_model=source_model))
+            self.append(
+                Band(
+                    bi,
+                    source_model=source_model,
+                    exposure_map=bi.get('exposure_map'),
+                    data=bi.get('data'),
+                )
+            )
         self.sources = source_model
         self.parameters = source_model.parameters
         self.parameter_names = source_model.parameter_names
@@ -412,6 +476,143 @@ class BandList(list):
 
         # Fit outputs from the most recent ``fit`` call.
         self.fit_info = {'correlation': None, 'errors': None}
+
+    @staticmethod
+    def _pixel_table_exposure_map(pixel_band, *, use_scalar_fallback=True):
+        """Adapt PixelTable exposure metadata to Band.pixel_counts semantics."""
+        exposure_map = getattr(pixel_band, 'exposure_map', None)
+        exposure_values = getattr(pixel_band, 'exposure_map_values', None)
+        pixel_exposure = getattr(pixel_band, 'pixel_exposure', None)
+
+        if pixel_exposure is not None:
+            return _make_sparse_pixel_lookup(pixel_band, pixel_exposure)
+
+        if exposure_values is not None:
+            arr = np.asarray(exposure_values, dtype=float).ravel()
+            map_nside = int(np.sqrt(arr.size / 12.0))
+            if 12 * map_nside**2 == arr.size:
+                frame = str(getattr(exposure_map, 'frame', 'galactic')).lower()
+                nest = bool(getattr(exposure_map, 'nest', False))
+                if frame == 'galactic' and not nest and map_nside == int(pixel_band.nside):
+                    return lambda pix, arr=arr: arr[np.asarray(pix, dtype=int)]
+
+        if exposure_map is not None:
+            hpx = HEALPix(nside=int(pixel_band.nside), order='ring', frame='galactic')
+
+            def map_from_pixels(pix, exposure_map=exposure_map, hpx=hpx):
+                skycoord = hpx.healpix_to_skycoord(np.asarray(pix, dtype=int))
+                return np.asarray(exposure_map(skycoord), dtype=float)
+
+            return map_from_pixels
+
+        if use_scalar_fallback:
+            exposure = getattr(pixel_band, 'exposure', None)
+            if exposure is not None and np.isfinite(float(exposure)):
+                return lambda pix, value=float(exposure): np.full(len(np.asarray(pix, dtype=int)), value, dtype=float)
+
+        return None
+
+    @classmethod
+    def from_pixel_table(
+        cls,
+        source_model,
+        pixel_table,
+        *,
+        psf_table_path='files/loc/psf_psf_table.pkl', #or fb_...
+        use_exposure=True,
+        use_data=True,
+    ):
+        """Build a ``BandList`` from a ``SourceModel`` and ``PixelTable`` metadata.
+
+        Parameters
+        ----------
+        source_model : SourceModel
+            Source model to evaluate in each band.
+        pixel_table : PixelTable
+            Pixel-table object providing band metadata and optional exposure.
+        psf_table_path : str, optional
+            Path to the serialized PSF table used by ``pylib.psf_func.PSFlist``.
+        use_exposure : bool, optional
+            If True, adapt pixel-table exposure products onto each ``Band``.
+        use_data : bool, optional
+            If True, attach each pixel-table band's sparse photon counts as
+            ``Band.data`` so ``BandList.fit`` can operate directly.
+        """
+        from pylib.psf_func import PSFlist
+
+        if not hasattr(pixel_table, 'meta_df'):
+            raise AttributeError('pixel_table must define meta_df')
+
+        meta_df = pixel_table.meta_df.reset_index(drop=True).copy()
+        pixel_bands = list(pixel_table.values())
+        if len(meta_df) != len(pixel_bands):
+            raise ValueError(
+                f'PixelTable metadata has {len(meta_df)} rows but pixel table contains {len(pixel_bands)} bands'
+            )
+
+        if 'event_type_code' in meta_df.columns:
+            event_codes = meta_df['event_type_code'].astype(int).to_numpy()
+        else:
+            event_codes = np.array([_event_type_code(value) for value in meta_df['event_type']], dtype=int)
+
+        energies = np.sqrt(meta_df['emin'].to_numpy(dtype=float) * meta_df['emax'].to_numpy(dtype=float))
+        assigned_psf = [None] * len(meta_df)
+
+        for event_code in np.unique(event_codes):
+            row_indices = np.flatnonzero(event_codes == int(event_code))
+            available_psfs = []
+            source_event_code = int(event_code)
+            for candidate_event_code in [int(event_code), 0, 1]:
+                available_psfs = list(PSFlist(event_type=candidate_event_code, table_path=psf_table_path))
+                if available_psfs:
+                    source_event_code = candidate_event_code
+                    break
+            if len(available_psfs) < len(row_indices):
+                # Pad with clones of the last entry sorted by energy so the
+                # highest-energy bands get a reasonable (if imprecise) PSF.
+                n_missing = len(row_indices) - len(available_psfs)
+                psf_energies = np.array(
+                    [float(getattr(p, 'energy', np.nan)) for p in available_psfs], dtype=float
+                )
+                last_psf = available_psfs[int(np.argmax(psf_energies)) if np.any(np.isfinite(psf_energies)) else -1]
+                available_psfs.extend([copy.copy(last_psf) for _ in range(n_missing)])
+
+            for row_index in row_indices[np.argsort(energies[row_indices])]:
+                if len(available_psfs) == 1:
+                    psf_index = 0
+                else:
+                    candidate_energies = np.array(
+                        [float(getattr(psf, 'energy', np.nan)) for psf in available_psfs],
+                        dtype=float,
+                    )
+                    if np.all(np.isfinite(candidate_energies)):
+                        psf_index = int(np.argmin(np.abs(np.log(candidate_energies) - np.log(energies[row_index]))))
+                    else:
+                        psf_index = 0
+                psf = available_psfs.pop(psf_index)
+                if source_event_code != int(event_code):
+                    psf = _clone_psf_with_event_type(psf, event_code)
+                assigned_psf[row_index] = psf
+
+        band_rows = []
+        for row_index, (row, pixel_band) in enumerate(zip(meta_df.itertuples(index=False), pixel_bands)):
+            pixel_order = getattr(pixel_band, 'order', 'ring')
+            band_info: dict[str, object] = dict(
+                energy=float(np.sqrt(float(row.emin) * float(row.emax))),
+                nside=int(row.nside),
+                psf=assigned_psf[row_index],
+                order=pixel_order,
+            )
+            if use_exposure:
+                band_info['exposure_map'] = cls._pixel_table_exposure_map(pixel_band)
+            if use_data:
+                band_info['data'] = (
+                    np.asarray(pixel_band.pix, dtype=int),
+                    np.asarray(pixel_band.photons),
+                )
+            band_rows.append(band_info)
+
+        return cls(source_model, pd.DataFrame(band_rows))
 
     def __iter__(self):
         """Iterate over selected bands, or all bands if no selection is active."""
