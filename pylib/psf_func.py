@@ -31,10 +31,16 @@ class PSFlist(list):
             self.spline = CubicSpline(x, y,)# extrapolate=True)
  
             self['r68'] = round(table.r68,3)
-            self['energy']=round(table.energy,0)
+            self['energy']= e =round(table.energy,0)
             self['event_type'] = table.event_type
+
+            # a kluge to make delta E 1
+            self['e0'] = e-0.5
+            self['e1'] = e+0.5
             self.__dict__.update(self)
             self.max_x = 5*table.r68
+
+  
 
         def __call__(self, angle):
             # note clip to avoid strange behavior at large angles
@@ -62,15 +68,34 @@ class PSFlist(list):
             ax1.legend(fontsize=12)
             return fig
 
-    def __init__(self, event_type=None, table_path='files/loc/psf_table.pkl'):
-        try:
-            psf_table = pd.read_pickle(table_path)
-        except Exception as msg:
-            print(msg, file=sys.stderr)
-            return
-        for which,table in enumerate(psf_table.itertuples()):
+    def __init__(self, event_type=None, table_path='files/loc'):
+        from pathlib import Path
+        path = Path(table_path)
+        if path.is_dir():
+            et = None if event_type is None else int(event_type)
+            load_fb  = et is None or et < 2
+            load_psf = et is None or et >= 2
+            frames = []
+            for fname, do_load in [('fb_psf_table.pkl', load_fb),
+                                   ('psf_psf_table.pkl', load_psf)]:
+                if not do_load:
+                    continue
+                try:
+                    frames.append(pd.read_pickle(path / fname))
+                except Exception as msg:
+                    print(msg, file=sys.stderr)
+            if not frames:
+                return
+            psf_table = pd.concat(frames, ignore_index=True)
+        else:
+            try:
+                psf_table = pd.read_pickle(path)
+            except Exception as msg:
+                print(msg, file=sys.stderr)
+                return
+        for which, table in enumerate(psf_table.itertuples()):
             t = self.PSF(table, which)
-            if event_type is None or t.event_type==event_type:
+            if event_type is None or t.event_type == event_type:
                 self.append(t)
 
     @classmethod
@@ -98,28 +123,3 @@ class PSFlist(list):
         df['nside'] = nsides
         return df
 
-    # @classmethod
-    # def demo(cls, idx=8):
-    #     p = cls()[idx]
-    #     show(f"""###  PSF demo: compare with equivalent Gaussian
-    #          Select PSF index {idx}: {p} """)
-    #     # radial functions
-    #     sigma = p.corresponding_sigma()
-    #     norm = lambda r: 1/(2*np.pi*sigma**2) * np.exp(-(r/sigma)**2/2) # corresponding Gaussian
-    #     psf = lambda r: Like(p).pdf(r).clip(1e-4) # normalized psf values
-    #     disk = lambda r: np.where( r<1, 1/(np.pi) , 0) # unit disk radius 1
-
-    #     # Set up grid for integration
-    #     R,grid = 1.5,201 # maximum radius, number of bins
-    #     x = y = np.linspace(-R,R,grid)
-    #     dx = x[1]-x[0]
-    #     xx,yy = np.meshgrid(x,y)
-    #     rr = np.sqrt(xx**2 + yy**2)#.clip(0,R)
-
-    #     radial_integral = lambda z : np.sum(z) * dx**2
-
-    #     show(f"""Check Integrals: unit disk, {radial_integral(disk(rr)):.3f},
-    #         PSF: {radial_integral(psf(rr)):.3f}, 
-    #         Norm: {radial_integral(norm(rr)):.3f}""")
-
-    #     show_fig(p.plot_w_gaussian, maxr=4*sigma);   

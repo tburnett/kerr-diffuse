@@ -21,7 +21,9 @@ class Pixels:
     def __init__(self):
         self.energies = np.sqrt(self.bins[1:]*self.bins[:-1])
         self.exposure_factor = np.full_like(self.energies,1e13) * self.energies/100  # simple energy-dependent exposure
-
+        self.e0 = self.bins[:-1]
+        self.e1 = self.bins[1:]
+        
     def counts(self, source_model):
         """ Convert flux to counts using exposure_factor
         """
@@ -119,10 +121,10 @@ class DemoModel(SourceModel, Pixels):
             2 : both sources
         """ 
         ps = PointSource(name='Pulsar', skydir=(0,0), 
-                        model=PLSuperExpCutoff4((1e-11, 2., 0.7, 0.69),free=[True,True,True,False] ))  
+                        model=PLSuperExpCutoff4((1e-11, 2., 0.7, 0.69),free=[True,True,True,False], e0=427 ))  
         
         pl = PointSource(name='Blazar', skydir=(0,0), 
-                        model=LogParabola((4e-12, 2, 0, 1e3), free=[True, True, False, False]))
+                        model=LogParabola((4e-12, 2, 0, 1e3), free=[True, True, False, False], e0=332))
         
         pp = []
         if src_key==0:

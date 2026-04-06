@@ -47,9 +47,27 @@ class Likelihood:
         # Constant factorial terms are omitted because they do not affect argmax.
         logl = np.sum(d * np.log(m) - m)
         # Gradient of log L for Poisson model: sum((d/m - 1) * dm/dtheta).
-        grad = ((d / m - 1) * self.model.count_gradient()).sum(axis=1)
+        # count_gradient() returns shape (n_total_free, n_pixels); restrict to the
+        # active subset defined by the current parameter mask (set via select()).
+        full_grad = ((d / m - 1) * self.model.count_gradient()).sum(axis=1)
+        grad = full_grad[self.mp.mask]
         return logl, grad
  
+    @property
+    def value(self):
+        """Return the log-likelihood at the best-fit parameters."""
+        if not hasattr(self, 'fit_info'):
+            raise RuntimeError('fit has not been run yet; call maximize() first')
+        return -self(self.fit_info['x_fit'])[0]
+    
+
+    @property
+    def grad(self):
+        """Return the gradient at the best-fit parameters."""
+        if not hasattr(self, 'fit_info'):
+            raise RuntimeError('fit has not been run yet; call maximize() first')
+        return -self(self.fit_info['x_fit'])[1]
+    
     def log_like(self, x):
         """Evaluate Poisson log-likelihood at parameter vector `x`."""
         return self._evaluate(x)[0]
@@ -90,7 +108,7 @@ class Likelihood:
             values = x_fit.copy()
             ts_array = np.full_like(values, np.nan)
 
-            for k, name in enumerate(model.parameter_names):
+            for k, name in enumerate(model.parameter_names[model.parameters.mask]):
                 if name.endswith('_Norm'):
                     values[k] = -20
                     ts_array[k] = round(2*(val_fit - logl(values)),1)
@@ -108,12 +126,13 @@ class Likelihood:
         val, gradient = self(x_fit)
         self.model.parameters.values = x_fit
   
-        hess = numdifftools.Hessian(self.log_like)(x_fit) 
-        cov = np.linalg.inv(-hess)
+        hess = -numdifftools.Hessian(self.log_like)(x_fit) 
+        cov = np.linalg.inv(hess)
         sigs = np.sqrt(cov.diagonal())
         self.model.parameters.set_covariance(cov)
 
         self.fit_info = dict(
+            hess = hess,
             cov = cov,
             sigs = sigs,
             corr = (cov / np.outer(sigs,sigs)).round(2),
@@ -154,12 +173,15 @@ class Likelihood:
         ts_values = None
         if hasattr(self, 'fit_info'):
             if gradient:
-                grad = self.fit_info['grad'][mask]
+                # fit_info['grad'] is already the active-subset gradient (length
+                # mask.sum()), so do NOT re-index with mask.
+                grad = self.fit_info['grad']
                 fmt += '%10s'; tup += ('gradient',)
             if ts:
                 ts_all = self.fit_info.get('ts_values', None)
                 if ts_all is not None:
-                    ts_values = ts_all[mask]
+                    # Same: ts_values was computed for the active subset only.
+                    ts_values = ts_all
                     fmt += '%10s'; tup += ('TS',)
         print(fmt %tup, file=out)
         prev=''

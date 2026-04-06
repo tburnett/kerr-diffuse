@@ -41,11 +41,14 @@ def _event_type_code(value):
             return int(label[3:]) + 2
         if label.isdigit():
             return int(label)
-
     if isinstance(value, (int, np.integer)):
         return int(value)
 
     raise ValueError(f'Unsupported event type metadata: {value!r}')
+
+
+_event_type_name='FRONT BACK PSF0 PSF1 PSF2 PSF3'.split()
+
 
 
 def _clone_psf_with_event_type(psf, event_type):
@@ -87,7 +90,7 @@ class Band(HEALPix):
     model terms during flux and gradient evaluation.
     """
 
-    def __init__(self, band_info, source_model, exposure_map=None, data=None):
+    def __init__(self, band_info, source_model, exposure_map=None, data=None, diffuse=None):
         """Initialize one analysis band from metadata and a source model.
 
         Parameters        
@@ -102,12 +105,17 @@ class Band(HEALPix):
             Data, a tuple (pixels, counts) for the band, if any.
             If provided, this is used for sparcifationn of model evaluation and gradient calculation.
             It can be set with the `simulate` method if not provided at initialization.
+        diffuse : np.ndarray or None, optional
+            Per-pixel diffuse model counts aligned with `data` pixels.
         """
+        
         from typing import Callable
         self.source_model = source_model
         self.exposure_map: Callable = exposure_map  # type: ignore[assignment]
         self.data = data
+        self.diffuse = diffuse
         self.energy = band_info.get("energy")
+        self.delta_e = band_info.get("e1") - band_info.get("e0") 
         self.nside = band_info.get("nside")
         self.psf = band_info.get("psf")
         self.order = band_info.get("order", "nested")
@@ -121,7 +129,7 @@ class Band(HEALPix):
 
     def __repr__(self):
         event_type = getattr(self.psf, 'event_type', self.psf)
-        return f'Band(energy={self.energy:.1f} MeV, et={event_type} nside={self.nside})'
+        return f'Band( {_event_type_name[event_type]}, {self.energy/1e3:.2f} GeV, nside {self.nside})'
 
     def response(self, source, pixels=None):
         """Return the response, or evaluation of the PSF, for a given source and pixel set.
@@ -155,7 +163,7 @@ class Band(HEALPix):
 
         k = np.fromiter(accum.keys(), dtype=int)
         v = np.fromiter(accum.values(), dtype=float)
-        v *= self.exposure_map(k)  # apply exposure scaling to model flux
+        v *= self.exposure_map(k) * self.delta_e  # apply exposure scaling (cm² s × MeV bandwidth)
         return k, v
 
     def counts(self):
@@ -186,7 +194,7 @@ class Band(HEALPix):
             _, v = src.response(self).evaluate(keys)
             g.append(v[:, None] * grad[None, :])
         g = np.hstack(g)  # stack before scaling to avoid list * array error
-        g *= self.exposure_map(keys)[:, None]  # apply exposure scaling to gradients
+        g *= self.exposure_map(keys)[:, None] * self.delta_e  # apply exposure scaling (cm² s × MeV bandwidth)
         return g
 
     def simulate(self, random_state=None, total_counts=None,):
@@ -282,7 +290,8 @@ class Band(HEALPix):
             ts_values.append(ts)
         return np.array(ts_values)
     
-    def plot_pixel_map(self, center, *, data=None, fig=None, label=None, log=True, **kwargs):
+    def plot_pixel_map(self, center, *, fig=None, data=None, label=None, log=True, colorbar=True, 
+                       vmin=None, vmax=None, axes_visible=True, **kwargs):
         """Plot per-pixel values for this band in a local ZEA projection.
 
         Parameters
@@ -290,13 +299,15 @@ class Band(HEALPix):
         center : tuple or SkyCoord
             Plot center in sky coordinates.
         data : tuple[np.ndarray, np.ndarray] or dict, optional
-            Pixel/value data to display. If omitted, uses `self.pixel_counts()`.
+            Pixel/value data to display. If omitted, uses `self.data`.
         fig : matplotlib.figure.Figure, optional
             Existing figure target.
         label : str, optional
             Colorbar label.
         log : bool, optional
-            If true, plot `log10` values.
+            If true, use a logarithmic colour scale (LogNorm).
+        axes_visible : bool, optional
+            If true, suppress axis labels, tick labels and grid.
         **kwargs
             Forwarded to `utilities.skymaps.ZEAfigure`.
         """
@@ -304,33 +315,54 @@ class Band(HEALPix):
         from matplotlib import colors
         
         pixmap = np.zeros(self.npix)
-        if isinstance(data, dict):
+        if data is None:
+            k, v = self.data
+            label = 'Data' if label is None else label
+        elif isinstance(data, dict):
             k = np.array(list(data.keys()))
             v = np.array(list(data.values()))
-        else:
-            k, v = data if data is not None else self.pixel_counts()
-        if self.order == 'nested':
-            k = self.nested_to_ring(np.asarray(k, dtype=int))
+        else: #assume tuple of arrays
+            k, v = data 
+    
+        # assume all input pixel indices are in the correct order for the HEALPix geometry of this band; if not, the caller should handle reordering before passing data to this method
+        # if self.order == 'nested':
+        #     k = self.nested_to_ring(np.asarray(k, dtype=int))
         pixmap[k] = v
         # Mask empty pixels so they do not dominate the color scale.
         pixmap[pixmap == 0] = np.nan
 
         # PSF width sets both field size and resolution for a compact local view.
         zkw = {
-            'size': 8 * self.psf.r68,
+            'size': 16 * self.psf.r68,
             'pixelsize': self.psf.r68 / 50,
             'figsize': (6, 5),
             'title': '',
         }
         zkw.update(kwargs)
+        _event_type_name='FRONT BACK PSF0 PSF1 PSF2 PSF3'.split()
 
         zfig = ZEAfigure(center, fig=fig, **zkw)
-        zfig.imshow(np.log10(pixmap) if log else pixmap, )# norm=(colors.LogNorm() if log else None) )
-        zfig.colorbar(label='log10(counts)' if log else 'counts', shrink=0.9, extend='max')
-   
-        zfig.axes_text(0.98, 0.98, f'{self.energy / 1e3:.2f} GeV',
+        zfig.imshow(pixmap, log=log, vmin=vmin, vmax=vmax)
+        if colorbar:
+            zfig.colorbar(label='counts', shrink=0.9, extend='max')
+
+        zfig.axes_text(0.98, 0.98, 
+                f'{self.energy / 1e3:.2f} GeV'+'\n'+_event_type_name[self.psf.event_type],
                 color='white', ha='right', va='top', fontsize=12)
-        
+        if label: zfig.axes_text(0.02, 0.98, label or '', color='white', ha='left', va='top', fontsize=12)
+
+        # Draw r68 circle in lower-left corner as PSF size indicator
+        from matplotlib.patches import Circle
+        ax = zfig.ax
+        r68_px = self.psf.r68 / zkw['pixelsize']
+        cx, cy = (ax.transAxes + ax.transData.inverted()).transform((0.12, 0.12))
+        ax.add_patch(Circle((cx, cy), r68_px, fill=False, edgecolor='white', linewidth=1.5))
+
+        if not axes_visible:
+            for axis in ax.coords:
+                axis.set_ticklabel_visible(False)
+                axis.set_ticks_visible(False)
+            ax.grid(False)
 
 class BandListLocalizationView:
     """Localization view for a BandList centered on the selected source.
@@ -449,18 +481,22 @@ class BandList(list):
             band_info = pd.DataFrame(
                 dict(
                     energy=np.sqrt(self.bins[1:] * self.bins[:-1]),
+                    e0=self.bins[:-1],
+                    e1=self.bins[1:],
                     nside=self.nsides,
                     psf=[None] * len(self.nsides),
                 )
             )
-  
+        # print(band_info)
         for bi in band_info.to_dict(orient='records'):
+            # print('band record:', bi)
             self.append(
                 Band(
                     bi,
                     source_model=source_model,
                     exposure_map=bi.get('exposure_map'),
                     data=bi.get('data'),
+                    diffuse=bi.get('diffuse'),
                 )
             )
         self.sources = source_model
@@ -476,6 +512,52 @@ class BandList(list):
 
         # Fit outputs from the most recent ``fit`` call.
         self.fit_info = {'correlation': None, 'errors': None}
+
+    def __getattr__(self, name):
+        """Forward unknown attribute lookups to the underlying SourceModel."""
+        # Avoid infinite recursion during unpickling / copy before 'sources' is set.
+        if name == 'sources':
+            raise AttributeError(name)
+        return getattr(self.sources, name)
+
+    @staticmethod
+    def _energy_index(energy):
+        """Return the integer energy-bin index for a band energy (MeV)."""
+        return int(np.log10(energy) * 4 - 8)
+
+    def __getitem__(self, key):
+        """Return a Band by sequential index or by ``(psf_index, energy_index)``.
+
+        Matches the PixelTable key convention where ``psf_index = event_type - 2``.
+
+        Supports both single-bracket and comma syntax:
+
+        - ``bl[i]``          — list index *i*.
+        - ``bl[pi, ei]``     — first band matching PSF index *pi* and
+          energy index *ei* (``int(log10(energy)*4 - 8)`` formula).
+
+        Parameters
+        ----------
+        key : int or tuple[int, int]
+            A plain integer for sequential access, or a 2-tuple
+            ``(psf_index, energy_index)`` for keyed lookup.
+
+        Raises
+        ------
+        KeyError
+            When a 2-tuple key matches no band.
+        """
+        pars = key if isinstance(key, tuple) else (key,)
+        if len(pars) == 1:
+            return list.__getitem__(self, pars[0])
+        if len(pars) == 2:
+            psf_index, energy_index = pars
+            for band in self:
+                if (self._energy_index(band.energy) == energy_index and
+                        _event_type_code(band.psf) - 2 == int(psf_index)):
+                    return band
+            raise KeyError(f'No band found for psf_index={psf_index}, energy_index={energy_index}')
+        raise TypeError(f'BandList indices must be int or 2-tuple, not {len(pars)}-tuple')
 
     @staticmethod
     def _pixel_table_exposure_map(pixel_band, *, use_scalar_fallback=True):
@@ -585,6 +667,7 @@ class BandList(list):
                         [float(getattr(psf, 'energy', np.nan)) for psf in available_psfs],
                         dtype=float,
                     )
+                    
                     if np.all(np.isfinite(candidate_energies)):
                         psf_index = int(np.argmin(np.abs(np.log(candidate_energies) - np.log(energies[row_index]))))
                     else:
@@ -599,6 +682,8 @@ class BandList(list):
             pixel_order = getattr(pixel_band, 'order', 'ring')
             band_info: dict[str, object] = dict(
                 energy=float(np.sqrt(float(row.emin) * float(row.emax))),
+                e0=float(row.emin),
+                e1=float(row.emax),
                 nside=int(row.nside),
                 psf=assigned_psf[row_index],
                 order=pixel_order,
@@ -610,6 +695,9 @@ class BandList(list):
                     np.asarray(pixel_band.pix, dtype=int),
                     np.asarray(pixel_band.photons),
                 )
+            diffuse = getattr(pixel_band, 'diffuse', None)
+            if diffuse is not None and len(diffuse) > 0:
+                band_info['diffuse'] = np.asarray(diffuse, dtype=float)
             band_rows.append(band_info)
 
         return cls(source_model, pd.DataFrame(band_rows))
@@ -682,71 +770,7 @@ class BandList(list):
         for band in self:
             band.data = band.simulate(random_state=random_state)
 
-    # def source_position_loglike(self, source_name, data=None, frame='galactic', clip=1e-30):
-    #     """Return a callable Poisson log-likelihood as a function of source position.
-
-    #     The returned function evaluates the model log-likelihood while shifting a
-    #     single source to each trial position and keeping all other model elements
-    #     fixed.
-
-    #     Parameters
-    #     ----------
-    #     source_name : str or Source
-    #         Source identifier accepted by `SourceModel.find_source`.
-    #     data : sequence[tuple[np.ndarray, np.ndarray]] or None
-    #         Per-band observed data as `(pixels, counts)`. If omitted, uses
-    #         `band.data` for each band and requires all bands to have data set.
-    #     frame : str
-    #         Coordinate frame used when trial positions are given as `(lon, lat)`.
-    #     clip : float
-    #         Lower bound applied to model counts to avoid `log(0)`.
-
-    #     Returns
-    #     -------
-    #     callable
-    #         Function `f(position) -> loglike`, where `position` can be a
-    #         `SkyCoord` or a 2-tuple of degrees.
-    #     """
-    #     src = self.sources.find_source(source_name)
-    #     if src.skydir is None:
-    #         raise ValueError('source_position_loglike requires a localized source with skydir')
-
-    #     if data is None:
-    #         data = [band.data for band in self]
-    #     if len(data) != len(self):
-    #         raise ValueError('data length must match number of bands')
-    #     if any(d is None for d in data):
-    #         raise ValueError('missing band data; pass data explicitly or set band.data for all bands')
-
-    #     def to_coord(position):
-    #         if isinstance(position, SkyCoord):
-    #             return position
-    #         if hasattr(position, '__iter__') and len(position) == 2:
-    #             return SkyCoord(position[0], position[1], unit='deg', frame=frame)
-    #         raise ValueError(f'unrecognized position: {position}')
-
-    #     original_skydir = src.skydir
-
-    #     def loglike(position):
-    #         src.skydir = to_coord(position)
-    #         try:
-    #             total = 0.0
-    #             for band, band_data in zip(self, data):
-    #                 keys, counts = band_data
-    #                 model = np.zeros_like(counts, dtype=float)
-    #                 for source in band.source_model:
-    #                     flux = source.model(band.energy)
-    #                     _, response_values = source.response(band).evaluate(keys)
-    #                     model += response_values * flux
-    #                 model *= band.exposure_map(keys)
-    #                 model = np.clip(model, clip, None)
-    #                 total += np.sum(counts * np.log(model) - model)
-    #             return float(total)
-    #         finally:
-    #             src.skydir = original_skydir
-
-    #     return loglike
-    
+       
     def localization_view(self, source_name=None):
         """Return a localization context-manager view for the selected source.
 
@@ -951,4 +975,68 @@ class BandList(list):
         print(f'Creating BandList with PSF for model: {model}')
         band_list = cls(model, df)
         print('Counts per band:', band_list.counts().astype(int))
+
+
+class BandModel:
+    """Adapter exposing the Likelihood interface for a single Band instance.
+
+    Parameters
+    ----------
+    band : Band
+        A Band with `data`, `diffuse`, `pixel_counts`, and `pixel_gradient` populated.
+
+    Notes
+    -----
+    The active pixel set is the intersection of the data pixels and the pixels
+    illuminated by `Band.pixel_counts()` (called without arguments).  Only these
+    pixels appear in `counts()`, `count_gradient()`, and `self.data`.
+    """
+
+    def __init__(self, band):
+        self.band = band
+        self.source_model = band.source_model
+        self.parameters = self.source_model.parameters
+
+        # Pixels illuminated by the source model
+        illum_pix, _ = band.pixel_counts()
+
+        # Restrict to the intersection with band.data pixels
+        data_pix, data_counts = band.data
+        mask = np.isin(data_pix, illum_pix)
+        self._pix = data_pix[mask]
+        self.data = data_counts[mask].astype(float)
+
+        # Diffuse contribution aligned to the same restricted pixel set
+        if band.diffuse is not None:
+            self._diffuse = band.diffuse[mask]
+        else:
+            self._diffuse = 0.0
+
+    @property
+    def parameter_names(self):
+        return self.source_model.parameter_names
+
+    def parsubset(self, *select):
+        return self.source_model.parsubset(*select)
+
+    def counts(self):
+        """Total model counts per active pixel: source + diffuse."""
+        _, src_counts = self.band.pixel_counts(self._pix)
+        return src_counts + self._diffuse
+
+    def count_gradient(self):
+        """Gradient of source counts w.r.t. free params, shape (n_params, n_pixels).
+
+        Diffuse counts are treated as fixed (no gradient contribution).
+        Returns (n_params, n_pixels) as expected by Likelihood._evaluate.
+        """
+        band = self.band
+        g = []
+        for src in band.source_model:
+            grad = src.model.gradient(band.energy)[src.model.free]  # (n_free_for_src,)
+            _, v = src.response(band).evaluate(self._pix)           # v: (n_pixels,)
+            g.append(v[:, None] * grad[None, :])                    # (n_pixels, n_free_for_src)
+        g = np.hstack(g)                                            # (n_pixels, n_params)
+        g *= band.exposure_map(self._pix)[:, None] * band.delta_e   # apply exposure scaling
+        return g.T                                                   # (n_params, n_pixels)
         return band_list

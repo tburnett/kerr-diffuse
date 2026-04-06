@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from . import (sources, parameterset)
+from utilities.catalogs import Fermi4FGL
 
 
 class SourceModelException(Exception):
@@ -32,9 +33,12 @@ class SourceModel(list):
         
         self.initialize()
 
-        # print(self.__repr__())
-        self.selected_source = None
-        self.selected_source_index = -1
+        if len(self) > 0:
+            self.selected_source = self[0]
+            self.selected_source_index = 0
+        else:
+            self.selected_source = None
+            self.selected_source_index = -1
 
     def __repr__(self):
         return f'SourceModel: {len(self)} sources with {len(self.parameters)} free parameters'
@@ -87,9 +91,76 @@ class SourceModel(list):
     def parsubset(self, *select):
         """Return a `ParSubSet` view with optional initial selection."""
         return parameterset.ParSubSet(self, *select)
-        
-    
-    # note that the following properties are dynamic, in case sources or their models change interactively
+
+    def summarize(self, out=None):
+        """Print a summary of free parameters and their current values.
+
+        If ``self.fit_info`` is present (set after fitting), also prints the
+        log-likelihood and fit quality from that record.  Otherwise falls back
+        to :meth:`parameterset.ParameterSet.parameter_summary`.
+
+        Parameters
+        ----------
+        out : file-like or None
+            Output stream passed to ``print``.
+        """
+        fit_info = getattr(self, 'fit_info', None)
+        if fit_info is not None:
+            print(f'loglike={fit_info.get("loglike", float("nan")):.3f}  '
+                  f'qual={fit_info.get("qual", float("nan")):.3f}', file=out)
+        self.parameters.parameter_summary(out=out)
+
+    def sed_plot(self, source_name=None, ax=None, emin=100, emax=1e5, npts=50):
+        """Plot the SED (E² dN/dE vs E) for the selected or named source.
+
+        Parameters
+        ----------
+        source_name : str, Source, or None
+            Source selector passed to :meth:`find_source`. Defaults to the
+            currently selected source.
+        ax : matplotlib.axes.Axes or None
+            Axes to draw into. A new figure is created when ``None``.
+        emin, emax : float
+            Energy range in MeV.
+        npts : int
+            Number of logarithmically-spaced evaluation points.
+
+        Returns
+        -------
+        matplotlib.axes.Axes
+        """
+        import matplotlib.pyplot as plt
+
+        source = self.find_source(source_name)
+        model = source.model
+
+        energies = np.logspace(np.log10(emin), np.log10(emax), npts)  # MeV
+        dnde = model(energies)                                          # ph cm⁻² s⁻¹ MeV⁻¹
+        e2dnde = energies**2 * dnde * 1e-3                             # GeV cm⁻² s⁻¹
+        e_gev = energies * 1e-3                                        # GeV
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=(6, 4))
+
+        ax.loglog(e_gev, e2dnde, label=source.name.strip())
+
+        if model.has_errors():
+            g = model.external_gradient(energies)   # shape (npar, npts)
+            cov = model.get_cov_matrix()             # shape (npar, npar)
+            # variance at each energy via error propagation: diag(g^T cov g)
+            var_dnde = np.sum((cov @ g) * g, axis=0)
+            var_dnde = np.clip(var_dnde, 0, None)
+            sigma_e2dnde = energies**2 * np.sqrt(var_dnde) * 1e-3
+            ax.fill_between(e_gev, e2dnde - sigma_e2dnde,
+                            e2dnde + sigma_e2dnde, alpha=0.3)
+
+        ax.set_xlabel('Energy (GeV)')
+        ax.set_ylabel(r'$E^2\,dN/dE\ [\mathrm{GeV\,cm^{-2}\,s^{-1}}]$')
+        ax.set_title(source.name.strip())
+        ax.legend()
+        return ax
+
+
     @property
     def source_names(self): return np.array([s.name for s in self])
     @property
@@ -113,7 +184,7 @@ class SourceModel(list):
                 names.append(source_name.strip()+'_'+pname)
         return np.array(names)
     
-    def find_source(self, source_name):
+    def find_source(self, source_name=None):
         """Return and select a source by name or object.
 
         Parameters
@@ -153,29 +224,28 @@ class SourceModel(list):
             
         names = [s.name for s in self]
         def not_found():
-            self.selected_source_index =-1
-            raise SourceModelException('source %s not found' %source_name)
+            self.selected_source_index = -1
+            raise SourceModelException('source %s not found' % source_name)
         def found(s):
-            self.selected_source=s
+            self.selected_source = s
             self.selected_source_index = names.index(s.name)
             return s
-        if isinstance(source_name, str) and len(source_name) > 0 and source_name[-1]=='*':
+        if isinstance(source_name, str) and source_name.endswith('*') and not source_name.startswith('*'):
+            prefix = source_name[:-1]
             for name in names:
-                if name.startswith(source_name[:-1]): 
+                if name.startswith(prefix):
                     return found(self[names.index(name)])
             not_found()
-        if isinstance(source_name, str) and len(source_name) > 0 and source_name[0]=='*':
+        if isinstance(source_name, str) and source_name.startswith('*') and not source_name.endswith('*'):
+            suffix = source_name[1:]
             for name in names:
-                if name.endswith(source_name[1:]): 
+                if name.endswith(suffix):
                     return found(self[names.index(name)])
             not_found()
         try:
             k = names.index(source_name)
-            self.selected_source = self[k]
-            #if self.selected_source is None or self.selected_source != selected_source:
-            #    print 'selected source %s for analysis' % selected_source.name
-            return found(self.selected_source)
-        except:
+            return found(self[k])
+        except ValueError:
             self.selected_source = None
             not_found()
 
@@ -307,10 +377,10 @@ class SourceModel(list):
             A newly constructed toy model.
         """
         ps = sources.PointSource(name='Pulsar',  skydir=(0,0), frame='galactic',
-                        model=sources.PLSuperExpCutoff4(1e-11, 2., 0.7, 0.69),)  
+                        model=sources.PLSuperExpCutoff4(1e-11, 2., 0.7, 0.69,e0=427))  
         
         pl = sources.PointSource(name='Blazar',skydir=(5,0), frame='galactic',
-                        model=sources.LogParabola(4e-12, 2, 0, 1e3))
+                        model=sources.LogParabola(4e-12, 2, 0, 1e3,e0=332))
         
         pp = []
         if src_key==0:
@@ -379,8 +449,10 @@ class SourceModel(list):
         return catalog.loc[items]
 
     @classmethod
-    def _subset_fermi_catalog(cls, catalog, *, select=None, query=None, skydir=None, cone_size=None, frame='icrs'):
+    def _subset_fermi_catalog(cls, catalog_id, *, select=None, query=None, skydir=None, cone_size=None, frame='icrs'):
         """Return a filtered catalog dataframe based on subset arguments."""
+        
+        catalog =Fermi4FGL(catalog_id) if isinstance(catalog_id, str) else catalog_id
         subset = catalog
 
         if skydir is not None or cone_size is not None:

@@ -28,6 +28,24 @@ class EffectiveAreaIRF(object):
                  CALDB=None,
                  partition="FB",
                  use_phidep=False):
+        """Initialize an effective-area reader for a given IRF and event partition.
+
+        Parameters
+        ----------
+        irf : str
+            IRF name, e.g. ``"P8R2_SOURCE_V6"`` or ``"P8R3_SOURCE_V3"``.
+        file_path : str or None
+            Directory containing the CALDB ``bcf/ea`` effective-area FITS files.
+            If *None*, derived from the ``CALDB`` environment variable.
+        CALDB : str or None
+            Root of the CALDB tree.  Overrides the ``$CALDB`` environment
+            variable when provided.
+        partition : str
+            Event partition: ``"FB"`` (front+back combined), ``"PSF0"``,
+            ``"PSF1"``, ``"PSF2"``, or ``"PSF3"``.
+        use_phidep : bool
+            If *True*, also load the azimuthal phi-dependence correction tables.
+        """
         if partition not in self.VALID_PARTITIONS:
             raise ValueError(
                 f"partition must be one of {self.VALID_PARTITIONS}, got {partition!r}"
@@ -58,6 +76,17 @@ class EffectiveAreaIRF(object):
             self._read_phi(self.aeff_file, self.aeff_file)
 
     def _resolve_aeff_file(self):
+        """Locate the CALDB FITS file that contains the effective-area tables.
+
+        Tries a partition-specific file first; for PSF partitions falls back to
+        the combined ``aeff_<IRF>_PSF.fits`` file.  Raises ``FileNotFoundError``
+        when no candidate is found.
+
+        Returns
+        -------
+        str
+            Absolute path to the effective-area FITS file.
+        """
         if self.partition == "FB":
             filename = os.path.join(self.file_path, f"aeff_{self.irf}_FB.fits")
             if os.path.exists(filename):
@@ -80,6 +109,26 @@ class EffectiveAreaIRF(object):
         )
 
     def _read_file(self, filename, tablename, columns):
+        """Read energy/cos-theta bins and 2-D image columns from a FITS table.
+
+        Parameters
+        ----------
+        filename : str
+            Path to the CALDB FITS file.
+        tablename : str
+            Name of the binary-table HDU (e.g. ``"EFFECTIVE AREA_FRONT"``).
+        columns : list of str
+            Data column names to extract (e.g. ``["EFFAREA"]``).
+
+        Returns
+        -------
+        ebins : ndarray
+            Energy bin edges in MeV, shape ``(n_energy + 1,)``.
+        cbins : ndarray
+            cos(theta) bin edges, shape ``(n_costh + 1,)``.
+        images : list of ndarray
+            One ``(n_costh, n_energy)`` array per requested column.
+        """
         with fits.open(filename) as hdu:
             table = cast(Any, hdu[tablename])
             table_data = table.data
@@ -95,6 +144,19 @@ class EffectiveAreaIRF(object):
         return ebins, cbins, images
 
     def _read_aeff(self, ct0_file, ct1_file):
+        """Populate the effective-area arrays and interpolation table from FITS.
+
+        Sets ``self.feffarea`` and ``self.beffarea`` (in cm²), ``self.ebins``,
+        ``self.cbins``, ``self.aeff``, ``self.faeff_aug``, and
+        ``self.baeff_aug``.
+
+        Parameters
+        ----------
+        ct0_file : str
+            FITS file used for FRONT (or combined PSF) tables.
+        ct1_file : str
+            FITS file used for BACK tables (may equal *ct0_file*).
+        """
         if self.partition.startswith("PSF") and self._psf_from_combined_file:
             tablename = f"EFFECTIVE AREA_{self.partition}"
             ebins, cbins, effarea = self._read_file(ct0_file, tablename, ["EFFAREA"])
@@ -132,6 +194,18 @@ class EffectiveAreaIRF(object):
         self.baeff_aug = self.aeff.augment_data(self.beffarea)
 
     def _read_phi(self, ct0_file, ct1_file):
+        """Load azimuthal phi-dependence correction tables from FITS.
+
+        Populates ``self.fphis``, ``self.bphis``, and ``self.phi`` (the
+        interpolation grid).  Only called when ``use_phidep=True``.
+
+        Parameters
+        ----------
+        ct0_file : str
+            FITS file used for FRONT (or combined PSF) phi tables.
+        ct1_file : str
+            FITS file used for BACK phi tables.
+        """
         if self.partition.startswith("PSF") and self._psf_from_combined_file:
             tablename = f"PHI_DEPENDENCE_{self.partition}"
             ebins, cbins, phis = self._read_file(ct0_file, tablename, ["PHIDEP0", "PHIDEP1"])
@@ -157,6 +231,28 @@ class EffectiveAreaIRF(object):
         self.phi = _InterpTable(np.log10(ebins), cbins, augment=False)
 
     def _phi_mod(self, e, c, event_class, phi):
+        """Compute the azimuthal modulation correction factor.
+
+        Implements the parametric LAT phi-dependence model
+        ``(1 + p0 * phi_sym^p1) / norm``, where ``phi_sym`` is a symmetrised
+        azimuthal angle.  Returns 1 when *phi* is *None*.
+
+        Parameters
+        ----------
+        e : float
+            log10(energy / MeV).
+        c : float
+            cos(theta).
+        event_class : int
+            0 for FRONT, 1 for BACK.
+        phi : float or None
+            Azimuthal angle in radians; pass *None* to skip the correction.
+
+        Returns
+        -------
+        float
+            Multiplicative phi-dependence correction factor.
+        """
         if phi is None:
             return 1
         tables = self.fphis if event_class == 0 else self.bphis
@@ -167,6 +263,26 @@ class EffectiveAreaIRF(object):
         return (1.0 + par0 * phi**par1) / norm
 
     def _eval_front_back(self, e, c, phi=None, bilinear=True):
+        """Return the (front, back) effective area at energy *e* and cos(theta) *c*.
+
+        Parameters
+        ----------
+        e : float
+            Energy in MeV.
+        c : float or ndarray
+            cos(theta) value(s).
+        phi : float or None
+            Azimuthal angle in radians for phi-dependence correction.
+        bilinear : bool
+            Use bilinear interpolation when *True*, nearest-neighbour otherwise.
+
+        Returns
+        -------
+        front : float or ndarray
+            FRONT effective area in cm².
+        back : float or ndarray
+            BACK effective area in cm².
+        """
         e = np.log10(e)
         at = self.aeff
         front = at(e, c, self.faeff_aug, bilinear=bilinear) * self._phi_mod(e, c, 0, phi)
@@ -174,6 +290,20 @@ class EffectiveAreaIRF(object):
         return front, back
 
     def _get_partition_evaluator(self, partition):
+        """Return a cached ``EffectiveAreaIRF`` for the requested partition.
+
+        Instantiates a new reader on first access and stores it in
+        ``self._partition_cache`` for reuse.
+
+        Parameters
+        ----------
+        partition : str
+            Partition name, e.g. ``"PSF0"``.
+
+        Returns
+        -------
+        EffectiveAreaIRF
+        """
         if partition in self._partition_cache:
             return self._partition_cache[partition]
         self._partition_cache[partition] = EffectiveAreaIRF(
@@ -219,6 +349,20 @@ class ExposureMap:
     """Callable HEALPix exposure map interpolator using astropy-healpix."""
 
     def __init__(self, values, nside=None, nest=False, frame="icrs"):
+        """Wrap a full-sky HEALPix exposure map for sky-coordinate lookup.
+
+        Parameters
+        ----------
+        values : array-like
+            Full-sky HEALPix map values, one entry per pixel.
+        nside : int or None
+            HEALPix ``nside`` resolution parameter; inferred from
+            ``len(values)`` when *None*.
+        nest : bool
+            *True* for NESTED pixel ordering; *False* (default) for RING.
+        frame : str
+            Coordinate frame of the map, ``"icrs"`` or ``"galactic"``.
+        """
         arr = np.asarray(values, dtype=float).ravel()
         if nside is None:
             nside = npix_to_nside(arr.size)
@@ -301,6 +445,18 @@ class _InterpTable(object):
     """Helper class for 2D interpolation in log10(E), cos(theta)."""
 
     def __init__(self, xbins, ybins, augment=True):
+        """Set up bin edges for 2-D bilinear interpolation in (x, y).
+
+        Parameters
+        ----------
+        xbins : ndarray
+            Bin edges along the x-axis (typically log10(E / MeV)).
+        ybins : ndarray
+            Bin edges along the y-axis (typically cos(theta)).
+        augment : bool
+            If *True*, pad the grid by one half-cell on every side so that the
+            bilinear stencil never requires out-of-range indexing.
+        """
         self.xbins_0, self.ybins_0 = xbins, ybins
         self.augment = augment
         if augment:
@@ -317,6 +473,21 @@ class _InterpTable(object):
         self.ybins_s = (self.ybins[:-1] + self.ybins[1:]) / 2
 
     def augment_data(self, data):
+        """Pad a 2-D data array to match the augmented bin grid.
+
+        The original data occupies the interior ``[1:-1, 1:-1]`` slice; border
+        cells are filled by replicating the nearest edge values.
+
+        Parameters
+        ----------
+        data : ndarray, shape (ny, nx)
+            Original data on the un-augmented grid.
+
+        Returns
+        -------
+        ndarray, shape (ny + 2, nx + 2)
+            Padded array ready for bilinear lookup.
+        """
         augmented = np.empty([data.shape[0] + 2, data.shape[1] + 2])
         augmented[1:-1, 1:-1] = data
         augmented[0, 1:-1] = data[0, :]
@@ -330,6 +501,21 @@ class _InterpTable(object):
         return augmented
 
     def set_indices(self, x, y, bilinear=True):
+        """Compute and cache lower-left bin indices for interpolation at (x, y).
+
+        Uses midpoint grids for bilinear mode and edge grids for
+        nearest-neighbour mode.  Results are stored in ``self.indices`` and
+        consumed by :meth:`value`.
+
+        Parameters
+        ----------
+        x : float
+            Query point on the x-axis (log10 energy).
+        y : float or ndarray
+            Query point(s) on the y-axis (cos theta).
+        bilinear : bool
+            Select bilinear (*True*) or nearest-neighbour (*False*) mode.
+        """
         if bilinear and (not self.augment):
             print("Not equipped for bilinear, going to nearest neighbor.")
             bilinear = False
@@ -343,6 +529,24 @@ class _InterpTable(object):
         self.indices = i, j
 
     def value(self, x, y, data):
+        """Return the interpolated value at (x, y) using cached indices.
+
+        Must be preceded by a call to :meth:`set_indices` for the same (x, y).
+
+        Parameters
+        ----------
+        x : float
+            Query x coordinate.
+        y : float or ndarray
+            Query y coordinate(s).
+        data : ndarray
+            Augmented data array produced by :meth:`augment_data`.
+
+        Returns
+        -------
+        float or ndarray
+            Interpolated value(s) at (x, y).
+        """
         i, j = self.indices
         if not self.bilinear:
             return data[j, i]
@@ -357,6 +561,28 @@ class _InterpTable(object):
                 (x - x1) * (f10 * (y2 - y) + f11 * (y - y1))) / norm
 
     def __call__(self, x, y, data, bilinear=True, reset_indices=True):
+        """Interpolate *data* at (x, y), optionally reusing cached indices.
+
+        Parameters
+        ----------
+        x : float
+            Query x coordinate.
+        y : float or ndarray
+            Query y coordinate(s).
+        data : ndarray
+            Augmented data array.
+        bilinear : bool
+            Use bilinear interpolation when *True*.
+        reset_indices : bool
+            Re-run :meth:`set_indices` before evaluating.  Set to *False* when
+            evaluating multiple datasets at the same (x, y) to avoid redundant
+            index computation.
+
+        Returns
+        -------
+        float or ndarray
+            Interpolated value(s).
+        """
         if reset_indices:
             self.set_indices(x, y, bilinear=bilinear)
         return self.value(x, y, data)
@@ -439,12 +665,39 @@ def make_aeff_costheta_function(
 
     Parameters
     ----------
+    emin, emax : float
+        Energy band boundaries in MeV.  Must satisfy ``0 < emin < emax``.
     Aeff : callable, dict, or None
         Effective-area evaluator with signature ``Aeff(E, cos_theta, event_class=...)``.
         If a dict, it should be keyed by ``event_type``.
-        If None, instantiate ``wtlike.effective_area.EffectiveArea`` with the
+        If *None*, an :class:`EffectiveAreaIRF` is instantiated using the
         provided IRF/path settings, selecting PSF-specific IRFs for event
-        types 2-5.
+        types 2–5.
+    event_type : int
+        Event-type code: ``-1`` returns front+back sum, ``0`` FRONT only,
+        ``1`` BACK only, ``2``–``5`` PSF0–PSF3 total.
+    irf : str
+        IRF name passed to :class:`EffectiveAreaIRF` when *Aeff* is *None*.
+    file_path : str or None
+        Path to the CALDB ``bcf/ea`` directory.
+    CALDB : str or None
+        CALDB root; falls back to ``$CALDB`` environment variable.
+    use_phidep : bool
+        Load phi-dependence tables when constructing a new IRF object.
+    n_energy : int
+        Number of logarithmically-spaced energy sample points for averaging.
+    spectrum : callable or None
+        Spectral weighting function ``S(E)``; defaults to ``E^{-2}``.
+    ctmin, ctmax : float
+        cos(theta) integration limits.  Must satisfy ``0 <= ctmin < ctmax <= 1``.
+    n_costh : int
+        Number of cos(theta) sample points.
+
+    Returns
+    -------
+    callable
+        Function ``aeff_costheta(costheta)`` returning the energy-averaged
+        effective area in cm² at each requested cos(theta) value.
     """
     if not (emin > 0 and emax > emin):
         raise ValueError("Expect 0 < emin < emax")
@@ -543,7 +796,54 @@ def make_exposure_map_healpix(
     zenith_deg=None,
     zmax_deg=None,
 ):
-    """Create a HEALPix exposure map via spherical convolution."""
+    """Create a HEALPix exposure map via spherical harmonic convolution.
+
+    Computes the band-averaged effective area as a function of cos(theta),
+    builds an axisymmetric kernel, and convolves it with the livetime-density
+    map in harmonic space using healpy.
+
+    Parameters
+    ----------
+    Aeff : callable, dict, or None
+        Effective-area evaluator; see :func:`make_aeff_costheta_function`.
+    emin, emax : float
+        Energy band boundaries in MeV.
+    livetime : float or ndarray
+        Per-pixel livetime in seconds.  A scalar is broadcast to a full-sky
+        map of ``12 * nside**2`` pixels (requires *nside*); a 1-D array
+        infers ``nside`` from its length.
+    nside : int or None
+        HEALPix resolution; required only when *livetime* is a scalar.
+    event_type : int
+        Event-type code (see :func:`make_aeff_costheta_function`).
+    irf : str
+        IRF name.
+    file_path, CALDB, use_phidep : see :func:`make_aeff_costheta_function`.
+    n_energy : int
+        Energy integration points.
+    spectrum : callable or None
+        Spectral weighting; defaults to ``E^{-2}``.
+    ctmin, ctmax : float
+        cos(theta) acceptance limits.
+    n_costh : int
+        cos(theta) sample points.
+    n_theta : int
+        Number of polar-angle points for the kernel (>= 16).
+    lmax : int or None
+        Maximum spherical-harmonic order; defaults to ``3 * nside - 1``.
+    costh_weight : callable or None
+        Optional additional weighting over cos(theta).
+    zenith_deg : ndarray or None
+        Per-pixel mean zenith angle in degrees; used with *zmax_deg* to mask
+        pixels above the zenith-angle cut.
+    zmax_deg : float or None
+        Maximum zenith angle cut in degrees.
+
+    Returns
+    -------
+    ndarray, shape (12 * nside²,), dtype float32
+        Full-sky HEALPix exposure map in cm² s.
+    """
     if not (emin > 0 and emax > emin):
         raise ValueError("Expect 0 < emin < emax")
     ctmin = float(ctmin)
@@ -672,11 +972,40 @@ def build_pixel_table_exposure(
 ):
     """Compute and attach band exposure products to a PixelTable.
 
-    For each band this builds:
-    - ``band.aeff_costheta``: band-averaged effective area versus cos(theta)
-    - ``band.exposure_map``: callable ``ExposureMap`` instance
-    - ``band.pixel_exposure``: exposure sampled at each sparse pixel direction
-    - ``band.exposure``: mean sparse-pixel exposure for the band
+    Iterates over every band in *pixel_table*, builds a full-sky HEALPix
+    exposure map for each band's energy range and event type, and attaches
+    the results via :meth:`PixelTable.attach_exposure`.
+
+    For each band the following attributes are set:
+
+    - ``band.aeff_costheta`` — band-averaged effective area vs. cos(theta)
+    - ``band.exposure_map``  — callable :class:`ExposureMap` instance
+    - ``band.pixel_exposure`` — exposure sampled at each sparse pixel
+    - ``band.exposure``       — mean sparse-pixel exposure for the band
+
+    Parameters
+    ----------
+    pixel_table : PixelTable
+        Sparse pixel-data object whose bands supply ``e0``, ``e1``, ``pix``,
+        and either ``event_type`` or ``psf`` attributes.
+    livetime : float or ndarray
+        Per-pixel livetime in seconds passed to :func:`make_exposure_map_healpix`.
+    Aeff : callable, dict, or None
+        Effective-area evaluator; see :func:`make_aeff_costheta_function`.
+    irf : str
+        IRF name (default ``"P8R3_SOURCE_V3"``).
+    file_path, CALDB, use_phidep : see :func:`make_aeff_costheta_function`.
+    frame : str
+        Coordinate frame for the exposure maps, ``"galactic"`` or ``"icrs"``.
+    nest : bool
+        HEALPix pixel ordering; *False* (default) for RING.
+    n_energy, spectrum, ctmin, ctmax, n_costh, n_theta, lmax, costh_weight,
+    zenith_deg, zmax_deg : see :func:`make_exposure_map_healpix`.
+
+    Returns
+    -------
+    PixelTable
+        The same *pixel_table* object, modified in-place.
     """
     exposure_by_band = {}
 

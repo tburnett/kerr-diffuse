@@ -1,18 +1,19 @@
-"""Utilities for loading, inspecting, plotting, and exporting Kerr pixel tables.
+"""Utilities for loading, inspecting, plotting, and exporting pixel tables.
 
 This module provides:
-- `PixelTable` and `PixelTable.Band` for reading pixel table files and working
-    with per-band HEALPix data.
+- `PixelTable` and `PixelTable.Band` for reading Kerr-style FITS pixel table
+    files and working with per-band HEALPix data.
 - Residual visualization helpers (`ResidualPlotter`, scatter/histogram helpers).
-- FITS export helpers (`KerrDataFile`).
 - Simple spatial clustering for significant residual points.
 """
 
+from matplotlib.colors import LogNorm
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from astropy.coordinates import SkyCoord, Angle
-from astropy_healpix import HEALPix 
+from astropy.io import fits
+from astropy_healpix import HEALPix
 from pathlib import Path
 from typing import cast
 
@@ -45,71 +46,47 @@ def _event_type_to_label(value):
         return 'BACK'
     return f'PSF{ivalue - 2}'
 
+_energy_index = lambda energy: (np.log10(energy) * 4 - 8).astype(int)
+
 
 class PixelTable(dict):
     """Container for pixel table bands and their sparse per-pixel arrays.
 
-    The class loads either Kerr `<root>.npz` and `<root>.pickle` companions or
-    a Kerr-style FITS file, then exposes each `(psf_index, energy_index)` band
-    through dictionary access.
+    The class loads a Kerr-style FITS file and exposes each
+    ``(psf_index, energy_index)`` band through dictionary access.
     """
 
     class Band(HEALPix):
         """Single event-type/energy slice of a pixel table.
 
         Each band is a HEALPix view plus aligned sparse arrays for photons and
-        model components (`diffuse`, `ptsrc`, optional `extsrc` and `sunmoon`).
+        model components (`diffuse` and `sources`).
         """
 
-        def __init__(self, meta):
-            self.psf, self.e0, self.e1, nside, self.nocc = meta
-            self.event_type = _event_type_to_int(self.psf)
-            self.counts = 0
-            self.pix = np.array([], dtype=np.int64)
-            self.photons = np.array([], dtype=np.int32)
-            self.diffuse = np.array([], dtype=float)
-            self.ptsrc = np.array([], dtype=float)
-            self.extsrc: np.ndarray | None = None
-            self.sunmoon: np.ndarray | None = None
-            self.exposure: float | None = None
-            self.pixel_exposure: np.ndarray | None = None
-            self.exposure_map = None
-            self.exposure_map_values: np.ndarray | None = None
-            self.aeff_costheta = None
-            self.slice = slice(0, 0)
-            self.totals: dict[str, object] = {}
-            ekey = lambda energy: (np.log10(energy) * 4 - 8).astype(int)
+        def __init__(self, meta, order):
+            self.psf_name, self.e0, self.e1, nside, self.nocc = meta
+            self.event_type = _event_type_to_int(self.psf_name)
 
             # key is (psf index, energy index) tuple
             psf_index = self.event_type if self.event_type < 2 else self.event_type - 2
-            self.key = (int(psf_index), ekey(self.e0))
+            self.key = (int(psf_index), _energy_index(self.e0))
             self.energy = f'{np.sqrt(self.e0 * self.e1) * 1e-3:.2f} GeV'
-            super().__init__(nside, frame='galactic', order='nested')
+            super().__init__(nside, frame='galactic', order=order)
+            self.psf = None  # set later by PixelTable.set_psf()
 
         def __repr__(self) -> str:
-            return f"Band{self.key}: {self.psf}@{self.energy} nside {self.nside} occ {self.nocc/(12*self.nside**2):.3f}"
-
-        def _optional_component(self, name):
-            """Return an optional model component array when present."""
-            component = getattr(self, name)
-            return component if component is not None else None
+            return f"Band{self.key}: {self.psf_name}@{self.energy} nside {self.nside} occ {self.nocc/(12*self.nside**2):.3f}"
 
         def _model_counts(self):
             """Return the full model counts vector for this band."""
-            extsrc = self._optional_component('extsrc')
-            sunmoon = self._optional_component('sunmoon')
             return (
                 self.diffuse
-                + self.ptsrc
-                + (extsrc if extsrc is not None else 0)
-                + (sunmoon if sunmoon is not None else 0)
+                + self.sources
             )
 
         def _component_values(self, component):
             """Resolve component name to a per-pixel values array."""
             model = self._model_counts()
-            extsrc = self._optional_component('extsrc')
-            sunmoon = self._optional_component('sunmoon')
             if component == 'exposure':
                 if self.pixel_exposure is None:
                     raise ValueError('No pixel exposure has been attached to this band')
@@ -124,9 +101,7 @@ class PixelTable(dict):
             components = {
                 'data': self.photons,
                 'diffuse': self.diffuse,
-                'ptsrc': self.ptsrc,
-                'extsrc': extsrc if extsrc is not None else np.zeros_like(self.photons),
-                'sunmoon': sunmoon if sunmoon is not None else np.zeros_like(self.photons),
+                'sources': self.sources,
             }
             return components[component]
 
@@ -186,8 +161,8 @@ class PixelTable(dict):
                 Component to map:
                 - 'data': observed photon counts
                 - 'diffuse': diffuse model component
-                - 'ptsrc': point-source model component
-                - 'model': combined model (diffuse + ptsrc + extsrc + sunmoon)
+                - 'sources': point-source model component
+                - 'model': combined model (diffuse + sources)
                 - 'resid': residuals (data - model)
                 - 'sigma': normalized residuals (resid / sqrt(model))
                 Default is 'data'.
@@ -216,7 +191,8 @@ class PixelTable(dict):
             np.add.at(mp, pix, values)
             return mp
         
-        def ait_plot(self, component, *, nside=128, figsize=(12,6), fig=None, colorbar=True, 
+        def ait_plot(self, component, *, nside=128, figsize=(12,6), fig=None, colorbar=True,
+                     label='counts/pixel',
                      shrink=0.7, cmap='viridis', frame='galactic', log=True, **kwargs):
             """Render an all-sky AIT projection for one band component.
 
@@ -239,7 +215,7 @@ class PixelTable(dict):
             frame : str, optional
                 Sky coordinate frame. Default is 'galactic'.
             log : bool, optional
-                If True, display log10(counts) with log scale; zero values shown as NaN.
+                If True, use a log scale for the color mapping of the map.
                 Default is True.
             **kwargs
                 Additional arguments passed to imshow().
@@ -250,18 +226,21 @@ class PixelTable(dict):
                 Chainable figure object. Call .show() to display.
             """
             from utilities.skymaps import AITfigure
+            from matplotlib.colors import LogNorm, Normalize
 
             mp = self.ring_map(nside, component=component, frame=frame)
             if log: mp[mp==0] = np.nan
-
+            vmin = kwargs.pop('vmin', None)
+            vmax = kwargs.pop('vmax', None)
+            norm_fn = LogNorm if log else Normalize
             afig = AITfigure(fig=fig, figsize=figsize, title=f'{component} for {self}')
-            afig.imshow(np.log10(mp) if log else mp, cmap=cmap, **kwargs)
+            afig.imshow(mp, norm=norm_fn(vmin=vmin, vmax=vmax), cmap=cmap, **kwargs)
             if colorbar:
-                afig.colorbar(label='log10(counts)' if log else 'counts', shrink=shrink)
+                afig.colorbar(label=label, shrink=shrink)
             return afig   
 
         def zea_plot(self, component, center, *, nside=256, figsize=(8,8), 
-                    pixelsize=0.05, size=5, fig=None,
+                    pixelsize=0.05, size=5, fig=None, axes_visible=True,
                      cmap='viridis', colorbar=True, title=None,**kwargs):
             """Render a local Zero Equal Area projection around a center coordinate.
 
@@ -299,6 +278,7 @@ class PixelTable(dict):
             from utilities.skymaps import ZEAfigure
 
             zfig = ZEAfigure(center, size=size, fig=fig, figsize=figsize, pixelsize=pixelsize,
+                             axes_visible=axes_visible,
                              title=f'{component} for {self}' if title is None else title) 
             
             if component is not None:
@@ -335,58 +315,34 @@ class PixelTable(dict):
             return pd.DataFrame( dict(pixel=self.ring_to_nested(pix[out]), data=d[out], model=m[out], sigma=r[out] )) 
          
        
-    def __init__(self, root, *, ring=None):
-        """Load a pixel table from Kerr `.npz/.pickle` or FITS input.
+    def __init__(self, root, *, emin=100, set_psf=True):
+        """Load a pixel table from a Kerr-style FITS file.
 
         Parameters
         ----------
         root : str or Path
-            Either a path stem for `<root>.npz` and `<root>.pickle`, or a FITS
-            filename containing `SKYMAP` and `BANDS` HDUs.
-        ring : bool or None, optional
-            Output pixel ordering. For Kerr `.npz/.pickle` input, `None` and
-            `False` both preserve NESTED ordering while `True` converts to RING.
-            For FITS input, `None` infers ordering from the `SKYMAP` header.
+            Path to a FITS file containing ``SKYMAP`` and ``BANDS`` HDUs.
+        emin : float or None, optional
+            Minimum band energy in MeV. Bands with emin below this value are
+            dropped at load time. Default is 100. Pass ``None`` to load all bands.
+        set_psf : bool, optional
+            Whether to set the PSF. Default is True. If True, calls `set_psf()` after loading the FITS data.
         """
         root = Path(root).expanduser()
         super().__init__()
+        self._load_from_fits(root, emin_filter=emin)
+        if set_psf:
+            self.set_psf()
 
-        name = root.name.lower()
-        if any(name.endswith(ext) for ext in ('.fits', '.fit', '.fits.gz', '.fit.gz', '.fts')):
-            self._load_from_fits(root, ring=ring)
-        else:
-            self._load_from_kerr(root, ring=ring)
+    def __call__(self, *pars):
+        return self[pars]
 
-    def _load_from_kerr(self, root, *, ring=None):
-        """Load sparse arrays and metadata from a Kerr `.npz/.pickle` pair."""
-        import pickle
-
-        filename, meta_file = root.with_suffix('.npz'), root.with_suffix('.pickle')
-        self.name = root.name
-        self.ring = False
-
-        with np.load(filename) as f:
-            self.diffuse = f['diffuse']
-            self.ptsrc = f['pointsources']
-            self.photons = f['counts'].astype(np.int32)
-            self.pix = f['indices']
-            if 'extendedsources' in f:
-                self.extsrc = f['extendedsources']
-            if 'sunmoon' in f:
-                self.sunmoon = f['sunmoon']
-
-        with open(meta_file, 'rb') as inp:
-            meta = pickle.load(inp)
-
-        self._setup_from_arrays(meta, source=filename, ring=bool(ring))
-
-    def _load_from_fits(self, filename, *, ring=None):
+    def _load_from_fits(self, filename, *, emin_filter=None):
         """Load sparse arrays and metadata from a Kerr-style FITS file."""
         filename = Path(filename).expanduser()
         self.name = filename.stem
-        self.ring = False
 
-        with fits.open(filename) as hdul:
+        with fits.open(filename, memmap=True) as hdul:
             skymap = cast(fits.BinTableHDU, hdul['SKYMAP'])
             bands = cast(fits.BinTableHDU, hdul['BANDS'])
             skymap_data = skymap.data
@@ -394,62 +350,95 @@ class PixelTable(dict):
             if skymap_data is None or bands_data is None:
                 raise ValueError(f'Invalid FITS table payload in {filename}')
 
-            pix = np.asarray(skymap_data['PIX'], dtype=np.int64)
-            chn = np.asarray(skymap_data['CHANNEL'], dtype=np.int64)
-            photons = np.asarray(skymap_data['VALUE'], dtype=np.int32)
-            pixel_exposure = None
-            skymap_names = skymap_data.names or ()
-            if 'EXPOSURE' in skymap_names:
-                pixel_exposure = np.asarray(skymap_data['EXPOSURE'], dtype=float)
-
-            if chn.size == 0:
-                raise ValueError(f'No rows found in SKYMAP HDU: {filename}')
-
-            order_idx = np.argsort(chn, kind='stable')
-            pix = pix[order_idx]
-            chn = chn[order_idx]
-            photons = photons[order_idx]
-            if pixel_exposure is not None:
-                pixel_exposure = pixel_exposure[order_idx]
+            ordering = skymap.header.get('ORDERING', 'NESTED').upper()
+            self.order = 'nested' if ordering == 'NESTED' else 'ring'
 
             nside = np.asarray(bands_data['NSIDE'], dtype=int)
             emin = np.asarray(bands_data['E_MIN'], dtype=float) * 1e-3
             emax = np.asarray(bands_data['E_MAX'], dtype=float) * 1e-3
             event_type = np.asarray(bands_data['EVENT_TYPE'], dtype=int)
-            band_exposure = None
-            band_names = bands_data.names or ()
-            if 'EXPOSURE' in band_names:
-                band_exposure = np.asarray(bands_data['EXPOSURE'], dtype=float)
-
             nbands = len(nside)
-            nocc = np.bincount(chn, minlength=nbands)
 
-            event_labels = [_event_type_to_label(et) for et in event_type]
-            meta = [
-                (event_labels[i], float(emin[i]), float(emax[i]), int(nside[i]), int(nocc[i]))
-                for i in range(nbands)
-            ]
+            # Read channel column first to build a combined sort+filter index.
+            # This avoids holding all columns in memory while sorting.
+            chn_raw = np.asarray(skymap_data['CHANNEL'], dtype=np.int64)
+            if chn_raw.size == 0:
+                raise ValueError(f'No rows found in SKYMAP HDU: {filename}')
 
-            ordering = str(skymap.header.get('ORDERING', 'NESTED')).strip().upper()
-            inferred_ring = ordering == 'RING'
+            order_idx = np.argsort(chn_raw, kind='stable')
+            chn_sorted = chn_raw[order_idx]
+            del chn_raw
+
+            if emin_filter is not None:
+                keep = np.where(emin >= emin_filter)[0]
+                chn_mask = np.isin(chn_sorted, keep)
+                order_idx = order_idx[chn_mask]          # combined sort+filter index
+                old_to_new = np.full(nbands, -1, dtype=np.int64)
+                old_to_new[keep] = np.arange(len(keep), dtype=np.int64)
+                chn = old_to_new[chn_sorted[chn_mask]]
+                del chn_sorted, chn_mask, old_to_new
+            else:
+                keep = np.arange(nbands)
+                chn = chn_sorted
+                del chn_sorted
+
+            nbands_out = len(keep)
+            nocc = np.bincount(chn, minlength=nbands_out)
+
+            # Apply the combined index to each column individually so that only
+            # one raw column is live at a time, bounding peak memory usage.
+            skymap_names = skymap_data.names or ()
+
+            _raw = np.asarray(skymap_data['PIX'], dtype=np.int64)
+            pix = _raw[order_idx]; del _raw
+
+            _raw = np.asarray(skymap_data['COUNTS'], dtype=np.int32)
+            photons = _raw[order_idx]; del _raw
+
+            pixel_exposure = None
+            if 'EXPOSURE' in skymap_names:
+                _raw = np.asarray(skymap_data['EXPOSURE'], dtype=float)
+                pixel_exposure = _raw[order_idx]; del _raw
+
+            fits_diffuse = None
+            if 'DIFFUSE' in skymap_names:
+                _raw = np.asarray(skymap_data['DIFFUSE'], dtype=np.float32)
+                fits_diffuse = _raw[order_idx]; del _raw
+                if 'SUNMOON' in skymap_names:
+                    _raw = np.asarray(skymap_data['SUNMOON'], dtype=np.float32)
+                    fits_diffuse += _raw[order_idx]; del _raw
+
+            _raw = np.asarray(skymap_data['POINTSOURCES'], dtype=np.float32)
+            fits_sources = _raw[order_idx]; del _raw
+            _raw = np.asarray(skymap_data['EXTENDEDSOURCES'], dtype=np.float32)
+            fits_sources += _raw[order_idx]; del _raw
+
+            del order_idx
+
+        nside = nside[keep]
+        emin = emin[keep]
+        emax = emax[keep]
+        event_type = event_type[keep]
+
+        event_labels = [_event_type_to_label(et) for et in event_type]
+        meta = [
+            (event_labels[i], float(emin[i]), float(emax[i]), int(nside[i]), int(nocc[i]))
+            for i in range(nbands_out)
+        ]
 
         self.photons = photons
         self.pix = pix
         if pixel_exposure is not None:
             self.pixel_exposure = pixel_exposure
         # FITS SKYMAP stores counts; initialize model arrays for API compatibility.
-        self.diffuse = np.zeros_like(photons, dtype=float)
-        self.ptsrc = np.zeros_like(photons, dtype=float)
+        self.diffuse = fits_diffuse.astype(np.float32)
+        self.sources = fits_sources.astype(np.float32)
 
-        target_ring = inferred_ring if ring is None else bool(ring)
-        self._setup_from_arrays(meta, source=filename, ring=target_ring)
-        if band_exposure is not None:
-            self.meta_df = self.meta_df.copy()
-            self.meta_df['exposure'] = np.asarray(band_exposure, dtype=float)
-            for band, value in zip(self.values(), band_exposure):
-                band.exposure = float(value)
 
-    def _setup_from_arrays(self, meta, *, source, ring=False):
+        self._setup_from_arrays(meta, source=filename)
+
+
+    def _setup_from_arrays(self, meta, *, source):
         """Build per-band objects from flattened sparse arrays and metadata."""
         self.meta_df = pd.DataFrame(meta, columns='event_type emin emax nside nocc'.split())
         self.meta_df['occupancy'] = (self.meta_df.nocc / (12 * self.meta_df.nside**2)).round(3)
@@ -457,245 +446,95 @@ class PixelTable(dict):
         nbands = len(meta)
         offset = 0
         for i, m in enumerate(meta):
-            b = self.Band(m)
+            b = self.Band(m, self.order)
             self[b.key] = b
             nocc = int(m[-1])
             sl = slice(offset, offset + nocc)
             b.slice = sl
-            for attr in ('diffuse', 'ptsrc', 'photons', 'pix'):
+            for attr in ('diffuse', 'sources', 'photons',  'pix', 'pixel_exposure'):
                 setattr(b, attr, getattr(self, attr)[sl])
-            for attr in ('extsrc', 'sunmoon'):
-                if hasattr(self, attr):
-                    setattr(b, attr, getattr(self, attr)[sl])
             offset += nocc
-            b.totals = dict(diffuse=self.diffuse[-nbands + i], ptsrc=self.ptsrc[-nbands + i])
+            b.totals = dict(diffuse=self.diffuse[-nbands + i], sources=self.sources[-nbands + i])
 
         self.meta_df['event_type_code'] = [self[key].event_type for key in self.keys()]
 
-        if len(self.diffuse) >= offset + nbands and len(self.ptsrc) >= offset + nbands:
-            self.totals = dict(diffuse=self.diffuse[offset:], ptsrc=self.ptsrc[offset:])
+        if len(self.diffuse) >= offset + nbands and len(self.sources) >= offset + nbands:
+            self.totals = dict(diffuse=self.diffuse[offset:], sources=self.sources[offset:])
         else:
             self.totals = dict(
                 diffuse=np.array([self.diffuse.sum()], dtype=float),
-                ptsrc=np.array([self.ptsrc.sum()], dtype=float),
+                sources=np.array([self.sources.sum()], dtype=float),
             )
 
         keys = sorted(self.keys())
         if keys:
-            band_summary = f"{self[keys[0]]} ... {self[keys[-1]]}"
+            self.band_summary = f"{self[keys[0]]} ... {self[keys[-1]]}"
         else:
-            band_summary = "no bands"
+            self.band_summary = "no bands"
 
         print(f"""Loaded pixel table from "{source}":
-            {len(self)} bands {band_summary}
+            {len(self)} bands {self.band_summary}
             {self.photons.sum().astype(int):,d} photons
-            {len(self.pix):,d} pixels
+            {len(self.pix):,d} pixels, order {self.order}
             """)
-
-        if ring:
-            for b in self.values():
-                b.pix_to_ring(inplace=True)
-            for b in self.values():
-                self.pix[b.slice] = b.pix
-            self.ring = True
-
-        if hasattr(self, 'pixel_exposure'):
-            self._set_pixel_exposure_from_flat(self.pixel_exposure)
-        elif 'exposure' in self.meta_df.columns:
-            exposure = np.asarray(self.meta_df['exposure'], dtype=float)
-            for band, value in zip(self.values(), exposure):
-                band.exposure = float(value)
 
     @staticmethod
     def _frame_name(frame):
         name = getattr(frame, 'name', frame)
         return str(name).lower()
 
-    def _set_pixel_exposure_from_flat(self, values):
-        """Populate per-band exposure arrays from a flattened sparse array."""
-        flat = np.asarray(values, dtype=float)
-        if flat.shape != self.pix.shape:
-            raise ValueError(
-                f'Flat exposure array shape {flat.shape} does not match pixel array shape {self.pix.shape}'
-            )
+    def set_psf(self, table_path='files/loc'):
+        """Assign PSF functor objects to each band from a PSF table.
 
-        self.pixel_exposure = flat
-        per_band = []
-        for band in self.values():
-            pixel_exp = flat[band.slice]
-            band.pixel_exposure = pixel_exp
-            band.exposure = float(np.nanmean(pixel_exp)) if pixel_exp.size else np.nan
-            per_band.append(band.exposure)
-
-        self.meta_df = self.meta_df.copy()
-        self.meta_df['exposure'] = np.asarray(per_band, dtype=float)
-        self._refresh_pixel_exposure_df()
-
-    def _refresh_pixel_exposure_df(self):
-        """Build the long-form per-pixel exposure table from attached band arrays."""
-        records = []
-        for band in self.values():
-            if band.pixel_exposure is None:
-                continue
-            records.append(
-                pd.DataFrame({
-                    'band_key': [band.key] * len(band.pix),
-                    'pix': np.asarray(band.pix, dtype=int),
-                    'pixel_exposure': np.asarray(band.pixel_exposure, dtype=float),
-                })
-            )
-        if records:
-            self.pixel_exposure_df = pd.concat(records, ignore_index=True)
-        elif hasattr(self, 'pixel_exposure_df'):
-            delattr(self, 'pixel_exposure_df')
-
-    def _resolve_band_exposure(self, band, source, *, frame='galactic', nest=False):
-        """Evaluate one exposure source into a per-pixel array for a band."""
-        from like3.exposure import ExposureMap
-
-        exposure_map_obj = None
-        map_values = None
-
-        if source is None or (np.isscalar(source) and not np.isfinite(source)):
-            pixel_exp = np.full(len(band.pix), np.nan, dtype=float)
-            return pixel_exp, exposure_map_obj, map_values
-
-        if np.isscalar(source):
-            scalar = float(np.asarray(source, dtype=float))
-            pixel_exp = np.full(len(band.pix), scalar, dtype=float)
-            return pixel_exp, exposure_map_obj, map_values
-
-        if isinstance(source, ExposureMap):
-            exposure_map_obj = source
-            map_values = np.asarray(source.values, dtype=float)
-            pixel_exp = np.asarray(source(band.skycoords), dtype=float)
-            return pixel_exp, exposure_map_obj, map_values
-
-        if callable(source):
-            for arg in (band.skycoords, np.asarray(band.pix, dtype=int)):
-                try:
-                    values = source(arg)
-                except Exception:
-                    continue
-                values = np.asarray(values, dtype=float)
-                if values.ndim == 0:
-                    return np.full(len(band.pix), float(values), dtype=float), exposure_map_obj, map_values
-                if values.shape == (len(band.pix),):
-                    return values.astype(float, copy=False), exposure_map_obj, map_values
-            raise ValueError(f'Exposure callable for band {band.key} did not return scalar or len(band.pix) values')
-
-        arr = np.asarray(source, dtype=float)
-        if arr.ndim != 1:
-            raise ValueError(f'Exposure for band {band.key} must be scalar, callable, or 1D array')
-
-        if arr.shape == (len(band.pix),):
-            return arr.astype(float, copy=False), exposure_map_obj, map_values
-
-        nside = int(np.sqrt(arr.size / 12.0))
-        if 12 * nside**2 != arr.size:
-            raise ValueError(
-                f'Exposure array for band {band.key} has length {arr.size}; expected len(band.pix)={len(band.pix)} '
-                'or a full-sky HEALPix map'
-            )
-
-        same_frame = self._frame_name(frame) == self._frame_name(getattr(band, 'frame', 'galactic'))
-        exposure_map_obj = ExposureMap(arr, nside=nside, nest=nest, frame=frame)
-        map_values = np.asarray(arr, dtype=float)
-        if same_frame and int(nside) == int(band.nside):
-            indices = band._pixels_for_map_order(nest=bool(nest))
-            pixel_exp = arr[np.asarray(indices, dtype=int)]
-        else:
-            pixel_exp = np.asarray(exposure_map_obj(band.skycoords), dtype=float)
-        return pixel_exp.astype(float, copy=False), exposure_map_obj, map_values
-
-    def attach_exposure(self, exposure_by_band, *, frame='galactic', nest=False):
-        """Attach per-pixel exposure arrays to each band.
+        Loads :class:`~pylib.psf_func.PSFlist` entries from *table_path* and
+        matches each band to the nearest-energy PSF for its event type.
+        When *table_path* is a directory, ``fb_psf_table.pkl`` is used for
+        FRONT/BACK bands (event types 0-1) and ``psf_psf_table.pkl`` for
+        PSF-partition bands (event types 2-5).  If an event type is absent
+        from the tables, the FRONT (event type 0) shapes are used as a
+        fallback.
 
         Parameters
         ----------
-        exposure_by_band : mapping
-            Dict keyed by ``band.key``. Values may be scalars, arrays aligned
-            with ``band.pix``, full-sky HEALPix arrays, callables, or
-            ``like3.exposure.ExposureMap`` instances.
-        frame : str, optional
-            Sky frame for full-sky HEALPix maps. Default is ``'galactic'``.
-        nest : bool, optional
-            Ordering for input full-sky HEALPix arrays. Default is ``False``.
-        """
-        self.meta_df = self.meta_df.copy()
-        self.meta_df['band_key'] = [band.key for band in self.values()]
-
-        flat = np.full(len(self.pix), np.nan, dtype=float)
-        per_band = {}
-        for band in self.values():
-            source = exposure_by_band.get(band.key)
-            pixel_exp, exposure_map_obj, map_values = self._resolve_band_exposure(
-                band,
-                source,
-                frame=frame,
-                nest=nest,
-            )
-            band.pixel_exposure = np.asarray(pixel_exp, dtype=float)
-            band.exposure = float(np.nanmean(band.pixel_exposure)) if band.pixel_exposure.size else np.nan
-            if exposure_map_obj is not None:
-                band.exposure_map = exposure_map_obj
-            if map_values is not None:
-                band.exposure_map_values = np.asarray(map_values, dtype=float)
-            flat[band.slice] = band.pixel_exposure
-            per_band[band.key] = band.exposure
-
-        self.pixel_exposure = flat
-        self.meta_df['exposure'] = self.meta_df['band_key'].map(per_band).astype(float)
-        self._refresh_pixel_exposure_df()
-        return self
-
-    def build_exposure(self, livetime, **kwargs):
-        """Compute and attach band exposure maps using like3.exposure utilities."""
-        from like3.exposure import build_pixel_table_exposure
-
-        return build_pixel_table_exposure(self, livetime, **kwargs)
-
-    # @classmethod
-    # def from_fits(cls, filename, *, ring=None):
-    #     """Create a PixelTable by reading a Kerr-style FITS file.
-
-    #     Parameters
-    #     ----------
-    #     filename : str or Path
-    #         FITS file path containing SKYMAP and BANDS HDUs.
-    #     ring : bool or None, optional
-    #         If None, infer output ordering from SKYMAP ORDERING header.
-    #         If bool, force NESTED (False) or RING (True) pixel ordering.
-    #     """
-    #     return cls(filename, ring=ring)
- 
-    def __call__(self, *pars):
-        """Return a band by (psf_index, energy_index) tuple.
-
-        Parameters
-        ----------
-        *pars : int
-            Exactly 2 positional arguments: psf_index (0-3) and energy_index (0-11 typical).
+        table_path : str or Path, optional
+            Directory containing ``fb_psf_table.pkl`` and
+            ``psf_psf_table.pkl``, or a direct path to a single pickle file.
+            Default is ``'files/loc'``.
 
         Returns
         -------
-        PixelTable.Band
-            The requested band object.
-
-        Raises
-        ------
-        ValueError
-            If not exactly 2 indices provided.
-
-        Examples
-        --------
-        >>> pt = PixelTable('files/toby_v4')
-        >>> band = pt(2, 4)  # PSF2, energy bin 4
+        PixelTable
+            Returns *self* for method chaining.
         """
-        if len(pars) != 2:
-            raise ValueError("Provide psf and energy bin index")
-        return self[pars]
-    
+        from pylib.psf_func import PSFlist
+        import copy
+
+        all_psfs = PSFlist(event_type=None, table_path=table_path)
+        if not all_psfs:
+            print(f'set_psf: no PSF entries loaded from {table_path!r}')
+            return self
+
+        # Build event-type → sorted list-of-PSF lookup.
+        psf_by_et: dict[int, list] = {}
+        for psf in all_psfs:
+            psf_by_et.setdefault(psf.event_type, []).append(psf)
+
+        for band in self.values():
+            et = band.event_type
+            fallback = et not in psf_by_et
+            lookup_et = et if not fallback else 0
+            plist = psf_by_et[lookup_et]
+            emean = np.sqrt(band.e0 * band.e1)  # MeV
+            energies = np.array([p.energy for p in plist])
+            psf = plist[int(np.argmin(np.abs(energies - emean)))]
+            if fallback:
+                psf = copy.copy(psf)
+                psf['event_type'] = et
+                psf.__dict__['event_type'] = et
+            band.psf = psf
+
+        return self
+
     def ring_map(self, nside=128, component='data', frame='galactic'):
         """Combine all compatible bands into one HEALPix RING map.
 
@@ -745,26 +584,6 @@ class PixelTable(dict):
             zfig.colorbar(label='log10(counts)', shrink=0.7)
         return zfig
 
-    def to_fits(self, filename, *, overwrite=True):
-        """Write this PixelTable to a Kerr-style FITS file.
-
-        Parameters
-        ----------
-        filename : str or Path
-            Output FITS filename.
-        overwrite : bool, optional
-            Overwrite existing file. Default is True.
-
-        Returns
-        -------
-        Path
-            Path to the written FITS file.
-        """
-        out = Path(filename).expanduser()
-        KerrDataFile(self).writeto(out, overwrite=overwrite)
-        return out
-
-        
 def multi_ait(pixel_table, et, component='diffuse'):
     """Generate a 3x4 panel of band-level AIT plots for one event-type prefix.
 
@@ -776,7 +595,7 @@ def multi_ait(pixel_table, et, component='diffuse'):
         Event type selector. Accepts integer PSF index (0-3), strings like
         '0', 'PSF0', 'psf3', or legacy labels ending with a digit.
     component : str, optional
-        Component name to visualize ('diffuse', 'ptsrc', 'data', etc.).
+        Component name to visualize ('diffuse', 'sources', 'data', etc.).
         Defaults to 'diffuse'.
 
     Returns
@@ -870,7 +689,7 @@ def residual_scatter(model, norm, ax=None, ylim=np.array([-5,5])):
 class ResidualPlotter:
     """Compute and visualize per-band residual diagnostics."""
 
-    def __init__(self, band, nside=64):
+    def __init__(self, band, nside=64, clipto=(-5,5)):
         """Precompute residual, model, and normalized residual maps.
 
         Parameters
@@ -880,6 +699,9 @@ class ResidualPlotter:
         nside : int, optional
             Target resolution for map degradation. Default is 64.
             Uses minimum of requested nside and band's native nside.
+        clipto : tuple of float, optional
+            Min/max values to clip normalized residuals to. Default is (-5, 5).
+
 
         Attributes Set
         ---------------
@@ -898,10 +720,13 @@ class ResidualPlotter:
         """
         self.nside = min(nside, band.nside) if nside is not None else band.nside
         self.resid = band.ring_map(component='resid', nside=self.nside) 
+    
         self.model = band.ring_map(component='model', nside=self.nside)
         # clean up zeros in model to avoid div by zero
         self.model[self.model==0] = np.min(self.model[self.model>0])
         self.rnorm = (self.resid/np.sqrt(self.model))
+        if clipto is not None:
+            self.rnorm = np.clip(self.rnorm, *clipto)
         self.photons = band.ring_map(component='data', nside=self.nside)
         self.band = band
 
@@ -975,7 +800,7 @@ class ResidualPlotter:
             rnorm = self.rnorm
 
         nfit = norm.fit(rnorm[~np.isnan(rnorm)])
-        ax.hist(rnorm.clip(*ylim), bins=25, range=ylim, density=True, 
+        ax.hist(rnorm.clip(*ylim), bins=25, range=(float(ylim[0]), float(ylim[1])), density=True,
                 histtype='stepfilled', alpha=0.5,)
         ax.plot((x:=np.linspace(*ylim,num=25)), norm.pdf(x, *nfit), 'r-', lw=4,
             label =rf'$\mu$={nfit[0]:.2f}'+'\n'+ rf'$\sigma$={nfit[1]:.2f}')
@@ -1063,7 +888,7 @@ def multi_residual_plotter(pixel_table, nside=64):
 
     # PSF label column and histogram grid
     for psf_idx, row in enumerate(axx[1:]):
-        row[0].text(0.5, 0.5, pixel_table(psf_idx, 7).psf.upper(),
+        row[0].text(0.5, 0.5, pixel_table(psf_idx, 7).psf_name.upper(),
                     transform=row[0].transAxes, fontsize=18, ha='center', va='center')
         row[0].axis('off')
         for energy_idx, ax in enumerate(row[1:]):
@@ -1105,165 +930,6 @@ class BinnedStat:
         self.xerr = 0.5 * (edges[1:] - edges[:-1])
         self.bins = bins
 
-
-from astropy.io import fits
-
-class KerrDataFile:
-    """Serialize `PixelTable` content into the FITS layout used by Kerr files.
-
-    The generated FITS file contains a sparse `SKYMAP` table holding pixel
-    counts and a `BANDS` table describing the energy/event-type metadata for
-    each channel.
-    """
-    def __init__(self, kerrmodel, *,order='ring'):
-        """Wrap a PixelTable and expose FITS export utilities.
-
-        Parameters
-        ----------
-        kerrmodel : PixelTable
-            Pixel table instance to serialize.
-        order : str, optional
-            Declared pixel ordering in output FITS header ('ring' or 'nested').
-            Default is 'ring'.
-
-        Attributes
-        -----------
-        pixeltable : PixelTable
-            Reference to source pixel table.
-        order : str
-            Declared ordering for FITS export.
-        """
-        self.pixeltable = kerrmodel
-        self.order = order
-
-    def __repr__(self):
-        return f'KerrDataFile for {self.pixeltable}'
-    
-
-    def skymap_hdu(self):
-        """Create sparse SKYMAP HDU with PIX/CHANNEL/VALUE columns.
-
-        Returns
-        -------
-        astropy.io.fits.BinTableHDU
-            Binary table with columns:
-                - PIX (uint32): NESTED pixel indices
-                - CHANNEL (uint32): Band/channel index into BANDS HDU
-                - VALUE (uint32): Photon counts per pixel
-            Includes HEALPix metadata in header (ORDERING, COORDSYS, etc.).
-        """
-        km = self.pixeltable
-
-        nocc = km.meta_df.nocc.to_numpy()
-        # channels: index of BANDS entry for each pixel
-        chn = np.repeat(np.arange(len(nocc), dtype=np.uint32), nocc.astype(np.uint32))
-
-        cols = [
-            fits.Column(name='PIX', format='J',    array=km.pix),
-            fits.Column(name='CHANNEL', format='I',array=chn),
-            fits.Column(name='VALUE', format='J',  array=km.photons),
-        ]
-        if hasattr(km, 'pixel_exposure'):
-            pixel_exposure = np.asarray(km.pixel_exposure, dtype=float)
-            if pixel_exposure.shape == km.pix.shape:
-                cols.append(fits.Column(name='EXPOSURE', format='D', array=pixel_exposure))
-        hdu=fits.BinTableHDU.from_columns(cols, name='SKYMAP')
-        hdu.header.update(
-            PIXTYPE='HEALPIX',
-            INDXSCHM='SPARSE',
-            ORDERING='RING' if self.pixeltable.ring else 'NESTED',
-            COORDSYS='GAL',
-            BANDSHDU='BANDS',
-            AXCOLS='E_MIN,E_MAX',
-            )
-        return hdu  
-
-    def band_hdu(self, version=5):
-        """Create BANDS HDU containing NSIDE/energy/event-type metadata.
-
-        Parameters
-        ----------
-        version : int, optional
-            FITS version number stored in HDU header. Default is 5.
-
-        Returns
-        -------
-        astropy.io.fits.BinTableHDU
-            Binary table with columns:
-                - NSIDE (int64): HEALPix nside per band
-                - E_MIN (float64): Minimum energy in keV
-                - E_MAX (float64): Maximum energy in keV
-                - EVENT_TYPE (int64): Event type code
-        """
-        df = self.pixeltable.meta_df
-        band_cols = [
-            fits.Column(name='NSIDE', format='J', array=df.nside),
-            fits.Column(name='E_MIN', format='D', array=df.emin*1e+3, unit='keV'),
-            fits.Column(name='E_MAX', format='D', array=df.emax*1e+3, unit='keV'),
-            fits.Column(name='EVENT_TYPE', format='J', array=df.event_type.apply(_event_type_to_int)),
-        ]
-        if 'exposure' in df.columns:
-            band_cols.append(fits.Column(name='EXPOSURE', format='D', array=np.asarray(df.exposure, dtype=float)))
-        hdu=fits.BinTableHDU.from_columns(band_cols, name='BANDS')
-        hdu.header.update(VERSION=version)
-        return hdu
-
-    def writeto(self, filename, overwrite=True):
-        """Write FITS file with PrimaryHDU, SKYMAP, and BANDS extensions.
-
-        Parameters
-        ----------
-        filename : str or Path
-            Output FITS filename.
-        overwrite : bool, optional
-            Overwrite existing file. Default is True.
-
-        Prints
-        ------
-        Status message indicating successful write and ring/nested ordering.
-        """
-
-        hdus=[fits.PrimaryHDU(), 
-              self.skymap_hdu(), 
-              self.band_hdu()] 
-        fits.HDUList(hdus).writeto(filename, overwrite=overwrite)
-        print(f'wrote file {filename}' + (f' (ring={self.pixeltable.ring})' if self.pixeltable.ring else ''))
-
-    @classmethod
-    def readfrom(cls, filename, kerrmodel):
-        """Open and print a FITS file summary, then return a wrapper instance."""
-        hdus = fits.open(filename)
-        print(f'Read KerrDataFile from {filename}:')
-        hdus.info()
-        return cls(kerrmodel)
-
-    
-    @classmethod
-    def to_fits(cls, kerrfile, fitsfile, *, ring=False, overwrite=True):
-        """Translate a Kerr `.npz/.pickle` pair into FITS representation.
-
-        Parameters
-        ----------
-        kerrfile : str or Path
-            Path stem for input .npz/.pickle files.
-        fitsfile : str or Path
-            Output FITS filename.
-        ring : bool, optional
-            If True, convert pixels to RING ordering before export. Default is False.
-        overwrite : bool, optional
-            Overwrite existing FITS file. Default is True.
-
-        Returns
-        -------
-        None
-
-        Notes
-        -----
-        This is a convenience classmethod that loads the pixel table and
-        calls writeto() in a single operation.
-        """
-        km = PixelTable(kerrfile, ring=ring )
-        cls(km).writeto(fitsfile, overwrite=overwrite)
 
 def grouper(points, radius):
     """Group SkyCoord points into connected clusters via separation threshold.
@@ -1365,11 +1031,11 @@ def plot_residuals_for_given_energy(pixel_table, energy_index):
     """
     def mdplot(band,ax=None):
         """Render one PSF panel for the selected energy slice."""
-        d = band.photons; m = band.diffuse+band.ptsrc+band.sunmoon
+        d = band.photons; m = band.diffuse+band.sources
         fig, ax = plt.subplots(figsize=(5,5)) if ax is None else (ax.figure, ax)
         ax.scatter(m.clip(1,1e4), ((d-m)/np.sqrt(m)).clip(-5,10), s=2);
         ax.set(xscale='log',yscale='linear',xlabel='model counts/pixel', ylabel=r'residual ($\sigma$ units)', )
-        ax.text(1,8, f'{band.psf}\nnside {band.nside}', fontsize=14)
+        ax.text(1,8, f'{band.psf_name}\nnside {band.nside}', fontsize=14)
         
     fig, axx = plt.subplots(2,2, figsize=(12,8), sharey=True, sharex=True)
     for i, ax in enumerate(axx.flat):
@@ -1520,7 +1186,7 @@ class ResidualPoints:
 
         self.cldf = pd.DataFrame.from_dict(cld, orient='index')['glon glat data model sigma n ids'.split()]
 
-    def zea_plot(self, center, size=5, **kwargs):
+    def zea_plot(self, center, size=5, axes_visible=False, **kwargs):
         """Plot residual points in a local ZEA projection.
 
         Parameters
@@ -1539,7 +1205,7 @@ class ResidualPoints:
         """
         from utilities.skymaps import ZEAfigure
 
-        zfig = ZEAfigure(center, size=size, fig=None, figsize=(8,8), title='Residual clusters', frame='galactic')
+        zfig = ZEAfigure(center, size=size, fig=None, figsize=(8,8), title='Residual clusters', frame='galactic', axes_visible=axes_visible)
         zfig.scatter(self.skycoord, s=self.df.sigma*10, c=self.df.sigma, cmap='jet', vmin=5, **kwargs)
         zfig.colorbar(label=r'$\sigma$', shrink=0.7)
         return zfig
