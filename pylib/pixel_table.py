@@ -46,6 +46,8 @@ def _event_type_to_label(value):
         return 'BACK'
     return f'PSF{ivalue - 2}'
 
+
+
 _energy_index = lambda energy: (np.log10(energy) * 4 - 8).astype(int)
 
 
@@ -63,26 +65,84 @@ class PixelTable(dict):
         model components (`diffuse` and `sources`).
         """
 
-        def __init__(self, meta, order):
+        def __init__(self, meta, order, source_model=None):
             self.psf_name, self.e0, self.e1, nside, self.nocc = meta
             self.event_type = _event_type_to_int(self.psf_name)
 
             # key is (psf index, energy index) tuple
             psf_index = self.event_type if self.event_type < 2 else self.event_type - 2
             self.key = (int(psf_index), _energy_index(self.e0))
-            self.energy = f'{np.sqrt(self.e0 * self.e1) * 1e-3:.2f} GeV'
+            self.energy = np.sqrt(self.e0 * self.e1)  # MeV, consistent with BandList.Band
+ 
             super().__init__(nside, frame='galactic', order=order)
             self.psf = None  # set later by PixelTable.set_psf()
+            self.source_model = source_model
+            # Dense array caches built once from sparse pixel arrays; see exposure_map.
+            self._exposure_dense: np.ndarray | None = None  # shape (12*nside^2,)
+            self._pix_inv: np.ndarray | None = None          # pixel_index → pos in self.pix
+            # Coverage mask: boolean array over self.pix selecting pixels near sources.
+            # When set, loglike/gradient computations are restricted to these pixels.
+            self._fit_mask: np.ndarray | None = None
+            # Sparse per-pixel arrays; populated by PixelTable._setup_from_arrays.
+            # Mandatory arrays are initialised empty so the type checker knows
+            # they are always ndarray (never None) once set up.
+            self.pix: np.ndarray = np.empty(0, dtype=np.int64)
+            self.photons: np.ndarray = np.empty(0, dtype=np.int32)
+            self.diffuse: np.ndarray = np.empty(0, dtype=np.float32)
+            self.sources: np.ndarray = np.empty(0, dtype=np.float32)
+            # Optional arrays: only present when the FITS file contains the column.
+            self.pixel_exposure: np.ndarray | None = None
+            self.count_exposure: np.ndarray | None = None
+            self.slice: slice | None = None
+            self.totals: dict | None = None
+
+
+       
 
         def __repr__(self) -> str:
-            return f"Band{self.key}: {self.psf_name}@{self.energy} nside {self.nside} occ {self.nocc/(12*self.nside**2):.3f}"
+            return f"Band{self.key}: {self.psf_name}@{self.energy * 1e-3:.2f} GeV nside {self.nside} occ {self.nocc/(12*self.nside**2):.3f}"
+
+        def response(self, source, pixels=None):
+            """Return PSF response for a source evaluated on given pixel indices."""
+            return source.response(self).evaluate(pixels)
+
+        @property
+        def exposure_map(self):
+            """Return a callable mapping pixel indices to their normalized exposure.
+
+            The returned values are the pixel exposure already scaled by
+            ``_exposure_normalization()`` (i.e. weighted exposure × ΔE for the
+            band's reference power law).
+
+            The callable accepts an integer array of pixel indices and returns a
+            float array via numpy fancy indexing into a precomputed dense array —
+            no Python loops.
+            """
+            pe = self.pixel_exposure
+            if pe is not None:
+                if self._exposure_dense is None:
+                    dense = np.zeros(12 * self.nside ** 2, dtype=float)
+                    dense[self.pix] = pe
+                    self._exposure_dense = dense
+                dense = self._exposure_dense
+                return lambda q: dense[np.asarray(q, dtype=np.intp)]
+            return lambda q: np.zeros(len(np.asarray(q)), dtype=float)
 
         def _model_counts(self):
             """Return the full model counts vector for this band."""
-            return (
-                self.diffuse
-                + self.sources
-            )
+            if self.source_model is not None:
+                counts = np.zeros(len(self.pix), dtype=float)
+                exp = self.exposure_map(self.pix)
+                for src in self.source_model:
+                    flux = src.model(self.energy)
+                    _, v = self.response(src, self.pix)
+                    counts += v * flux
+                counts *= exp
+                return self.diffuse + counts
+            return self.diffuse + self.sources
+        def _exposure_normalization(self):
+            """factor to convert input counts per pixel for this power law to the weighted exposure times delta E."""
+            return 1/(1e-14 * (np.sqrt(self.e0 * self.e1) * 1e-3) ** (-2.1))
 
         def _component_values(self, component):
             """Resolve component name to a per-pixel values array."""
@@ -98,12 +158,17 @@ class PixelTable(dict):
             if component == 'model':
                 return model
 
-            components = {
-                'data': self.photons,
-                'diffuse': self.diffuse,
-                'sources': self.sources,
-            }
-            return components[component]
+            if component == 'data':
+                return self.photons
+            if component == 'diffuse':
+                return self.diffuse
+            if component == 'sources':
+                # When a source_model is set, derive source counts dynamically;
+                # otherwise fall back to the pre-computed FITS array.
+                if self.source_model is not None:
+                    return self.pixel_counts()[1] - self.diffuse
+                return self.sources
+            raise ValueError(f"Unknown component: {component!r}")
 
         def _pixels_in_frame(self, frame):
             """Return NESTED pixel indices transformed to the requested frame."""
@@ -239,36 +304,60 @@ class PixelTable(dict):
                 afig.colorbar(label=label, shrink=shrink)
             return afig   
 
-        def zea_plot(self, component, center, *, nside=256, figsize=(8,8), 
-                    pixelsize=0.05, size=5, fig=None, axes_visible=True,
-                     cmap='viridis', colorbar=True, title=None,**kwargs):
-            """Render a local Zero Equal Area projection around a center coordinate.
+        def zea_plot(self, center, component='data', *, nside=256, figsize=(6, 5),
+                    pixelsize=None, size=None, fig=None, axes_visible=True,
+                    cmap='viridis', colorbar=True, title=None, log=True,
+                    vmin=None, vmax=None, cb_label='counts/pixel', **kwargs):
+            """Render a local ZEA projection for a single band around a center coordinate.
+
+            When a PSF is attached (``self.psf`` is not None), the field-of-view
+            and pixel resolution are derived automatically from ``psf.r68``:
+            ``size = 16 * r68``, ``pixelsize = r68 / 50``.  Both can be
+            overridden explicitly.
+
+            After rendering the image the method overlays:
+
+            * Energy and event-type label in the upper-right corner.
+            * Optional *label* string in the upper-left corner.
+            * A circle of radius ``r68`` in the lower-left corner as a PSF
+              size indicator (only when PSF is attached).
 
             Parameters
             ----------
-            component : str
-                Component to visualize (see `ring_map` for valid names).
             center : astropy.coordinates.SkyCoord or tuple
-                Center of projection. If tuple, interpreted as (lon, lat) in degrees
-                using the frame parameter.
+                Plot center. Tuples are interpreted as (lon, lat) in degrees
+                in the galactic frame.
+            component : str or None, optional
+                Component to visualize (see `ring_map` for valid names).
+                Pass ``None`` to create an empty axes. Default is 'data'.
             nside : int, optional
-                Map resolution. Default is 256.
+                HEALPix resolution for the ring map. Default is 256.
             figsize : tuple, optional
-                Figure size. Default is (8, 8).
-            pixelsize : float, optional
-                Pixel size in degrees. Default is 0.05.
-            size : float, optional
-                Field of view side length in degrees. Default is 5.
+                Figure size in inches. Default is ``(6, 5)``.
+            pixelsize : float or None, optional
+                Pixel size in degrees. Derived from ``psf.r68 / 50`` when
+                None and the PSF is attached; otherwise defaults to 0.05.
+            size : float or None, optional
+                Field-of-view side length in degrees. Derived from
+                ``16 * psf.r68`` when None and the PSF is attached;
+                otherwise defaults to 5.
             fig : matplotlib.figure.Figure, optional
-                Existing figure; creates new if None.
+                Existing figure target; creates a new figure if None.
+            axes_visible : bool, optional
+                Show axis tick labels and grid. Default is True.
             cmap : str, optional
-                Matplotlib colormap. Default is 'viridis'.
+                Matplotlib colormap name. Default is ``'viridis'``.
             colorbar : bool, optional
-                Display colorbar. Default is True.
-            title : str, optional
-                Plot title; auto-generated if None.
+                Display a colorbar. Default is True.
+            title : str or None, optional
+                Plot title.  Defaults to an empty string.
+            log : bool, optional
+                Apply logarithmic colour scaling. Default is True.
+            vmin, vmax : float or None, optional
+                Colour scale limits forwarded to ``ZEAfigure.imshow``.
+
             **kwargs
-                Additional arguments to imshow().
+                Additional keyword arguments forwarded to ``ZEAfigure.imshow``.
 
             Returns
             -------
@@ -277,18 +366,45 @@ class PixelTable(dict):
             """
             from utilities.skymaps import ZEAfigure
 
-            zfig = ZEAfigure(center, size=size, fig=fig, figsize=figsize, pixelsize=pixelsize,
-                             axes_visible=axes_visible,
-                             title=f'{component} for {self}' if title is None else title) 
-            
+            psf = self.psf
+            if psf is not None:
+                _size      = size      if size      is not None else 16 * psf.r68
+                _pixelsize = pixelsize if pixelsize is not None else psf.r68 / 50
+            else:
+                _size      = size      if size      is not None else 5
+                _pixelsize = pixelsize if pixelsize is not None else 0.05
+
+            zfig = ZEAfigure(center, size=_size, fig=fig, figsize=figsize,
+                             pixelsize=_pixelsize, axes_visible=axes_visible,
+                             title='' if title is None else title)
+
             if component is not None:
                 mp = self.ring_map(nside, component=component)
-                mp[mp==0] = np.nan
-                zfig.imshow(np.log10(mp), cmap=cmap, **kwargs)
+                mp[mp == 0] = np.nan
+                zfig.imshow(mp, log=log, vmin=vmin, vmax=vmax, cmap=cmap, **kwargs)
+                zfig.axes_text(0.02, 0.98, component,
+                               color='white', ha='left', va='top', fontsize=12)
 
                 if colorbar:
-                    zfig.colorbar(label='log10(counts)', shrink=0.7)
-            return zfig    
+                    zfig.colorbar(
+                        label=cb_label, shrink=0.9, extend='max',
+                    )
+
+            # Energy + event-type annotation (upper right)
+            zfig.axes_text(0.98, 0.98,
+                           f'{self.energy / 1e3:.2f} GeV\n{self.psf_name}',
+                           color='white', ha='right', va='top', fontsize=12)
+
+            # r68 PSF-size circle in lower left
+            if psf is not None:
+                from matplotlib.patches import Circle
+                ax = zfig.ax
+                r68_px = psf.r68 / _pixelsize
+                cx, cy = (ax.transAxes + ax.transData.inverted()).transform((0.12, 0.12))
+                ax.add_patch(Circle((cx, cy), r68_px,
+                                    fill=False, edgecolor='white', linewidth=1.5))
+
+            return zfig
         
         def get_outliers(self, sigma_min=4):
             """Extract pixels with normalized residual exceeding a threshold.
@@ -313,9 +429,189 @@ class PixelTable(dict):
             out = r > sigma_min
             pix = np.arange(12*self.nside**2)
             return pd.DataFrame( dict(pixel=self.ring_to_nested(pix[out]), data=d[out], model=m[out], sigma=r[out] )) 
-         
-       
-    def __init__(self, root, *, emin=100, set_psf=True):
+
+        def build_coverage_mask(self, r68_radius: float = 5.0) -> None:
+            """Build and cache a boolean mask restricting likelihood pixels to the source footprint.
+
+            Sets ``self._fit_mask`` to a boolean array (length = ``len(self.pix)``)
+            where ``True`` marks pixels within ``r68_radius`` × r68 of any source
+            in the attached source model.  Clears the mask (sets it to *None*) if
+            no source model is attached.
+
+            Parameters
+            ----------
+            r68_radius : float, optional
+                Cone radius in units of the band's PSF r68.  Default is 5.
+            """
+            if self.source_model is None:
+                self._fit_mask = None
+                return
+            radius_deg = r68_radius * self.psf.r68 if self.psf is not None else 2.0
+            mask = np.zeros(len(self.pix), dtype=bool)
+            for src in self.source_model:
+                mask |= self.cone_search(src.skydir, radius_deg)
+            self._fit_mask = mask
+
+        def pixel_counts(self, pixels=None):
+            """Return per-pixel model counts (diffuse + source model) for a pixel set.
+
+            Parameters
+            ----------
+            pixels : array-like of int or None
+                Pixel indices to evaluate. If None, uses all loaded pixels
+                (``self.pix``), restricted to the coverage mask when set.
+                Arbitrary index subsets are supported via a sparse lookup into
+                the band's stored diffuse array.
+
+            Returns
+            -------
+            tuple[np.ndarray, np.ndarray]
+                Pixel indices and corresponding model count values.
+            """
+            if pixels is None:
+                m = self._fit_mask
+                pix = self.pix if m is None else self.pix[m]
+                diff = (self.diffuse if m is None else self.diffuse[m]).astype(float)
+            else:
+                pix = np.asarray(pixels, dtype=int)
+                if self.diffuse is not None:
+                    diff_lookup = dict(zip(self.pix.tolist(), self.diffuse.tolist()))
+                    diff = np.array([diff_lookup.get(int(p), 0.0) for p in pix], dtype=float)
+                else:
+                    diff = np.zeros(len(pix), dtype=float)
+
+            if self.source_model is None:
+                if pixels is None:
+                    src = self.sources if m is None else self.sources[m]
+                else:
+                    src_lookup = dict(zip(self.pix.tolist(), self.sources.tolist()))
+                    src = np.array([src_lookup.get(int(p), 0.0) for p in pix], dtype=float)
+                return pix, diff + src
+
+            # Source-model path: response.evaluate(pix) returns k=pix exactly,
+            # so PSF weights can be accumulated directly without scatter.
+            src_counts = np.zeros(len(pix), dtype=float)
+            for src in self.source_model:
+                flux = src.model(self.energy)
+                _, v = self.response(src, pix)
+                src_counts += np.asarray(v, dtype=float) * flux
+            src_counts *= self.exposure_map(pix)
+            return pix, diff + src_counts
+
+        def pixel_gradient(self, data):
+            """Evaluate per-pixel count gradients for free source-model parameters.
+
+            Parameters
+            ----------
+            data : tuple[np.ndarray, np.ndarray]
+                ``(pixels, counts)`` pair; only the pixel array is used.
+
+            Returns
+            -------
+            np.ndarray
+                Gradient matrix of shape ``(n_pixels, n_free_parameters)``.
+            """
+            if self.source_model is None:
+                raise ValueError('pixel_gradient requires a source_model')
+            keys, _ = data
+            g = []
+            for src in self.source_model:
+                grad = src.model.gradient(self.energy)[src.model.free]
+                _, v = src.response(self).evaluate(keys)
+                g.append(v[:, None] * grad[None, :])
+            g_arr = np.hstack(g)
+            g_arr *= self.exposure_map(keys)[:, None]
+            return g_arr
+
+        def pixel_counts_and_gradient(self):
+            """Compute model counts and per-parameter gradient in one PSF pass.
+
+            Equivalent to calling ``pixel_counts()`` and ``pixel_gradient()``
+            separately, but evaluates each source's PSF response only once,
+            halving the PSF cost when the optimizer requests both value and
+            gradient.
+
+            Returns
+            -------
+            model : np.ndarray, shape (n_pixels,)
+                Total model counts (diffuse + source model) for ``self.pix``.
+            grad : np.ndarray, shape (n_pixels, n_free_params)
+                Jacobian of model counts w.r.t. free spectral parameters.
+            """
+            if self.source_model is None:
+                raise ValueError('pixel_counts_and_gradient requires a source_model')
+
+            # Apply coverage restriction when set.
+            m = self._fit_mask
+            pix = self.pix if m is None else self.pix[m]
+            diff = (self.diffuse if m is None else self.diffuse[m]).astype(float)
+
+            # response.evaluate(pix) always returns k=pix; assign PSF weights directly.
+            exp = self.exposure_map(pix)
+
+            src_counts = np.zeros(len(pix), dtype=float)
+            grad_cols: list = []
+
+            for src in self.source_model:
+                flux = src.model(self.energy)
+                grad_factors = src.model.gradient(self.energy)[src.model.free]
+                _, v = self.response(src, pix)
+                contrib_exp = np.asarray(v, dtype=float) * exp
+                src_counts += contrib_exp * flux
+                grad_cols.append(contrib_exp[:, None] * grad_factors[None, :])
+
+            model = diff + src_counts
+            grad = np.hstack(grad_cols) if grad_cols else np.zeros((len(pix), 0), dtype=float)
+            return model, grad
+
+        def simulate(self, random_state=None, total_counts=None):
+            """Simulate pixel counts from the band model.
+
+            Parameters
+            ----------
+            random_state : int, np.random.Generator, or None
+                Seed or RNG for Poisson sampling. If None, returns deterministic
+                integer floor of model counts without noise.
+            total_counts : float or None
+                If provided, normalise the model shape to this total before sampling.
+
+            Returns
+            -------
+            tuple[np.ndarray, np.ndarray]
+                Sparse pixel indices and counts; only non-zero pixels are returned.
+            """
+            _, counts = self.pixel_counts()
+            if total_counts is not None:
+                counts = total_counts * counts / counts.sum()
+            if random_state is not None:
+                rng = np.random.default_rng(random_state)
+                counts = rng.poisson(counts)
+            else:
+                counts = counts.astype(int)
+            select = counts > 0
+            return self.pix[select], counts[select]
+
+        def loglike(self, skydir=None):
+            """Poisson log-likelihood of the band's photon data against the model.
+
+            Parameters
+            ----------
+            skydir : SkyCoord or None, optional
+                Trial sky position forwarded to ``source_model.setposition``.
+
+            Returns
+            -------
+            float
+                ``sum(photons * log(model) - model)`` over all loaded pixels.
+            """
+            if skydir is not None:
+                self.source_model.setposition(skydir)
+            _, model = self.pixel_counts()
+            model = model.clip(1e-30, None)
+            photons = self.photons if self._fit_mask is None else self.photons[self._fit_mask]
+            return float(np.sum(photons * np.log(model) - model))
+
+    def __init__(self, root, *, emin=100, set_psf=True, source_model=None):
         """Load a pixel table from a Kerr-style FITS file.
 
         Parameters
@@ -327,12 +623,25 @@ class PixelTable(dict):
             dropped at load time. Default is 100. Pass ``None`` to load all bands.
         set_psf : bool, optional
             Whether to set the PSF. Default is True. If True, calls `set_psf()` after loading the FITS data.
+        source_model : SourceModel or None, optional
+            Source model to attach to each band. When set, ``Band._model_counts()``
+            evaluates the model dynamically rather than using the pre-computed FITS
+            source arrays. Mirrors the ``source_model`` parameter of ``BandList``.
         """
         root = Path(root).expanduser()
         super().__init__()
+        self.source_model = source_model
+        self._selected: list | None = None
+        self.fit_info: dict = {}
         self._load_from_fits(root, emin_filter=emin)
+        if self.source_model is not None:
+            print(f"Attached source model with {len(self.source_model)} sources to pixel table")
+        else:
+            print("No source model attached to pixel table")
         if set_psf:
             self.set_psf()
+        if self.source_model is not None:
+            self.build_coverage()
 
     def __call__(self, *pars):
         return self[pars]
@@ -350,7 +659,7 @@ class PixelTable(dict):
             if skymap_data is None or bands_data is None:
                 raise ValueError(f'Invalid FITS table payload in {filename}')
 
-            ordering = skymap.header.get('ORDERING', 'NESTED').upper()
+            ordering = str(skymap.header.get('ORDERING', 'NESTED')).upper()
             self.order = 'nested' if ordering == 'NESTED' else 'ring'
 
             nside = np.asarray(bands_data['NSIDE'], dtype=int)
@@ -431,7 +740,7 @@ class PixelTable(dict):
         if pixel_exposure is not None:
             self.pixel_exposure = pixel_exposure
         # FITS SKYMAP stores counts; initialize model arrays for API compatibility.
-        self.diffuse = fits_diffuse.astype(np.float32)
+        self.diffuse = fits_diffuse.astype(np.float32) if fits_diffuse is not None else np.zeros(len(pix), dtype=np.float32)
         self.sources = fits_sources.astype(np.float32)
 
 
@@ -446,13 +755,19 @@ class PixelTable(dict):
         nbands = len(meta)
         offset = 0
         for i, m in enumerate(meta):
-            b = self.Band(m, self.order)
+            b = self.Band(m, self.order, source_model=getattr(self, 'source_model', None))
             self[b.key] = b
             nocc = int(m[-1])
             sl = slice(offset, offset + nocc)
             b.slice = sl
             for attr in ('diffuse', 'sources', 'photons',  'pix', 'pixel_exposure'):
-                setattr(b, attr, getattr(self, attr)[sl])
+                v = getattr(self, attr)[sl]
+                if attr == 'pixel_exposure': # and getattr(b, attr) is not None:
+                    setattr(b, attr, v * b._exposure_normalization())
+                    setattr(b, 'count_exposure', v)
+                else:
+                    setattr(b, attr, v)
+
             offset += nocc
             b.totals = dict(diffuse=self.diffuse[-nbands + i], sources=self.sources[-nbands + i])
 
@@ -513,6 +828,12 @@ class PixelTable(dict):
         if not all_psfs:
             print(f'set_psf: no PSF entries loaded from {table_path!r}')
             return self
+
+        et_names = PSFlist.PSF.et_name
+        ets = sorted({p.event_type for p in all_psfs})
+        et_labels = [et_names[e] if e < len(et_names) else str(e) for e in ets]
+        print(f'set_psf: {len(all_psfs)} PSF entries '
+              f'({", ".join(et_labels)}) from {table_path!r}')
 
         # Build event-type → sorted list-of-PSF lookup.
         psf_by_et: dict[int, list] = {}
@@ -583,6 +904,483 @@ class PixelTable(dict):
             ## NOTE: this is not compatible with a following call to colorbar
             zfig.colorbar(label='log10(counts)', shrink=0.7)
         return zfig
+
+    def build_coverage(self, r68_radius: float = 5.0) -> 'PixelTable':
+        """Build per-band coverage masks restricting log-likelihood to source footprints.
+
+        Calls :meth:`Band.build_coverage_mask` on every band (or the current
+        selection when one is active).  Call again after changing the source
+        model position or after calling :meth:`select` with a new band set.
+
+        Parameters
+        ----------
+        r68_radius : float, optional
+            Cone radius in units of r68.  Default is 5.
+
+        Returns
+        -------
+        self : PixelTable
+            Returns *self* for method chaining.
+        """
+        for band in self.values():
+            band.build_coverage_mask(r68_radius)
+        return self
+
+    def _iter_bands(self):
+        """Iterate over selected bands, or all bands when no selection is active."""
+        if self._selected is None:
+            return self.values()
+        return (self[k] for k in self._selected)
+
+    def select(self, keys=None, *, psf=None, emin=None, emax=None):
+        """Set active band selection for ``loglike``, ``simulate``, and ``fit``.
+
+        Bands can be specified directly by key, or filtered by PSF type and/or
+        energy range.  All active keyword filters are ANDed together.  Call
+        with no arguments to reset to all bands.
+
+        Parameters
+        ----------
+        keys : iterable of band keys or None
+            Explicit band keys (2-tuples ``(psf_index, energy_index)``) to
+            include.  When provided, keyword filters are ignored.
+        psf : str, int, or list of str/int, optional
+            PSF/event type(s) to keep.  Accepts label strings (``'FRONT'``,
+            ``'BACK'``, ``'PSF0'`` … ``'PSF3'``) or integer event-type codes.
+            Ignored when *keys* is given.
+        emin : float or None, optional
+            Lower energy bound in MeV (inclusive on the band's low edge ``e0``).
+            Ignored when *keys* is given.
+        emax : float or None, optional
+            Upper energy bound in MeV (inclusive on the band's high edge ``e1``).
+            Ignored when *keys* is given.
+
+        Returns
+        -------
+        self : PixelTable
+            Returns *self* for method chaining.
+
+        Examples
+        --------
+        Reset to all bands::
+
+            pt.select()
+
+        Select PSF2 and PSF3 bands above 1 GeV::
+
+            pt.select(psf=['PSF2', 'PSF3'], emin=1000)
+
+        Select by explicit keys::
+
+            pt.select(keys=[(2, 4), (2, 5)])
+        """
+        if keys is not None:
+            self._selected = list(keys)
+            return self
+        if psf is None and emin is None and emax is None:
+            self._selected = None
+            return self
+
+        if psf is not None:
+            if isinstance(psf, (str, int, np.integer)):
+                psf = [psf]
+            allowed_et = {_event_type_to_int(p) for p in psf}
+        else:
+            allowed_et = None
+
+        selected = []
+        for k, b in self.items():
+            if allowed_et is not None and b.event_type not in allowed_et:
+                continue
+            if emin is not None and b.e0 < emin:
+                continue
+            if emax is not None and b.e1 > emax:
+                continue
+            selected.append(k)
+        self._selected = selected
+        return self
+
+    @property
+    def parameters(self):
+        """Free-parameter set of the attached source model."""
+        if self.source_model is None:
+            raise AttributeError('parameters requires a source_model')
+        return self.source_model.parameters
+
+    def preserve_parameters(self):
+        """Context manager that restores source-model parameter values on exit.
+
+        Snapshots the current free parameters on entry and writes them back
+        on exit, even if an exception is raised.  Useful for trial fits or
+        scan loops that should not permanently modify the model.
+
+        Example
+        -------
+        >>> with pixtab.preserve_parameters():
+        ...     pixtab.fit()
+        ...     print(pixtab.parameters.get_parameters())
+        # parameters are restored here
+        """
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            pset = self.parameters
+            saved = np.array(pset.get_parameters(), copy=True)
+            try:
+                yield
+            finally:
+                pset.set_parameters(saved)
+
+        return _ctx()
+
+    @property
+    def parameter_names(self):
+        """Names of the free parameters of the attached source model."""
+        if self.source_model is None:
+            raise AttributeError('parameter_names requires a source_model')
+        return self.source_model.parameter_names
+
+    @property
+    def bounds(self):
+        """Fitter-space parameter bounds from the attached source model."""
+        if self.source_model is None:
+            return None
+        return self.source_model.bounds
+
+    def preserve_position(self):
+        """Context manager that restores the selected source's sky position on exit.
+
+        Snapshots ``source_model.selected_source.skydir`` on entry and writes
+        it back on exit, even if an exception is raised.  Useful for trial
+        localization scans that should not permanently move the source.
+
+        Example
+        -------
+        >>> with pixtab.preserve_position():
+        ...     pixtab.source_model.setposition(trial_skydir)
+        ...     print(pixtab.loglike())
+        # source position is restored here
+        """
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            if self.source_model is None:
+                raise ValueError('preserve_position requires a source_model')
+            src = self.source_model.selected_source
+            if src is None:
+                raise ValueError('preserve_position requires a selected source')
+            saved = src.skydir
+            try:
+                yield
+            finally:
+                src.skydir = saved
+
+        return _ctx()
+
+    def localization_view(self, source_name=None):
+        """Return a localization context manager for the selected source.
+
+        Mirrors ``BandList.localization_view``; uses ``self.loglike`` so
+        localization is driven by the full pixel-table likelihood.
+
+        Parameters
+        ----------
+        source_name : str, Source-like, or None
+            Source identifier forwarded to ``SourceModel.localization_view``.
+
+        Returns
+        -------
+        _BandListLocalizationContext
+            Context manager yielding a ``BandListLocalizationView`` on entry.
+        """
+        if self.source_model is None:
+            raise ValueError('localization_view requires a source_model')
+        from like3.bands import _BandListLocalizationContext
+        sm_context = self.source_model.localization_view(source_name)
+        return _BandListLocalizationContext(self, sm_context)
+
+    def localize(self, source_name=None, sigma=0.1, verbose=True):
+        """Run localization for a source and return a ``quadform.Localize`` result.
+
+        Parameters
+        ----------
+        source_name : str, Source-like, or None
+            Source identifier forwarded to ``SourceModel.localization_view``.
+        sigma : float, optional
+            Initial localization uncertainty in degrees.
+        verbose : bool, optional
+            Print localization diagnostics.
+
+        Returns
+        -------
+        like3.quadform.Localize
+            Completed localization result.
+        """
+        from like3.quadform import Localize
+        with self.localization_view(source_name) as loc:
+            return Localize(loc, sigma=sigma, verbose=verbose)
+
+    def loglike(self, skydir=None):
+        """Total Poisson log-likelihood summed over selected bands.
+
+        Parameters
+        ----------
+        skydir : SkyCoord or None, optional
+            Trial sky position forwarded to each ``Band.loglike`` call.
+
+        Returns
+        -------
+        float
+            Sum of per-band log-likelihood values.
+        """
+        if self.source_model is None:
+            raise ValueError('loglike requires a source_model')
+        return float(sum(band.loglike(skydir=skydir) for band in self._iter_bands()))
+
+    def simulate(self, random_state=42):
+        """Simulate per-band photon counts from the source model.
+
+        Replaces ``band.photons`` for each selected band in place with Poisson
+        samples drawn from the current model prediction.
+
+        Parameters
+        ----------
+        random_state : int or np.random.Generator, optional
+            Seed or RNG for reproducible Poisson sampling.
+        """
+        if self.source_model is None:
+            raise ValueError('simulate requires a source_model')
+        rng = np.random.default_rng(random_state)
+        for band in self._iter_bands():
+            _, model = band.pixel_counts()
+            band.photons[:] = rng.poisson(model)
+
+    def fit(self, select=None, *, method='l-bfgs-b', quiet=True, use_gradient=True, **kwargs):
+        """Optimize the free spectral parameters of the source model.
+
+        Minimizes the negative Poisson log-likelihood summed over all bands
+        using :class:`~like3.fitter.Minimizer`.
+
+        Parameters
+        ----------
+        select : str | int | list[str | int] or None, optional
+            Selection passed to :class:`~like3.parameterset.ParSubSet` to
+            identify the subset of parameters to optimize.  Supports the same
+            rich matching rules as ``ParSubSet.select``: source names (with
+            ``*`` wildcards), parameter names prefixed with ``_``, and integer
+            indices.  ``None`` (default) optimizes all free parameters.
+        method : str, optional
+            Optimization method: ``'l-bfgs-b'`` (default), ``'simplex'``,
+            or ``'powell'``.
+        quiet : bool, optional
+            Suppress optimizer diagnostic output.
+        use_gradient : bool, optional
+            If True, pass the analytic gradient to the optimizer.
+        **kwargs
+            Additional keyword arguments forwarded to ``Minimizer.__call__``.
+
+        Returns
+        -------
+        fitvalue : float
+            Negative log-likelihood at the optimum (relative to initial).
+        parameters : np.ndarray
+            Best-fit free-parameter vector.
+        errors : np.ndarray
+            1-sigma parameter uncertainties (NaN if estimation failed).
+
+        Side Effects
+        ------------
+        Updates ``self.source_model`` parameters in place.
+        Stores ``self.fit_info`` with ``'correlation'``, ``'errors'``, and
+        ``'gradient'`` arrays from the fit.
+        """
+        if self.source_model is None:
+            raise ValueError('fit requires a source_model')
+        from like3.fitter import Minimizer, Fitted
+
+        pset = self.source_model.parameters
+        pixel_table = self
+        initial_loglike = self.loglike()
+        use_gradient = kwargs.pop('use_gradient', use_gradient)
+
+        # Build a boolean mask for the subset of parameters to optimise.
+        all_names = np.asarray(pset.parameter_names)
+        n_all = len(all_names)
+        if select is not None:
+            from like3.parameterset import ParSubSet
+            select_args = select if isinstance(select, (list, tuple)) else [select]
+            subset = ParSubSet(self.source_model, *select_args)
+            param_mask = subset._mask
+        else:
+            param_mask = np.ones(n_all, dtype=bool)
+
+        x_init = np.asarray(pset.get_parameters(), dtype=float)[param_mask].copy()
+
+        class _Objective(Fitted):
+            def __init__(self):
+                self._cache_pars = None
+                self._cache_value = None
+                self._cache_grad = None
+
+            @property
+            def bounds(self):
+                b = pixel_table.source_model.bounds
+                return b[param_mask] if b is not None else None
+
+            @property
+            def parameter_names(self):
+                return all_names[param_mask]
+
+            def get_parameters(self):
+                return np.asarray(pset.get_parameters())[param_mask]
+
+            def set_parameters(self, par):
+                full = np.asarray(pset.get_parameters(), dtype=float)
+                full[param_mask] = par
+                pset.set_parameters(full)
+
+            def _evaluate(self, pars, need_grad=False):
+                pars = np.asarray(pars, dtype=float)
+                if (
+                    self._cache_pars is not None
+                    and np.array_equal(pars, self._cache_pars)
+                    and (not need_grad or self._cache_grad is not None)
+                ):
+                    return self._cache_value, self._cache_grad
+
+                self.set_parameters(pars)
+                loglike = 0.0
+                full_grad = np.zeros(n_all, dtype=float) if need_grad else None
+
+                for band in pixel_table._iter_bands():
+                    m = band._fit_mask
+                    counts = band.photons if m is None else band.photons[m]
+                    if need_grad:
+                        # Single PSF pass yields both model and Jacobian.
+                        model, dm_dtheta = band.pixel_counts_and_gradient()
+                    else:
+                        _, model = band.pixel_counts()
+                    model = np.clip(model, 1e-30, None)
+                    loglike += float(np.sum(counts * np.log(model) - model))
+                    if need_grad:
+                        full_grad -= ((counts / model - 1.0)[:, None] * dm_dtheta).sum(axis=0)
+
+                grad = full_grad[param_mask] if need_grad else None
+                value = -float(loglike) + initial_loglike
+                self._cache_pars = np.array(pars, copy=True)
+                self._cache_value = value
+                self._cache_grad = None if grad is None else np.array(grad, copy=True)
+                return value, grad
+
+            def __call__(self, pars, *args):
+                value, _ = self._evaluate(pars, need_grad=use_gradient)
+                return value
+
+            def gradient(self, pars):
+                """Return gradient of the objective at ``pars``."""
+                _, grad = self._evaluate(pars, need_grad=True)
+                return grad
+
+        objective = _Objective()
+        minimizer = Minimizer(objective, quiet=quiet)
+        fit_out = minimizer(method=method, use_gradient=use_gradient, **kwargs)
+        x_fit = np.array(fit_out[1], copy=True)
+        logl_opt = initial_loglike - float(fit_out[0])
+        delta_loglike = round(logl_opt - initial_loglike, 2)
+
+        # Analytical Fisher information matrix (Hessian of neg-loglike),
+        # summed over bands: H_ij = sum_n (1/m_n)(dm_n/dtheta_i)(dm_n/dtheta_j).
+        n_active = int(param_mask.sum())
+        hess = np.zeros((n_active, n_active), dtype=float)
+        for band in self._iter_bands():
+            band_model, dm_dtheta = band.pixel_counts_and_gradient()
+            band_model = np.clip(band_model, 1e-30, None)
+            G = dm_dtheta[:, param_mask].T  # (n_active, n_pix)
+            hess += (G / band_model) @ G.T
+
+        try:
+            cov = np.linalg.inv(hess)
+        except np.linalg.LinAlgError:
+            cov = np.full_like(hess, np.nan)
+        sigs = np.sqrt(np.clip(cov.diagonal(), 0.0, None))
+        outer = np.outer(sigs, sigs)
+        corr = np.where(outer > 0, cov / np.where(outer > 0, outer, 1.0), np.nan).round(2)
+
+        grad = objective.gradient(x_fit)
+
+        # TS-like values: 2 x delta-loglike forcing each Norm parameter to -20.
+        active_names = all_names[param_mask]
+        ts_values = np.full(n_active, np.nan)
+        for k, name in enumerate(active_names):
+            if name.endswith('_Norm'):
+                trial = x_fit.copy()
+                trial[k] = -20.0
+                objective.set_parameters(trial)
+                ts_values[k] = round(2.0 * (logl_opt - self.loglike()), 1)
+                objective.set_parameters(x_fit)
+
+        self.fit_info = dict(
+            hess=hess,
+            cov=cov,
+            sigs=sigs.round(4),
+            corr=corr,
+            grad=grad,
+            x_fit=x_fit,
+            x_init=x_init,
+            delta_loglike=delta_loglike,
+            ts_values=ts_values,
+        )
+        return fit_out
+
+    def fit_source(self, source=None, energy_range=None, **kwargs):
+        """Fit a source over an optional energy range and return the result.
+
+        A convenience wrapper around :meth:`fit` that temporarily restricts
+        band iteration to bands whose energies fall within *energy_range*,
+        then restores the previous selection on exit.
+
+        Parameters
+        ----------
+        source : str, Source-like, or None, optional
+            Source to fit.  When ``None`` the first source in the attached
+            ``source_model`` is used (the model parameters are shared, so
+            fitting any named source optimises it in the context of all
+            others).  Currently passed through for future use; the actual
+            free-parameter set is determined by ``source_model.parameters``.
+        energy_range : tuple[float, float] or None, optional
+            ``(emin, emax)`` in **GeV**.  Bands with ``e0 < emin*1000`` or
+            ``e1 > emax*1000`` (MeV) are excluded during the fit.  Pass
+            ``None`` to use all currently selected bands.
+        **kwargs
+            Forwarded to :meth:`fit`.
+
+        Returns
+        -------
+        tuple
+            ``(fitvalue, parameters, errors)`` as returned by :meth:`fit`.
+        """
+        if self.source_model is None:
+            raise ValueError('fit_source requires a source_model')
+
+        # Save and restore selection so we don't permanently change it.
+        prior_selected = self._selected
+
+        try:
+            if energy_range is not None:
+                emin_mev = energy_range[0] * 1e3
+                emax_mev = energy_range[1] * 1e3
+                # Start from the prior selection if one is active.
+                candidate_keys = list(prior_selected) if prior_selected is not None else list(self.keys())
+                self._selected = [
+                    k for k in candidate_keys
+                    if self[k].e0 >= emin_mev and self[k].e1 <= emax_mev
+                ]
+            return self.fit(**kwargs)
+        finally:
+            self._selected = prior_selected
+
 
 def multi_ait(pixel_table, et, component='diffuse'):
     """Generate a 3x4 panel of band-level AIT plots for one event-type prefix.

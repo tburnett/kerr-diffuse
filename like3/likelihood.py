@@ -6,6 +6,7 @@ covariance, correlation matrix, gradients, and TS-like values for normalization
 parameters.
 """
 
+import contextlib
 import numpy as np
 from scipy import optimize
 
@@ -13,7 +14,7 @@ from scipy import optimize
 class Likelihood:
     """Poisson likelihood wrapper for fitting model counts to observed data."""
     
-    def __init__(self, model, data,):
+    def __init__(self, model, data=None):
         """Initialize a likelihood object.
 
         Parameters:
@@ -25,8 +26,32 @@ class Likelihood:
             Observed counts to fit.
         """
         self.model = model
-        self.data = data
+        self.data = model.data if data is None else data
         self.mp = model.parameters
+
+    @contextlib.contextmanager
+    def saved_state(self):
+        """Context manager that restores SourceModel parameter state on exit.
+
+        Saves the active ``ParameterSet`` (which ``select()`` can replace with a
+        ``ParSubSet``) and the full internal parameter vector, then restores both
+        when the ``with`` block exits — whether normally or via exception.
+
+        Example
+        -------
+        with likelihood.saved_state():
+            likelihood.select('Norm')
+            likelihood.maximize()
+        # model.parameters and all source-model values are back to what they were
+        """
+        saved_parameters = self.model.parameters
+        saved_values = saved_parameters.values.copy()
+        try:
+            yield
+        finally:
+            self.model.parameters = saved_parameters
+            self.mp = saved_parameters
+            saved_parameters.values = saved_values
 
     def select(self, *select):
         """Select a subset of fit parameters and update active parameter view.
@@ -97,8 +122,6 @@ class Likelihood:
         Stores covariance, 1-sigma estimates, correlation matrix, gradient,
         fitted values, and TS-like values for normalization parameters.
         """
-        import numdifftools
-
         def evaluate_ts():
             """Compute TS-like drops by forcing `_Norm` parameters to -20."""
             model = self.model
@@ -126,18 +149,26 @@ class Likelihood:
         val, gradient = self(x_fit)
         self.model.parameters.values = x_fit
   
-        hess = -numdifftools.Hessian(self.log_like)(x_fit) 
+        # Analytic Fisher information matrix: H_ij = sum_n (1/m_n)(dm_n/dtheta_i)(dm_n/dtheta_j).
+        # Positive-definite by construction; avoids numdifftools finite differences which
+        # become unreliable when many parameters are correlated (overlapping sources).
+        G = self.model.count_gradient()  # (n_total_free, n_pix)
+        G_active = G[self.mp.mask]       # (n_active, n_pix)
+        m = self.model.counts()          # (n_pix,)
+        hess = (G_active / m) @ G_active.T  # (n_active, n_active)
         cov = np.linalg.inv(hess)
         sigs = np.sqrt(cov.diagonal())
+
         self.model.parameters.set_covariance(cov)
 
         self.fit_info = dict(
             hess = hess,
             cov = cov,
-            sigs = sigs,
+            sigs = sigs.round(4),
             corr = (cov / np.outer(sigs,sigs)).round(2),
             grad = -gradient,
             x_fit = x_fit,
+            x_init = x0,
             delta_loglike = round(initial_val-val,2), 
 
             funcalls = d['funcalls'],)
@@ -147,7 +178,67 @@ class Likelihood:
     def model_parameters(self):
         """Return model/external parameter values for active fit parameters."""
         return self.model.parameters.model_parameters
-    
+
+    def norm_profile(self, source_name=None):
+        """Return the log-likelihood as a function of the Norm parameter for a named source.
+
+        All other free parameters are held fixed at their current values.
+
+        Parameters
+        ----------
+        source_name : str
+            Source name 
+
+        Returns
+        -------
+        callable
+            ``f(norm_values)`` accepts a scalar or array of internal (log-space)
+            Norm values and returns the corresponding Poisson log-likelihood
+            value(s).  Model state is restored to its original Norm value after
+            each call.
+
+        Raises
+        ------
+        ValueError
+            If no ``<source_name>_Norm`` parameter exists among the free parameters.
+        """
+        all_names = self.model.parameter_names   # all free-param names (unmasked)
+        
+        try:
+            source_name =  self.model.source_model.find_source(source_name).name
+        except Exception as e:
+            raise ValueError(f'No source found matching {source_name!r}') from e
+        norm_name = source_name + '_Norm'
+        matches = np.where(all_names == norm_name)[0]
+        if len(matches) == 0:
+            raise ValueError(
+                f'No Norm parameter found for source {source_name!r}; '
+                f'available names: {list(all_names)}'
+            )
+        norm_global_idx = int(matches[0])
+
+        # Build a one-element ParSubSet selecting only this Norm parameter.
+        norm_subset = self.model.parsubset()
+        m = np.zeros(len(all_names), bool)
+        m[norm_global_idx] = True
+        norm_subset.set_mask(m)
+
+        d = self.data
+
+        def f(norm_values):
+            scalar = np.ndim(norm_values) == 0
+            norm_values = np.atleast_1d(np.asarray(norm_values, dtype=float))
+            saved = float(norm_subset.values[0])
+            result = np.empty(len(norm_values))
+            for i, v in enumerate(norm_values):
+                norm_subset.values = np.array([v])
+                counts = self.model.counts()
+                result[i] = np.sum(d * np.log(counts) - counts)
+            norm_subset.values = np.array([saved])   # restore
+            return float(result[0]) if scalar else result
+
+        return f
+
     def summary(self,  out=None, title=None, gradient=True, ts=True):
         """Print a summary table of fitted parameter values and diagnostics.
 
@@ -233,4 +324,80 @@ class Likelihood:
         lk = cls(model, data)
         lk.maximize(x0)
         print(model)
+
+
+class BandModel:
+    """Adapt a :class:`~pylib.pixel_table.PixelTable.Band` to the Likelihood interface.
+
+    Parameters
+    ----------
+    band : PixelTable.Band
+        A band with ``pix``, ``photons``, ``diffuse``, ``source_model``,
+        ``exposure_map``, and ``pixel_gradient`` populated.
+
+    Notes
+    -----
+    Active pixels are the intersection of the band's data pixels and the pixels
+    illuminated by the source model (returned by ``band.pixel_counts()``).  Only
+    these pixels participate in ``counts()``, ``count_gradient()``, and
+    ``self.data``.
+
+    The PSF response × exposure for each source is cached at construction time
+    so that ``counts()`` and ``count_gradient()`` avoid recomputing the spatial
+    response on every likelihood evaluation (including every Hessian
+    finite-difference step).
+    """
+
+    def __init__(self, band):
+        self.band = band
+        self.source_model = band.source_model
+        self.parameters = self.source_model.parameters
+
+        # Pixels illuminated by the source model
+        illum_pix, _ = band.pixel_counts()
+
+        # Restrict to the intersection with the band's data pixels
+        mask = np.isin(band.pix, illum_pix)
+        self._pix = band.pix[mask]
+        self.data = band.photons[mask].astype(float)
+
+        # Diffuse contribution aligned to the restricted pixel set (fixed)
+        if band.diffuse is not None:
+            self._diffuse = band.diffuse[mask].astype(float)
+        else:
+            self._diffuse = np.zeros(len(self._pix), dtype=float)
+
+        # Cache spatial response × exposure per source (shape: n_active_pix).
+        # These are constant w.r.t. model parameters and expensive to recompute.
+        exp = band.exposure_map(self._pix)
+        self._src_responses = []
+        for src in self.source_model:
+            _, v = band.response(src, self._pix)
+            self._src_responses.append(v * exp)
+
+    @property
+    def parameter_names(self):
+        return self.source_model.parameter_names
+
+    def parsubset(self, *select):
+        return self.source_model.parsubset(*select)
+
+    def counts(self):
+        """Total model counts (diffuse + source) per active pixel."""
+        model = self._diffuse.copy()
+        for src, resp in zip(self.source_model, self._src_responses):
+            model += resp * src.model(self.band.energy)
+        return model
+
+    def count_gradient(self):
+        """Gradient of source counts w.r.t. free params, shape (n_params, n_pixels).
+
+        Diffuse counts are treated as fixed (no gradient contribution).
+        Returns ``(n_params, n_pixels)`` as expected by :class:`Likelihood`.
+        """
+        g = []
+        for src, resp in zip(self.source_model, self._src_responses):
+            grad = src.model.gradient(self.band.energy)[src.model.free]
+            g.append(resp[:, None] * grad[None, :])   # (n_pix, n_free_for_src)
+        return np.hstack(g).T                          # (n_params, n_pixels)
         return lk

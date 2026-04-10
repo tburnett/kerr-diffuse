@@ -110,7 +110,7 @@ class SourceModel(list):
                   f'qual={fit_info.get("qual", float("nan")):.3f}', file=out)
         self.parameters.parameter_summary(out=out)
 
-    def sed_plot(self, source_name=None, ax=None, emin=100, emax=1e5, npts=50):
+    def sed_plot(self, source_name=None, ax=None, title=None, label=None, emin=100, emax=1e5, npts=50):
         """Plot the SED (E² dN/dE vs E) for the selected or named source.
 
         Parameters
@@ -136,13 +136,12 @@ class SourceModel(list):
 
         energies = np.logspace(np.log10(emin), np.log10(emax), npts)  # MeV
         dnde = model(energies)                                          # ph cm⁻² s⁻¹ MeV⁻¹
-        e2dnde = energies**2 * dnde * 1e-3                             # GeV cm⁻² s⁻¹
-        e_gev = energies * 1e-3                                        # GeV
+        e2dnde = energies**2 * dnde                                     # MeV cm⁻² s⁻¹
 
         if ax is None:
             _, ax = plt.subplots(figsize=(6, 4))
 
-        ax.loglog(e_gev, e2dnde, label=source.name.strip())
+        ax.loglog(energies, e2dnde, label=source.name.strip() if label is None else label)
 
         if model.has_errors():
             g = model.external_gradient(energies)   # shape (npar, npts)
@@ -150,13 +149,13 @@ class SourceModel(list):
             # variance at each energy via error propagation: diag(g^T cov g)
             var_dnde = np.sum((cov @ g) * g, axis=0)
             var_dnde = np.clip(var_dnde, 0, None)
-            sigma_e2dnde = energies**2 * np.sqrt(var_dnde) * 1e-3
-            ax.fill_between(e_gev, e2dnde - sigma_e2dnde,
+            sigma_e2dnde = energies**2 * np.sqrt(var_dnde)
+            ax.fill_between(energies, e2dnde - sigma_e2dnde,
                             e2dnde + sigma_e2dnde, alpha=0.3)
 
-        ax.set_xlabel('Energy (GeV)')
-        ax.set_ylabel(r'$E^2\,dN/dE\ [\mathrm{GeV\,cm^{-2}\,s^{-1}}]$')
-        ax.set_title(source.name.strip())
+        ax.set_xlabel('Energy (MeV)')
+        ax.set_ylabel(r'$E^2\,dN/dE\ [\mathrm{MeV\,cm^{-2}\,s^{-1}}]$')
+        ax.set_title(source.name.strip() if title is None else title)
         ax.legend()
         return ax
 
