@@ -746,6 +746,10 @@ class PixelTable(dict):
 
         self._setup_from_arrays(meta, source=filename)
 
+    @property
+    def e_egom_mean(self):
+        """Return the geometric mean energy of each band in MeV."""
+        return np.sqrt(self.meta_df.emin * self.meta_df.emax) * 1e3
 
     def _setup_from_arrays(self, meta, *, source):
         """Build per-band objects from flattened sparse arrays and metadata."""
@@ -786,6 +790,13 @@ class PixelTable(dict):
             self.band_summary = f"{self[keys[0]]} ... {self[keys[-1]]}"
         else:
             self.band_summary = "no bands"
+
+        # Map energy_index -> sorted list of (psf_index, energy_index) keys.
+        bands_by_energy: dict[int, list] = {}
+        for key in keys:
+            e_idx = key[1]
+            bands_by_energy.setdefault(e_idx, []).append(key)
+        self.bands_by_energy = {e: sorted(ks) for e, ks in sorted(bands_by_energy.items())}
 
         print(f"""Loaded pixel table from "{source}":
             {len(self)} bands {self.band_summary}
@@ -952,7 +963,8 @@ class PixelTable(dict):
             Lower energy bound in MeV (inclusive on the band's low edge ``e0``).
             Ignored when *keys* is given.
         emax : float or None, optional
-            Upper energy bound in MeV (inclusive on the band's high edge ``e1``).
+            Upper energy bound in MeV (exclusive on the band's low edge ``e0``).
+            Bands with ``e0 >= emax`` are excluded.
             Ignored when *keys* is given.
 
         Returns
@@ -975,6 +987,9 @@ class PixelTable(dict):
             pt.select(keys=[(2, 4), (2, 5)])
         """
         if keys is not None:
+            # Accept a single band key (2-tuple) or an iterable of keys.
+            if isinstance(keys, tuple):
+                keys = [keys]
             self._selected = list(keys)
             return self
         if psf is None and emin is None and emax is None:
@@ -994,9 +1009,11 @@ class PixelTable(dict):
                 continue
             if emin is not None and b.e0 < emin:
                 continue
-            if emax is not None and b.e1 > emax:
+            if emax is not None and b.e0 >= emax:
                 continue
             selected.append(k)
+        if not selected:
+            print('select: no bands match the given filters')
         self._selected = selected
         return self
 

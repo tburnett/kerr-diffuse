@@ -52,7 +52,7 @@ class LogMapper(ParameterMapper):
                     ...
                 MapperException: Parameter value=-1 must be greater than 0
         """
-        if external<0: 
+        if external<=0: 
             raise MapperException("Parameter value=%s must be greater than 0" % external)
         return np.log10(external)
 

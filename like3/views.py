@@ -1,32 +1,33 @@
+"""Likelihood engine view classes and fitting helpers.
+
+This module defines view and mixin classes used to fit and inspect ROI likelihood
+models. The core classes expose:
+
+- optimization wrappers around ``scipy.optimize.fmin_l_bfgs_b``
+- convenience summaries and diagnostic plotting
+- context-manager state restoration via ``WithMixin``
+
+Historical source:
+    $Header: /nfs/slac/g/glast/ground/cvs/pointlike/python/uw/like2/views.py,v 1.22 2017/11/17 22:50:36 burnett Exp $
+    Author: T.Burnett <tburnett@uw.edu> (based on pioneering work by M. Kerr)
 """
-classes presenting views of the likelihood engine in the module bandlike
 
-Each has a mixin to allow the with ... as ... construction, which should restore the BandLikeList
-
-
-$Header: /nfs/slac/g/glast/ground/cvs/pointlike/python/uw/like2/views.py,v 1.22 2017/11/17 22:50:36 burnett Exp $
-Author: T.Burnett <tburnett@uw.edu> (based on pioneering work by M. Kerr)
-"""
-
-import sys, types
+import sys, types, importlib
+from typing import Any
 import numpy as np
 from scipy import misc, optimize
 from . skydir import SkyDir
-# from . import (roimodel, bandlike, tools,)
+# from . import roimodel, bandlike
 from . import parameterset
-"""
-Got it ✅
-Here’s a ready-made SciPy helper that lets you do bounded root finding for any dimension by wrapping scipy.optimize.root with a variable transformation so the solver never leaves your bounds.
+_pkg = __package__ if __package__ else 'like3'
+tools = importlib.import_module(f'{_pkg}.tools')
 
-Bounded Root Finder Wrapper
-Pythonimport numpy as np
-
-from scipy.optimize import root
-"""
 
 def bounded_root(func, x0, bounds, method='hybr', tol=1e-8, maxiter=1000):
-    """
-    Find a root of a function with bounds using variable transformation.
+    """Find a bounded root using an unbounded-variable transform.
+
+    The solver runs in transformed coordinates and maps each iterate back into
+    ``[lb, ub]`` using a logistic transform, so iterates always remain in bounds.
 
     Parameters
     ----------
@@ -72,78 +73,47 @@ def bounded_root(func, x0, bounds, method='hybr', tol=1e-8, maxiter=1000):
     u0 = to_unbounded(x0)
 
     # Solve in unbounded space
-    res = root(wrapped, u0, method=method, tol=tol, options={'maxfev': maxiter})
+    res = optimize.root(wrapped, u0, method=method, tol=tol, options={'maxfev': maxiter})
 
     # Map back to bounded space
     res.x = to_bounded(res.x)
     return res
-"""
-# ---------------- Example Usage ----------------
-if __name__ == "__main__":
-    # Example: Solve cos(x) - x = 0 with bounds [0, 2]
-    def f1(x):
-        return np.cos(x[0]) - x[0]
-
-    result = bounded_root(f1, x0=[1.0], bounds=([0], [2]))
-    if result.success:
-        print("Bounded root:", result.x)
-    else:
-        print("No solution:", result.message)
-
-    # Example: 2D system with bounds
-    def f2(vars):
-        x, y = vars
-        return [
-            x**2 + y - 4,
-            x - y**2 + 1
-        ]
-
-    result2 = bounded_root(f2, x0=[1, 1], bounds=([0, 0], [3, 3]))
-    if result2.success:
-        print("Bounded root (2D):", result2.x)
-    else:
-        print("No solution:", result2.message)
-"""
-
-# How It Works
-
-# Sigmoid mapping keeps variables inside [lb, ub] automatically.
-# root works in unbounded space (u variables).
-# After solving, we map back to the bounded space.
-# Works for 1D and multi-D problems.
-
-
-# Advantages
-# ✅ Works with any scipy.optimize.root method (hybr, lm, broyden1, etc.)
-# ✅ No need for sign-change requirement like brentq
-# ✅ Handles multi-dimensional problems with bounds
-# ✅ Keeps solver stable by avoiding hard clipping during iterations
-
-# If you want, I can extend this so it also supports equality and inequality constraints like minimize does, while still solving for roots.
-# That would make it a full bounded + constrained root solver.
-# Do you want me to build that extended version?
 
 
 
 
 def fit_plot( tupfun, x0, 
              *,ax=None,  nolabels=False , y2lim=(-5,5), **kwargs):
-    """make a plot showing the log likelihood and its derivative as a function of
-    expected sigma, evaluated from the second derivative at the current point
-   
+    """Plot likelihood and derivative around the local optimum.
+
+    The x-axis is shown in units of the estimated local sigma, derived from the
+    second derivative at the fitted root of the gradient.
+
     Parameters
     ----------
-    tupfun : function
-        function that takes a single float argument and returns a tuple of
+    tupfun : callable
+        Function taking a single float argument and returning a tuple of
         (-log likelihood, -derivative)
     x0 : float
-        initial position to evaluate log likelihood and derivative
+        Initial position used by the root finder.
     ax : matplotlib.axes.Axes, optional
-        axis to plot on, by default None
+        Axis to plot on. If None, a new figure and axis are created.
     nolabels : bool, optional
-        if True, do not add axis labels, by default False
+        If True, do not add axis labels.
     y2lim : tuple, optional
-        y-axis limits for derivative plot, by default (-5,5)
+        Y-axis limits for derivative panel.
+    **kwargs
+        Additional keyword arguments forwarded to ``ax.set(...)``.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Figure containing the diagnostic plot.
+
+    Raises
+    ------
+    RuntimeError
+        If the root finder does not converge.
     """
     import matplotlib.pyplot as plt
     from scipy import optimize
@@ -189,21 +159,46 @@ def fit_plot( tupfun, x0,
 
 
 class FitterSummaryMixin(object):
-    """mixin to summarize variables"""
+    """Mixin that formats tabular summaries for fitter parameters."""
+
+    # Interface expected from concrete fitter views.
+    def gradient(self):
+        raise NotImplementedError
+
+    def hessian(self):
+        raise NotImplementedError
+
+    @property
+    def mask(self):
+        raise NotImplementedError
+
+    @property
+    def parameter_names(self):
+        raise NotImplementedError
+
+    @property
+    def model_parameters(self):
+        raise NotImplementedError
+
+    @property
+    def uncertainties(self):
+        raise NotImplementedError
     
-    def summary(self, select=None, exclude=None, out=None, title=None, gradient=True):
-        """ summary table of free parameters, values uncertainties gradient
-        
-        Parameters:
+    def summary(self: Any, select=None, exclude=None, out=None, title=None, gradient=True):
+        """Print summary table for current free parameters.
+
+        Parameters
         ----------
-        select : list of integers or string
-            integers are indices of parameters
-            string is the wildcarded name of a source
-        out : open file or None
-        title: None or string
-        gradient: bool
-            set False to not print gradient
-            
+        select : list[int] or str or None
+            Reserved selector argument (currently not applied in body).
+        exclude : list[int] or str or None
+            Reserved exclusion argument (currently not applied in body).
+        out : file-like or None
+            Output stream passed to ``print``.
+        title : str or None
+            Optional heading line.
+        gradient : bool
+            If True, include gradient values.
         """
         if title is not None:
             print(title, file=out)
@@ -232,8 +227,19 @@ class FitterSummaryMixin(object):
                 fmt +='%10.1f'; tup += (grad[index],)
             print(fmt % tup, file=out)
     
-    def delta_loglike(self, quiet=True):
-        """ estimate change in log likelihood from current gradient 
+    def delta_loglike(self: Any, quiet=True):
+        """Estimate expected log-likelihood improvement from local quadratic form.
+
+        Parameters
+        ----------
+        quiet : bool
+            Reserved compatibility argument.
+
+        Returns
+        -------
+        float
+            Approximate expected improvement in log-likelihood. Returns 99.0 if
+            the estimate fails.
         """
         try:
             # Old code assuming now-deprecated numpy.matrix
@@ -249,13 +255,43 @@ class FitterSummaryMixin(object):
 
 
 class FitPlotMixin(object):
-    """mixin  for likelihood function to generate a plot, or set of all plots"""
+    """Mixin with likelihood-profile plotting helpers."""
+
+    # Interface expected from concrete fitter views.
+    def get_parameters(self):
+        raise NotImplementedError
+
+    def set_parameters(self, pars):
+        raise NotImplementedError
+
+    def gradient(self, pars=None):
+        raise NotImplementedError
+
+    def hessian(self, pars=None):
+        raise NotImplementedError
+
+    def __call__(self, pars=None):
+        raise NotImplementedError
+
+    parameters: Any  # concrete subclass must provide this attribute
+
+    @property
+    def parameter_names(self):
+        raise NotImplementedError
+
+    @property
+    def mask(self):
+        raise NotImplementedError
     
-    def estimate_solution(self):
-        """ return a tuple with:
-            current parameters, 
-            estimated parmeters at maximum
-            sigmas
+    def estimate_solution(self: Any):
+        """Estimate local optimum and parameter sigmas from Hessian.
+
+        Returns
+        -------
+        tuple
+            ``(parz, parmax, sigs)`` where ``parz`` are current parameters,
+            ``parmax`` is a one-step quadratic estimate of the optimum, and
+            ``sigs`` are 1-sigma estimates from the covariance diagonal.
         """
         parz = self.get_parameters()
         hess = self.hessian(parz)
@@ -264,12 +300,26 @@ class FitPlotMixin(object):
         parmax = parz-self.gradient(parz)*sigs**2/2.
         return parz, parmax, sigs
 
-    def plot(self, index, ax=None, nolabels=False , y2lim=(-5,5), estimate=None):
-        """make a plot showing the log likelihood and its derivative as a function of
-        expected sigma, evaluated from the second derivative at the current point
-        
+    def plot(self: Any, index, ax=None, nolabels=False , y2lim=(-5,5), estimate=None):
+        """Plot 1D likelihood profile for a selected parameter.
+
+        Parameters
+        ----------
         index : int
-            index of the parameter
+            Index of parameter to profile.
+        ax : matplotlib.axes.Axes or None
+            Target axis; if None, create a new one.
+        nolabels : bool
+            If True, suppress axis labels.
+        y2lim : tuple
+            Limits for derivative axis.
+        estimate : tuple or None
+            Optional precomputed ``(parz, parmax, sigs)`` tuple.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            Figure containing the profile plot.
         """
         import matplotlib.pyplot as plt
         # get current parameters, gradient, and the Hessian for estimate of max liklihood position
@@ -317,8 +367,16 @@ class FitPlotMixin(object):
         self.set_parameters(parz) # restore when done
         return fig
     
-    def plot_all(self, perrow=5, figsize=None): 
-        """
+    def plot_all(self: Any, perrow=5, figsize=None): 
+        """Plot profile diagnostics for all free parameters.
+
+        Parameters
+        ----------
+        perrow : int
+            Number of panels per row.
+        figsize : tuple or None
+            Figure size passed to ``matplotlib``; defaults to a size derived
+            from the number of rows.
         """
         import matplotlib.pyplot as plt
         n = len(self.parameters)
@@ -340,13 +398,44 @@ class FitPlotMixin(object):
 
 
 class FitterMixin(object):
+    """Mixin providing likelihood maximization and derivative diagnostics."""
 
-    def maximize(self,  **kwargs):
-        """Maximize likelihood and estimate errors.
-        Uses scipy.optimize.fmin_l_bfgs_b
-        
-        keyword args
-        ------------
+    # Interface expected from concrete fitter views.
+    @property
+    def bounds(self):
+        raise NotImplementedError
+
+    @property
+    def parameter_names(self):
+        raise NotImplementedError
+
+    def get_parameters(self):
+        raise NotImplementedError
+
+    def set_parameters(self, pars):
+        raise NotImplementedError
+
+    def gradient(self, pars=None):
+        raise NotImplementedError
+
+    def log_like(self, summed=True):
+        raise NotImplementedError
+
+    def __call__(self, pars=None):
+        raise NotImplementedError
+
+    def maximize(self: Any,  **kwargs):
+        """Maximize likelihood and optionally estimate parameter uncertainties.
+
+        Uses ``scipy.optimize.fmin_l_bfgs_b``.
+
+        Parameters
+        ----------
+        **kwargs
+            Keyword arguments for the optimizer and behavior switches.
+
+        Other Parameters
+        ----------------
         m : int
             The maximum number of variable metric corrections
             used to define the limited memory matrix. (The limited memory BFGS
@@ -378,6 +467,26 @@ class FitterMixin(object):
             Maximum number of function evaluations.
         maxiter : int
             Maximum number of iterations.
+        quiet : bool
+            If False, print minimizer diagnostics.
+        use_gradient : bool
+            Kept for compatibility; gradients are used when available.
+        estimate_errors : bool
+            If True, invert Hessian at optimum to estimate 1-sigma errors.
+        approx_grad : bool
+            If True, use finite-difference gradients in L-BFGS-B.
+
+        Returns
+        -------
+        tuple
+            ``(fmin, pars, sigmas)`` where ``fmin`` is minimized objective,
+            ``pars`` are best-fit parameters, and ``sigmas`` are estimated
+            standard deviations or ``np.nan`` if ``estimate_errors=False``.
+
+        Raises
+        ------
+        Exception
+            If minimization fails according to the optimizer warn flag.
 
         """
         from scipy import optimize
@@ -391,21 +500,29 @@ class FitterMixin(object):
         winit = self.log_like()
         # assert len(parz)==len(self.gradient()), 'tracking a bug'
 
-        # list of default from the function statement, mods shown
-        fit_args=dict(m=10, 
-            factr=1e9,  #1e8
-            pgtol=1e-3, #1e-05
-            epsilon=1e-08, 
-            iprint=-1, maxfun=15000, maxiter=15000)
-        fit_args.update(kwargs)
-        approx_grad = fit_args.pop('approx_grad', False)
+        # Defaults from scipy.optimize.fmin_l_bfgs_b, with project-specific tuning.
+        m = int(kwargs.pop('m', 10))
+        factr = float(kwargs.pop('factr', 1e9))
+        pgtol = float(kwargs.pop('pgtol', 1e-3))
+        epsilon = float(kwargs.pop('epsilon', 1e-08))
+        iprint = int(kwargs.pop('iprint', -1))
+        maxfun = int(kwargs.pop('maxfun', 15000))
+        maxiter = int(kwargs.pop('maxiter', 15000))
+        approx_grad = bool(kwargs.pop('approx_grad', False))
 
         # run the fit
         ret = optimize.fmin_l_bfgs_b(self, parz, 
                 bounds=self.bounds,  
                 fprime=None if approx_grad else self.gradient, 
                 approx_grad=approx_grad, 
-                **fit_args)
+            m=m,
+            factr=factr,
+            pgtol=pgtol,
+            epsilon=epsilon,
+            iprint=iprint,
+            maxfun=maxfun,
+            maxiter=maxiter,
+            **kwargs)
         self.fmin_ret=ret
         if ret[2]['warnflag']>0: 
             print('Fit failure: check parameters')
@@ -428,13 +545,20 @@ class FitterMixin(object):
             self.covariance = None
             return f[1], f[0], np.nan
 
-    def hessian(self, pars=None, **kwargs):
-        """    
-        Return the Hessian matrix  
-        For sigmas and correlation coefficients, invert to covariance
-                cov =  self.hessian().I
-                sigs = np.sqrt(cov.diagonal())
-                corr = cov / np.outer(sigs,sigs)
+    def hessian(self: Any, pars=None, **kwargs):
+        """Compute numerical Hessian matrix using ``numdifftools``.
+
+        Parameters
+        ----------
+        pars : array-like or None
+            Parameter vector. If None, uses current parameters.
+        **kwargs
+            Forwarded to ``numdifftools.Hessian``.
+
+        Returns
+        -------
+        numpy.matrix
+            Hessian matrix at ``pars``.
         """
         import numdifftools
         if pars is None: pars = self.get_parameters()
@@ -442,19 +566,36 @@ class FitterMixin(object):
 
         
         
-    def modify(self, fraction):
-        """change iniital set to fraction of current change; restore will make it permanent
+    def modify(self: Any, fraction):
+        """Move saved initial parameters toward current parameters.
+
+        Parameters
+        ----------
+        fraction : float
+            Fraction of ``(current - initial)`` to apply to ``initial``.
         """
         if fraction==0 : return
         delta = self.get_parameters()-self.initial_parameters
         self.initial_parameters += fraction * delta
         
-    def restore(self):
+    def restore(self: Any):
+        """Restore parameters to the saved initial state."""
         print(f'set parameters to {self.initial_parameters}')
         self.set_parameters(self.initial_parameters)
 
-    def check_gradient(self, delta=1e-5):
-        """compare the analytic gradient with a numerical derivative"""
+    def check_gradient(self: Any, delta=1e-5):
+        """Compare analytic gradient with central-difference estimate.
+
+        Parameters
+        ----------
+        delta : float
+            Step size used for central finite differences.
+
+        Returns
+        -------
+        tuple
+            ``(analytic, numeric)`` gradient arrays.
+        """
         
         parz = self.get_parameters()
         fz = self(parz)
@@ -473,23 +614,40 @@ class FitterMixin(object):
         return grad, np.array(fprime) 
 
 class WithMixin(object):
-    """Mixin to allow simple restore of an object's state
-        supports the 'with' construction, guarantees that restore is called to restore the state of the model
-        example:
-        -------
-        with ClassName(...) as something:
-            # use something ...
+    """Mixin enabling context-manager state restoration.
+
+    Classes using this mixin must define ``restore()``. On context exit,
+    ``restore()`` is always invoked.
+
+    Examples
+    --------
+    with ClassName(...) as obj:
+        ...
     """
-    def __enter__(self):
+    def __enter__(self: Any):
         return self
+
+    def restore(self):
+        raise NotImplementedError
         
-    def __exit__(self, type, value, traceback):
+    def __exit__(self: Any, type, value, traceback):
         self.restore()
 
 
 class FitterView(FitPlotMixin, FitterMixin, FitterSummaryMixin, WithMixin): 
+    """Full-parameter fitter view over all currently free source parameters."""
 
     def __init__(self, blike,  **kwargs):
+        """Initialize fitter for all free parameters in *blike*.
+
+        Parameters
+        ----------
+        blike : LikelihoodViews
+            Band-likelihood container providing ``parameterset``,
+            ``log_like``, ``gradient``, ``hessian``, and ``update``.
+        **kwargs
+            Reserved; currently unused.
+        """
         self.blike = blike
         self.parameters = blike.parameterset
         # self.parameters = blike.sources.parameters
@@ -499,20 +657,30 @@ class FitterView(FitPlotMixin, FitterMixin, FitterSummaryMixin, WithMixin):
         self.calls=0
         
     def get_parameters(self):
+        """Return current free-parameter vector."""
         return self.parameters.get_parameters()
     def set_parameters(self, pars):
+        """Set free parameters and refresh bandlike state."""
         self.parameters.set_parameters(pars)
         self.blike.update()
         
     def save_covariance(self):
-        """ store source submatrices of the fit covariance matrix into the models.
-        this loses the correlations between sources
+        """Store per-source covariance submatrices into source model objects.
+
+        Notes
+        -----
+        Cross-source covariance terms are not preserved by this projection.
         """
         assert hasattr(self, 'covariance'), 'maximize was not run: no covariance to save'
         self.parameters.set_covariance(self.covariance)
     
     def modify(self, fraction):
-        """change iniital set to fraction of current change; restore will make it permanent
+        """Update saved initial parameters toward current values.
+
+        Parameters
+        ----------
+        fraction : float
+            Interpolation factor between saved and current parameters.
         """
         if fraction==0 : return
         delta = self.get_parameters()-self.initial_parameters
@@ -525,44 +693,71 @@ class FitterView(FitPlotMixin, FitterMixin, FitterSummaryMixin, WithMixin):
         print(f'parameters to save {self.initial_parameters}')
         
     def restore(self):
+        """Restore parameters and print post-restore gradient."""
         print(f'set parameters to {self.initial_parameters}')
         self.set_parameters(self.initial_parameters)
         print(f'gradient after restore: {self.gradient()}')
 
     @property 
     def bounds(self):
+        """Parameter bounds for L-BFGS-B, concatenated from all free source models."""
         return np.concatenate([s.model.bounds[s.model.free] for s in self.sources]) 
     def __call__(self, pars=None):
+        """Return negative log-likelihood, optionally setting free parameters first."""
         if pars is not None: self.set_parameters(pars)
         self.calls+=1
         return -self.blike.log_like()
     def log_like(self, summed=True):
-        """assume that parameters are set, possibility of individual likelihoods"""
+        """Return log-likelihood for current state.
+
+        Parameters
+        ----------
+        summed : bool
+            If True, return scalar total; otherwise return per-component values.
+        """
         return self.blike.log_like(summed=summed)
 
     def gradient(self,pars=None):
+        """Return gradient of log-likelihood with respect to free parameters."""
         if pars is not None: self.set_parameters(pars)
         return self.blike.gradient()
     def hessian(self, pars=None):
+        """Return Hessian matrix, computing at pars if provided."""
         if pars is not None: self.set_parameters(pars)
         return self.blike.hessian()
     @property
     def parameter_names(self):
+        """Names of all currently free parameters, in order."""
         return self.parameters.parameter_names
     @property
     def model_parameters(self):
+        """Current values of all free model parameters."""
         return self.parameters.model_parameters
     @property
     def uncertainties(self):
+        """Relative uncertainties for all free parameters."""
         return self.parameters.uncertainties
     @property
     def mask(self):
+        """Boolean mask marking free parameters in the full parameter vector."""
         return self.parameters.mask
              
 
 class SubsetFitterView(parameterset.ParSubSet, FitPlotMixin, FitterMixin, FitterSummaryMixin, WithMixin):
+    """Fitter view restricted to a selected subset of free parameters."""
 
     def __init__(self, blike, select=None, exclude=None):
+        """Initialize a subset fitter for a selection of free parameters.
+
+        Parameters
+        ----------
+        blike : LikelihoodViews
+            Band-likelihood container.
+        select : str, list, or None
+            Parameter names or indices to include; see :class:`parameterset.ParSubSet`.
+        exclude : str, list, or None
+            Parameter names or indices to exclude.
+        """
         self.blike = blike
         super().__init__(blike.sources, select, exclude)
         self.initial_parameters = self.parameters[:]
@@ -570,32 +765,47 @@ class SubsetFitterView(parameterset.ParSubSet, FitPlotMixin, FitterMixin, Fitter
         self.calls=0
 
     def __repr__(self):
+        """Short string including the module, class, and selection description."""
         return '%s.%s: %s '% (self.__module__, self.__class__.__name__, self.selection_description)
     def restore(self):
+        """Restore subset parameters to their saved initial values."""
         self.set_parameters(self.initial_parameters)
 
     def save_covariance(self):
-        """ store source submatrices of the fit covariance matrix into the models.
-        this loses the correlations between sources
+        """Store subset covariance matrix back into model parameter container.
+
+        Notes
+        -----
+        Cross-source covariance terms are not preserved by this projection.
         """
         assert hasattr(self, 'covariance'), 'maximize was not run: no covariance to save'
         self.set_covariance(self.covariance)
 
     @property
     def parameters(self):
+        """Current subset parameter values (re-read on each access)."""
         return self.get_parameters()
     def set_parameters(self, pars):
+        """Set subset parameters and refresh band-likelihood state."""
         super().set_parameters(pars)
         self.blike.update()
     def __call__(self, pars=None):
+        """Return negative log-likelihood, optionally setting subset parameters first."""
         if pars is not None: self.set_parameters(pars)
         self.calls +=1
         return -self.blike.log_like()
         
     def log_like(self, *,summed=True):
-        """assume that parameters are set, possibility of individual likelihoods"""
+        """Return log-likelihood for current state.
+
+        Parameters
+        ----------
+        summed : bool
+            If True, return scalar total; otherwise return per-component values.
+        """
         return self.blike.log_like(summed=summed)
     def gradient(self, pars=None):
+        """Return subset gradient by masking the full band-likelihood gradient."""
         if pars is not None: self.set_parameters(pars)
         return self.blike.gradient()[self.mask]
     #### This seems wrong! #####
@@ -604,175 +814,337 @@ class SubsetFitterView(parameterset.ParSubSet, FitPlotMixin, FitterMixin, Fitter
     #     return self.blike.hessian(self.mask) 
         
     def ts(self):
-        """ simple test statistic """
+        """Compute simple TS by forcing first subset parameter to a low value."""
         lnow = self()
         pars = self.parameters
         pars[0] = -20 ##### override to be really small self.bounds[0][0]
         return 2 * (self(pars)-lnow)
         
 
-# class TSmapView(tools.WithMixin):
+class TSmapView(WithMixin):
+    """Context-managed view for source-position scanning (TS maps).
 
-#     def __init__(self, blike, func, quiet=True):
-#         self.quiet = quiet
-#         self.func = func
-#         self.blike = blike
-#         self.source = self.func.source
-#         self.saved_skydir = self.get_dir()
-#         self.wzero = func.log_like()
+    Moves a source's ``skydir`` attribute and evaluates the likelihood
+    difference ``2*(L - L0)`` relative to the saved reference likelihood.
+
+    Parameters
+    ----------
+    blike : LikelihoodViews
+        Band-likelihood container.
+    func : FitterView
+        Fitter view with the source normalization parameter selected.
+    quiet : bool
+        If True, suppress diagnostic output.
+    """
+
+    def __init__(self, blike, func, quiet=True):
+        self.quiet = quiet
+        self.func = func
+        self.blike = blike
+        self.source = self.func.source
+        self.saved_skydir = self.get_dir()
+        self.wzero = func.log_like()
     
-#     def __repr__(self):
-#         return '%s.%s: source %s' % (self.__module__, self.__class__.__name__, self.source.name)
+    def __repr__(self):
+        """Short representation showing the source name."""
+        return '%s.%s: source %s' % (self.__module__, self.__class__.__name__, self.source.name)
         
-#     def set_dir(self, skydir):
-#         self.source.skydir = skydir
-#         self.blike.initialize(None, self.source.name ) #sourcenane=self.source.name)
+    def set_dir(self, skydir):
+        """Move the source to skydir and reinitialize band-likelihood."""
+        self.source.skydir = skydir
+        self.blike.initialize(None, self.source.name ) #sourcenane=self.source.name)
     
-#     def get_dir(self):
-#         return self.source.skydir
-#     skydir = property(get_dir, set_dir)
+    def get_dir(self):
+        """Return the current source sky direction."""
+        return self.source.skydir
+    skydir = property(get_dir, set_dir)
     
-#     def restore(self):
-#         self.set_dir(self.saved_skydir)
+    def restore(self):
+        """Restore source to its saved initial position."""
+        self.set_dir(self.saved_skydir)
 
-#     def __call__(self, skydir=None):
-#         if skydir is not None:
-#             if not isinstance(skydir, SkyDir):
-#                 skydir = SkyDir(*skydir)
-#             self.set_dir(skydir)
-#         return 2*(self.func.log_like()-self.wzero)
+    def __call__(self, skydir=None):
+        """Return TS = 2*(L(skydir) - L0) at the given position.
+
+        Parameters
+        ----------
+        skydir : SkyDir, (ra, dec) tuple, or None
+            Position to evaluate. If None, evaluates at the current position.
+
+        Returns
+        -------
+        float
+            Test statistic value.
+        """
+        if skydir is not None:
+            if not isinstance(skydir, SkyDir):
+                skydir = SkyDir(*skydir)
+            self.set_dir(skydir)
+        return 2*(self.func.log_like()-self.wzero)
 
 
-# class EnergyFluxView(tools.WithMixin):
+class EnergyFluxView(WithMixin):
+    """Context-managed view expressing likelihood as a function of differential energy flux.
 
-#     def __init__(self, blike, func, energy, **kw):
+    The underlying normalization parameter is mapped to energy flux in eV
+    units at the specified energy.  ``__call__`` is decorated as a ufunc so
+    it can be evaluated over arrays.
+
+    Parameters
+    ----------
+    blike : LikelihoodViews
+        Band-likelihood container.
+    func : FitterView
+        Fitter view with the source normalization parameter selected.
+    energy : float or None
+        Evaluation energy in MeV. If None, uses the model reference energy.
+    **kw
+        ``bound`` (float): lower bound for the internal log-norm parameter.
+    """
+
+    def __init__(self, blike, func, energy, **kw):
         
-#         self.func = func
-#         self.blike=blike
-#         self.source = source = self.func.source
-#         self.model=model = source.spectral_model
-#         #assert model[0]==model['norm']
-#         self.norm = model[0]
-#         self.tointernal = model.mappers[0].tointernal
-#         self.bound = kw.get('bound', -20)# !!! model.bounds[0][0])
-#         self.set_energy(energy)
+        self.func = func
+        self.blike=blike
+        self.source = source = self.func.source
+        self.model=model = source.spectral_model
+        #assert model[0]==model['norm']
+        self.norm = model[0]
+        self.tointernal = model.mappers[0].tointernal
+        self.bound = kw.get('bound', -20)# !!! model.bounds[0][0])
+        self.set_energy(energy)
 
-#     def set_energy(self, energy=None):
-#         if energy is None:
-#             energy=self.model.e0
-#         self.model[0]=self.norm # get original norm 
-#         self.source.changed=True
-#         self.blike.update()
-#         self.energy = energy
-#         self.eflux = self.model(energy) * energy**2 * 1e6
-#         self.ratio = self.model[0]/self.eflux
+    def set_energy(self, energy=None):
+        """Reset evaluation energy (or restore to reference energy if None).
+
+        Parameters
+        ----------
+        energy : float or None
+            New energy in MeV; defaults to the model reference energy.
+        """
+        if energy is None:
+            energy=self.model.e0
+        self.model[0]=self.norm # get original norm 
+        self.source.changed=True
+        self.blike.update()
+        self.energy = energy
+        self.eflux = self.model(energy) * energy**2 * 1e6
+        self.ratio = self.model[0]/self.eflux
     
-#     def __repr__(self):
-#         return '%s.%s: func=%s, at %.0f MeV' % (self.__module__, self.__class__.__name__,self.func,self.energy)
-#     def restore(self):
-#         self.set_energy()
+    def __repr__(self):
+        """Short representation showing func name and evaluation energy."""
+        return '%s.%s: func=%s, at %.0f MeV' % (self.__module__, self.__class__.__name__,self.func,self.energy)
+    def restore(self):
+        """Restore normalization to the model reference energy."""
+        self.set_energy()
 
-#     @tools.ufunc_decorator # make this behave like a ufunc
-#     def __call__(self, eflux):
-#         if eflux<=0:
-#             par = self.bound
-#         else:
-#             par = max(self.bound, self.tointernal(eflux*self.ratio))
-#         return -self.func([par])
+    @tools.ufunc_decorator # make this behave like a ufunc
+    def __call__(self, eflux):
+        """Return negative log-likelihood as a function of differential energy flux.
+
+        Parameters
+        ----------
+        eflux : float
+            Differential energy flux at ``self.energy`` in eV units.
+
+        Returns
+        -------
+        float
+            Negative log-likelihood value.
+        """
+        if eflux<=0:
+            par = self.bound
+        else:
+            par = max(self.bound, self.tointernal(eflux*self.ratio))
+        return -self.func([par])
         
-# class NormalizationView(tools.WithMixin):
-#     """Manage a view defining a function of the normalization factor for a source
-    
-#     """
-#     def __init__(self, blike, source_name):
-#         self.blike = blike
-#         source = blike.sources.find_source(source_name)
-#         self.model = model= source.model
-#         self.par = model[0]
-#         parname = model.param_names[0]
-#         if not model.free[0]:
-#             self.freed = (parname, source_name)
-#             blike.thaw(parname, source_name)
-#         else: self.freed=None
-#         self.func = blike.fitter_view(source_name + '_' + parname)
+class NormalizationView(WithMixin):
+    """Context-managed view expressing likelihood as a function of source normalization.
 
-#         self.tointernal = model.mappers[0].tointernal
-#         self.bound = model.bounds[0][0]
+    If the normalization parameter is frozen, it is temporarily thawed and
+    restored on context exit.  ``__call__`` is decorated as a ufunc.
+
+    Parameters
+    ----------
+    blike : LikelihoodViews
+        Band-likelihood container.
+    source_name : str
+        Name of the source whose normalization parameter is varied.
+    """
+    def __init__(self, blike, source_name):
+        """Initialize, thawing normalization if needed before constructing the view."""
+        self.blike = blike
+        source = blike.sources.find_source(source_name)
+        self.model = model= source.model
+        self.par = model[0]
+        parname = model.param_names[0]
+        if not model.free[0]:
+            self.freed = (parname, source_name)
+            blike.thaw(parname, source_name)
+        else: self.freed=None
+        self.func = blike.fitter_view(source_name + '_' + parname)
+
+        self.tointernal = model.mappers[0].tointernal
+        self.bound = model.bounds[0][0]
     
-#     @tools.ufunc_decorator
-#     def __call__(self, norm):
-#         if norm <=0:
-#             par = self.bound
-#         else:
-#             par = max(self.bound, self.tointernal(norm*self.par))
-#         return -self.func([par])
+    @tools.ufunc_decorator
+    def __call__(self, norm):
+        """Return negative log-likelihood as a function of normalization factor.
+
+        Parameters
+        ----------
+        norm : float
+            Normalization factor to evaluate.
+
+        Returns
+        -------
+        float
+            Negative log-likelihood value.
+        """
+        if norm <=0:
+            par = self.bound
+        else:
+            par = max(self.bound, self.tointernal(norm*self.par))
+        return -self.func([par])
     
-#     def restore(self):
-#         """If had to thaw, restore"""
-#         self.func.restore()
-#         if self.freed is not None and self.model.free[0]:
-#             self.blike.freeze(*self.freed)
+    def restore(self):
+        """If had to thaw, restore"""
+        self.func.restore()
+        if self.freed is not None and self.model.free[0]:
+            self.blike.freeze(*self.freed)
         
 
-# class LikelihoodViews(bandlike.BandLikeList):
+class LikelihoodViews(object):
+    """Container of per-band likelihoods with factory methods for analysis views.
 
-#     """Subclass of BandLikeList with  methods to return views for specific analyses.
+    Provides convenience constructors for:
+
+    * ``fitter_view`` — :class:`FitterView` or :class:`SubsetFitterView`
+    * ``energy_flux_view`` — :class:`EnergyFluxView`
+    * ``tsmap_view`` — :class:`TSmapView`
+    * ``normalization_view`` — :class:`NormalizationView`
+    """
+
+    sources: Any  # provided by base class or initializer
     
-#     * fits: fitter_view, return a FitterView or SubsetFitterView
-#     * SED : energy_flux_view, a fitterView with a source selected
-#     * TSmap : tsmap_view : a FitterView with the source flux selected which can have the position changed.
-#     """
-    
-#     def fitter_view(self, select=None, setpars=None, **kwargs):
-#         """ return a object to use with a fitter.
-#             Two versions, one with full set of parameters, other if a subset is specified
-#         """
-#         if setpars is not None: 
-#             self.sources.parameters.setitems(setpars)
+    def fitter_view(self, select=None, setpars=None, **kwargs):
+        """Return a fitter view over all or a subset of free parameters.
 
-#         if select is None:
-#             return FitterView(self, **kwargs)
-#         return SubsetFitterView(self, select, **kwargs)
+        Parameters
+        ----------
+        select : str, list, or None
+            If None, returns a :class:`FitterView` over all free parameters.
+            Otherwise, constructs a :class:`SubsetFitterView` for the selection.
+        setpars : dict or None
+            If provided, set these parameter values before constructing the view.
+        **kwargs
+            Forwarded to the view constructor.
 
-#     def energy_flux_view(self, source_name, energy=None, **kw):
-#         """ a functor for a source, which returns log likelihood as a 
-#                 function of the differential energy flux, in eV units, at the given energy
-                
-#         parameters
-#         ----------
-#         source_name : string
-#         energy : [None | float]
-#             if None, use the reference energy e0
-#         """
-#         try:
-#             source = self.sources.find_source(source_name)
-#             model = source.model
-#             func = self.fitter_view(source_name + '_' + model.param_names[0])
-#         except Exception as msg:
-#             raise Exception('could not create energy flux function for source %s;%s' %(source_name, msg))
-#         return EnergyFluxView(self, func, energy, **kw)
+        Returns
+        -------
+        FitterView or SubsetFitterView
+        """
+        if setpars is not None: 
+            self.sources.parameters.setitems(setpars)
+
+        if select is None:
+            return FitterView(self, **kwargs)
+        return SubsetFitterView(self, select, **kwargs)
+
+    def energy_flux_view(self, source_name, energy=None, **kw):
+        """Return a functor expressing log-likelihood as a function of energy flux.
+
+        Parameters
+        ----------
+        source_name : str
+            Source whose normalization is profiled.
+        energy : float or None
+            Energy in MeV. If None, uses the model reference energy e0.
+        **kw
+            Forwarded to :class:`EnergyFluxView`.
+
+        Returns
+        -------
+        EnergyFluxView
+
+        Raises
+        ------
+        Exception
+            If the source cannot be found or the view cannot be constructed.
+        """
+        try:
+            source = self.sources.find_source(source_name)
+            model = source.model
+            func = self.fitter_view(source_name + '_' + model.param_names[0])
+        except Exception as msg:
+            raise Exception('could not create energy flux function for source %s;%s' %(source_name, msg))
+        return EnergyFluxView(self, func, energy, **kw)
         
-#     def tsmap_view(self, source_name, **kw):
-#         """Return TSmap function for the source
-#         """
-#         if source_name is None and self.sources.selected_source is not None:
-#             source_name = self.sources.selected_source.name 
-#         if source_name is None: 
-#             raise Exception('No source is selected for a tsmap')
-#         try:
-#             func = self.fitter_view(source_name+'_Norm')
-#         except Exception as msg:
-#             raise Exception('could not create tsmap function for source %s;%s' %(source_name, msg))
-#         return TSmapView(self, func, **kw)
-        
-#     def normalization_view(self, source_name):
-#         return NormalizationView(self, source_name)
+    def tsmap_view(self, source_name, **kw):
+        """Return a TS-map view for position scanning of the named source.
 
-# def make_views(roi_index, rings=2):
-#     """convenience function to return a LikelihoodViews object for testing
-#     """
-#     from . import (configuration, bands, from_healpix)
-#     config = configuration.Configuration(quiet=True)
-#     roi_bands = bands.BandSet(config, roi_index, load=True)
-#     roi_sources = from_healpix.ROImodelFromHealpix(config, roi_index, load_kw=dict(rings=rings))
-#     return LikelihoodViews(roi_bands, roi_sources)
+        Parameters
+        ----------
+        source_name : str or None
+            Source name. If None, uses the currently selected source.
+        **kw
+            Forwarded to :class:`TSmapView`.
+
+        Returns
+        -------
+        TSmapView
+
+        Raises
+        ------
+        Exception
+            If no source is identified or the view cannot be constructed.
+        """
+        if source_name is None and self.sources.selected_source is not None:
+            source_name = self.sources.selected_source.name 
+        if source_name is None: 
+            raise Exception('No source is selected for a tsmap')
+        try:
+            func = self.fitter_view(source_name+'_Norm')
+        except Exception as msg:
+            raise Exception('could not create tsmap function for source %s;%s' %(source_name, msg))
+        return TSmapView(self, func, **kw)
+        
+    def normalization_view(self, source_name):
+        """Return a normalization view for the named source.
+
+        Parameters
+        ----------
+        source_name : str
+            Source name.
+
+        Returns
+        -------
+        NormalizationView
+        """
+        return NormalizationView(self, source_name)
+
+def make_views(roi_index, rings=2):
+    """Convenience factory to build a :class:`LikelihoodViews` for testing.
+
+    .. note::
+        Requires legacy modules ``configuration``, ``bands.BandSet``, and
+        ``from_healpix.ROImodelFromHealpix`` that are not part of like3.
+        Calling this function will raise ``ImportError`` unless those modules
+        are available on ``sys.path``.
+
+    Parameters
+    ----------
+    roi_index : int
+        HEALPix ROI index.
+    rings : int
+        Number of neighbour rings to include around the central pixel.
+
+    Returns
+    -------
+    LikelihoodViews
+    """
+    from . import (configuration, bands, from_healpix)  # type: ignore[attr-defined]
+    config = configuration.Configuration(quiet=True)
+    roi_bands = bands.BandSet(config, roi_index, load=True)  # type: ignore[attr-defined]
+    roi_sources = from_healpix.ROImodelFromHealpix(config, roi_index, load_kw=dict(rings=rings))  # type: ignore[attr-defined]
+    return LikelihoodViews(roi_bands, roi_sources)  # type: ignore[call-arg]

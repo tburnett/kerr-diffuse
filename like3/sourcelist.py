@@ -129,35 +129,9 @@ class SourceModel(list):
         -------
         matplotlib.axes.Axes
         """
-        import matplotlib.pyplot as plt
-
-        source = self.find_source(source_name)
-        model = source.model
-
-        energies = np.logspace(np.log10(emin), np.log10(emax), npts)  # MeV
-        dnde = model(energies)                                          # ph cm⁻² s⁻¹ MeV⁻¹
-        e2dnde = energies**2 * dnde                                     # MeV cm⁻² s⁻¹
-
-        if ax is None:
-            _, ax = plt.subplots(figsize=(6, 4))
-
-        ax.loglog(energies, e2dnde, label=source.name.strip() if label is None else label)
-
-        if model.has_errors():
-            g = model.external_gradient(energies)   # shape (npar, npts)
-            cov = model.get_cov_matrix()             # shape (npar, npar)
-            # variance at each energy via error propagation: diag(g^T cov g)
-            var_dnde = np.sum((cov @ g) * g, axis=0)
-            var_dnde = np.clip(var_dnde, 0, None)
-            sigma_e2dnde = energies**2 * np.sqrt(var_dnde)
-            ax.fill_between(energies, e2dnde - sigma_e2dnde,
-                            e2dnde + sigma_e2dnde, alpha=0.3)
-
-        ax.set_xlabel('Energy (MeV)')
-        ax.set_ylabel(r'$E^2\,dN/dE\ [\mathrm{MeV\,cm^{-2}\,s^{-1}}]$')
-        ax.set_title(source.name.strip() if title is None else title)
-        ax.legend()
-        return ax
+        return self.find_source(source_name).sed_plot(
+            ax=ax, title=title, label=label, emin=emin, emax=emax, npts=npts
+        )
 
 
     @property

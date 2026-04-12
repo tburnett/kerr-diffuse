@@ -181,12 +181,64 @@ class Source(object):
         return '%s.%s: \n%s' % (self.__module__,self.__class__.__name__ , self.__str__())
         
     @property
+    def e_ref(self):
+        """Convenience property to access model reference energy, if it exists."""
+        return self.model.e0 if hasattr(self.model, 'e0') else None
+
+    @property
     def isextended(self):
         return hasattr(self, 'dmodel') and not self.isglobal
 
     @property
     def isglobal(self):
         return self.skydir is None
+
+    def sed_plot(self, ax=None, title=None, label=None, emin=100, emax=1e5, npts=50):
+        """Plot the SED (E² dN/dE vs E) for this source.
+
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes or None
+            Axes to draw into. A new figure is created when ``None``.
+        title : str or None
+            Axes title. Defaults to the source name.
+        label : str or None
+            Legend label. Defaults to the source name.
+        emin, emax : float
+            Energy range in MeV.
+        npts : int
+            Number of logarithmically-spaced evaluation points.
+
+        Returns
+        -------
+        matplotlib.axes.Axes
+        """
+        import matplotlib.pyplot as plt
+
+        model = self.model
+        energies = np.logspace(np.log10(emin), np.log10(emax), npts)  # MeV
+        dnde = model(energies)                                          # ph cm⁻² s⁻¹ MeV⁻¹
+        e2dnde = energies**2 * dnde                                     # MeV cm⁻² s⁻¹
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=(6, 4))
+
+        ax.loglog(energies, e2dnde, label=self.name.strip() if label is None else label)
+
+        if model.has_errors():
+            g = model.external_gradient(energies)   # shape (npar, npts)
+            cov = model.get_cov_matrix()             # shape (npar, npar)
+            var_dnde = np.sum((cov @ g) * g, axis=0)
+            var_dnde = np.clip(var_dnde, 0, None)
+            sigma_e2dnde = energies**2 * np.sqrt(var_dnde)
+            ax.fill_between(energies, e2dnde - sigma_e2dnde,
+                            e2dnde + sigma_e2dnde, alpha=0.3)
+
+        ax.set_xlabel('Energy (MeV)')
+        ax.set_ylabel(r'$E^2\,dN/dE\ [\mathrm{MeV\,cm^{-2}\,s^{-1}}]$')
+        ax.set_title(self.name.strip() if title is None else title)
+        ax.legend()
+        return ax
 
 
 class PointSource(Source):

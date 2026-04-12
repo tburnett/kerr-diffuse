@@ -2,11 +2,13 @@
 FermiFit: fitting interface for a PixelTable + SourceModel pair.
 """
 from contextlib import contextmanager
+import importlib
 
 import numpy as np
+from . import views
 
 
-class FermiFit:
+class FermiFit(views.LikelihoodViews):
     """Fitting engine that wraps a PixelTable and its attached SourceModel.
 
     Parameters
@@ -49,6 +51,26 @@ class FermiFit:
     def bounds(self):
         """Fitter-space parameter bounds."""
         return self.source_model.bounds
+
+    def get_sed(self, source_name=None, event_type=None, update=False, tol=0.2):
+        """ return the SED recarray for the source, including npred info
+        source_name : string
+            Name of a source in the ROI, with possible wildcards
+        event_type : None, or integer, 0/1 for front/back, 2-5 for psf0-3
+        update : bool
+            set True to force recalculation of sed recarray
+        """
+        
+        source = self.source_model.find_source(source_name)
+        if not hasattr(source, 'sedrec') or source.sedrec is None\
+                 or (update and np.any(source.model.free)):
+            pkg = __package__ if __package__ else 'like3'
+            sedfuns = importlib.import_module(f'{pkg}.sedfuns')
+            with sedfuns.SED(self, source.name) as sf:
+                source.sedrec = sf.sed_rec(event_type=event_type, tol=tol)
+        
+        return source.sedrec
+
 
     # ------------------------------------------------------------------
     # Freeze / thaw
@@ -94,16 +116,34 @@ class FermiFit:
     # Context managers
     # ------------------------------------------------------------------
 
-    def preserve_parameters(self):
-        """Context manager that restores free-parameter values on exit."""
+    def preserve_parameters(self, restore=True):
+        """Context manager that restores free-parameter values on exit.
+
+        Parameters
+        ----------
+        restore : bool, optional
+            Initial value of the restore flag.  When ``True`` (default) the
+            saved parameter values are restored on exit.  Can be changed at
+            any point inside the ``with`` block via the yielded flag object::
+
+                with ff.preserve_parameters() as ctx:
+                    ff.fit()
+                    ctx.restore = False   # keep fitted values on exit
+        """
+        class _Ctx:
+            def __init__(self, restore):
+                self.restore = restore
+
         @contextmanager
         def _ctx():
             pset = self.parameters
             saved = np.array(pset.get_parameters(), copy=True)
+            ctx = _Ctx(restore)
             try:
-                yield
+                yield ctx
             finally:
-                pset.set_parameters(saved)
+                if ctx.restore:
+                    pset.set_parameters(saved)
         return _ctx()
 
     def preserve_position(self):
@@ -260,7 +300,7 @@ class FermiFit:
                     if need_grad:
                         full_grad -= ((counts / model - 1.0)[:, None] * dm_dtheta).sum(axis=0)
 
-                grad = full_grad[param_mask] if need_grad else None
+                grad = full_grad[param_mask] if (need_grad and full_grad is not None) else None
                 value = -float(loglike) + initial_loglike
                 self._cache_pars = np.array(pars, copy=True)
                 self._cache_value = value
@@ -454,12 +494,135 @@ class FermiFit:
         finally:
             pt._selected = prior_selected
 
-    def localization_view(self, source_name=None):
-        """Return a localization context manager for the selected source.
+    def norm_profile(self, source_name=None, tol=0.5):
+        """Return a Norm profile fitted in log-space.
+
+        All other free parameters are held fixed at their current values.
+        The fit is performed against ``x = log(norm / norm_floor)`` (with an
+        additional linear rescaling for numerical stability), then exposed via a
+        callable object in physical Norm units.
 
         Parameters
         ----------
-        source_name : str, Source-like, or None
+        source_name : str, Source, or None
+            Source selector forwarded to ``SourceModel.find_source``.  Defaults
+            to the currently selected source.
+        tol : float, optional
+            Fit-quality tolerance forwarded to ``PoissonFitter``.
+
+        Returns
+        -------
+        object
+            Profile object with ``__call__``, ``flux``, ``errors``, ``limit``,
+            and ``ts`` attributes in physical Norm units.
+
+        Raises
+        ------
+        ValueError
+            If no ``Norm`` parameter exists in the source's spectral model.
+        """
+        pkg = __package__ if __package__ else 'like3'
+        PoissonFitter = importlib.import_module(f'{pkg}.loglikelihood').PoissonFitter
+
+        source = self.source_model.find_source(source_name)
+        model = source.model
+        best_norm = float(model.getp('Norm'))
+        norm_floor = 1e-30
+        safe_best = max(best_norm, norm_floor)
+
+        def _set_norm(norm):
+            model.setp('Norm', max(float(norm), norm_floor))
+            source.changed = True
+
+        def _loglike_x(x):
+            # x is log(norm / norm_floor), constrained to x >= 0 by PoissonFitter.
+            x = max(float(x), 0.0)
+            norm = norm_floor * np.exp(np.clip(x, 0.0, 700.0))
+            _set_norm(norm)
+            return self.loglike()
+
+        # Use local curvature around the current best value to set a linear
+        # scale so the PoissonFitter variable has O(1) width.
+        x0 = float(np.log(safe_best / norm_floor))
+        h = 1e-3
+        try:
+            f0 = _loglike_x(x0)
+            fp = _loglike_x(x0 + h)
+            fm = _loglike_x(max(x0 - h, 0.0))
+            curvature = max(2.0 * f0 - fp - fm, 0.0) / (h * h)
+            sigma_x = 1.0 / np.sqrt(curvature) if curvature > 0 else 1.0
+            sigma_x = float(np.clip(sigma_x, 1e-4, 1e4))
+            y0 = x0 / sigma_x
+
+            def _loglike_y(y):
+                return _loglike_x(y * sigma_x)
+
+            try:
+                pf = PoissonFitter(_loglike_y, scale=max(y0, 1.0), tol=tol)
+            except Exception:
+                # Some low-information or strongly non-Poisson-like profiles can
+                # exceed the strict maxdev test; retry with a looser tolerance.
+                pf = PoissonFitter(_loglike_y, scale=max(y0, 1.0), tol=max(1.0, 2.0 * tol))
+            poiss_y = pf.poiss
+        finally:
+            _set_norm(best_norm)
+
+        class _LogNormProfile:
+            def __init__(self, poiss, sigma, floor):
+                self._poiss = poiss
+                self._sigma = float(sigma)
+                self._floor = float(floor)
+
+            def __str__(self):
+                flux = self.flux
+                lo, hi = self.errors
+                limit = self.limit
+                if flux > 0:
+                    return (
+                        f'LogNormProfile(flux={flux:.4g}, '
+                        f'errors=({lo:.4g}, {hi:.4g}), '
+                        f'ts={self.ts:.2f})'
+                    )
+                return f'LogNormProfile(flux=0, limit95={limit:.4g}, ts={self.ts:.2f})'
+
+            __repr__ = __str__
+
+            def _norm_to_y(self, norm):
+                n = np.clip(np.asarray(norm, dtype=float), self._floor, np.inf)
+                x = np.log(n / self._floor)
+                return x / self._sigma
+
+            def __call__(self, norm):
+                y = self._norm_to_y(norm)
+                if np.ndim(y) == 0:
+                    return float(self._poiss(float(y)))
+                return np.asarray(self._poiss(y), dtype=float)
+
+            @property
+            def flux(self):
+                y_peak = max(self._poiss.flux, 0.0)
+                return float(self._floor * np.exp(np.clip(y_peak * self._sigma, 0.0, 700.0)))
+
+            @property
+            def errors(self):
+                y_lo, y_hi = self._poiss.errors
+                lo = self._floor * np.exp(np.clip(y_lo * self._sigma, 0.0, 700.0))
+                hi = self._floor * np.exp(np.clip(y_hi * self._sigma, 0.0, 700.0))
+                return (float(lo), float(hi))
+
+            @property
+            def limit(self):
+                y_lim = self._poiss.limit if hasattr(self._poiss, 'limit') else self._poiss.percentile(0.95)
+                return float(self._floor * np.exp(np.clip(y_lim * self._sigma, 0.0, 700.0)))
+
+            @property
+            def ts(self):
+                return float(self._poiss.ts)
+
+        return _LogNormProfile(poiss_y, sigma_x, norm_floor)
+
+    def localization_view(self, source_name=None):
+        """Return a localization context manager for the selected source.
 
         Returns
         -------
