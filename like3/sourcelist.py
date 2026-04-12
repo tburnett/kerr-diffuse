@@ -350,10 +350,10 @@ class SourceModel(list):
             A newly constructed toy model.
         """
         ps = sources.PointSource(name='Pulsar',  skydir=(0,0), frame='galactic',
-                        model=sources.PLSuperExpCutoff4(1e-11, 2., 0.7, 0.69,e0=427))  
+            model=sources.PLSuperExpCutoff4(1e-11, 2., 0.7, 0.69))  
         
         pl = sources.PointSource(name='Blazar',skydir=(5,0), frame='galactic',
-                        model=sources.LogParabola(4e-12, 2, 0, 1e3,e0=332))
+                model=sources.LogParabola(4e-12, 2, 0, 332))
         
         pp = []
         if src_key==0:

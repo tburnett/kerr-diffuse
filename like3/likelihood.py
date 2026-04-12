@@ -327,7 +327,7 @@ class Likelihood:
 
 
 class BandModel:
-    """Adapt a :class:`~pylib.pixel_table.PixelTable.Band` to the Likelihood interface.
+    """Adapt a :class:`~like3.pixel_table.PixelTable.Band` to the Likelihood interface.
 
     Parameters
     ----------

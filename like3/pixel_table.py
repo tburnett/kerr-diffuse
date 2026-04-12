@@ -51,6 +51,41 @@ def _event_type_to_label(value):
 _energy_index = lambda energy: (np.log10(energy) * 4 - 8).astype(int)
 
 
+class PixelTableLocalizationView:
+    """Localization view centered on the selected source for a pixel table."""
+
+    def __init__(self, pixel_table, source_model_view):
+        self.pixel_table = pixel_table
+        self.bandlist = pixel_table  # legacy alias used by existing tests/callers
+        self.source_model_view = source_model_view
+        self.source = source_model_view.source
+
+    @property
+    def skydir(self):
+        return self.source.skydir
+
+    def __getattr__(self, name):
+        return getattr(self.source_model_view, name)
+
+    def delta_ts(self, position=None, baseline=None):
+        return self.source_model_view.delta_ts(self.pixel_table.loglike, position=position, baseline=baseline)
+
+
+class _PixelTableLocalizationContext:
+    """Context-manager wrapper for pixel-table localization views."""
+
+    def __init__(self, pixel_table, source_model_context):
+        self.pixel_table = pixel_table
+        self.source_model_context = source_model_context
+
+    def __enter__(self):
+        source_model_view = self.source_model_context.__enter__()
+        return PixelTableLocalizationView(self.pixel_table, source_model_view)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self.source_model_context.__exit__(exc_type, exc_val, exc_tb)
+
+
 class PixelTable(dict):
     """Container for pixel table bands and their sparse per-pixel arrays.
 
@@ -1120,7 +1155,6 @@ class PixelTable(dict):
         """
         if self.source_model is None:
             raise ValueError('localization_view requires a source_model')
-        from like3.pixel_table import _PixelTableLocalizationContext
         sm_context = self.source_model.localization_view(source_name)
         return _PixelTableLocalizationContext(self, sm_context)
 

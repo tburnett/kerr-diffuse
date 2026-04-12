@@ -13,7 +13,7 @@ class FermiFit(views.LikelihoodViews):
 
     Parameters
     ----------
-    pixel_table : pylib.pixel_table.PixelTable
+    pixel_table : like3.pixel_table.PixelTable
         A loaded pixel table with a ``source_model`` attribute set.
     """
 
@@ -626,11 +626,13 @@ class FermiFit(views.LikelihoodViews):
 
         Returns
         -------
-        _BandListLocalizationContext
+        _PixelTableLocalizationContext
         """
-        from like3.bands import _BandListLocalizationContext
+        pkg = __package__ if __package__ else 'like3'
+        pixel_table_mod = importlib.import_module(f'{pkg}.pixel_table')
+        context_cls = pixel_table_mod._PixelTableLocalizationContext
         sm_context = self.source_model.localization_view(source_name)
-        return _BandListLocalizationContext(self.pixel_table, sm_context)
+        return context_cls(self.pixel_table, sm_context)
 
     def localize(self, source_name=None, sigma=0.1, verbose=True):
         """Run localization for a source.

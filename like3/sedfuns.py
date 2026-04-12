@@ -29,7 +29,7 @@ plotting = importlib.import_module(f'{_pkg}.plotting')
 tools = importlib.import_module(f'{_pkg}.tools')
 loglikelihood = importlib.import_module(f'{_pkg}.loglikelihood')
 sources = importlib.import_module(f'{_pkg}.sources')
-bands = importlib.import_module(f'{_pkg}.bands')
+bands = importlib.import_module(f'{_pkg}.pixel_table')
 # 2/decade above 31.6 GeV
 energybins=np.concatenate( [np.logspace(2,4.25,10), np.logspace(4.5,6,4)])
        
