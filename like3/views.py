@@ -1026,6 +1026,42 @@ class LikelihoodViews(object):
     """
 
     sources: Any  # provided by base class or initializer
+
+    def __init__(self, bands_or_pixel_table, sources=None):
+        """Initialize likelihood views from either PixelTable or legacy parts.
+
+        Parameters
+        ----------
+        bands_or_pixel_table : object
+            Preferred: ``like3.pixel_table.PixelTable`` instance.
+            Legacy: band container object.
+        sources : object or None
+            Legacy source-model object when using the 2-argument constructor.
+
+        Notes
+        -----
+        New code should pass a PixelTable directly. Legacy callers that still
+        pass ``(bands, sources)`` remain supported.
+        """
+        # New preferred path: PixelTable-like object.
+        if sources is None and hasattr(bands_or_pixel_table, '_iter_bands') \
+                and hasattr(bands_or_pixel_table, 'source_model'):
+            self.pixel_table = bands_or_pixel_table
+            self.bands = bands_or_pixel_table
+            self.sources = bands_or_pixel_table.source_model
+            self.parameterset = self.sources.parameters if self.sources is not None else None
+            return
+
+        # Legacy path: explicit bands + sources.
+        if sources is not None:
+            self.bands = bands_or_pixel_table
+            self.sources = sources
+            self.parameterset = getattr(self.sources, 'parameters', None)
+            return
+
+        raise TypeError(
+            'LikelihoodViews expects a PixelTable instance or (bands, sources)'
+        )
     
     def fitter_view(self, select=None, setpars=None, **kwargs):
         """Return a fitter view over all or a subset of free parameters.

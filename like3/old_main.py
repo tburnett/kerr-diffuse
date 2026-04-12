@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pylab as plt
 from uw.utilities import keyword_options
-from skymaps import SkyDir, Band
-from . import (sourcelist, views,  configuration, extended,  from_xml, from_healpix,
+from skydir import SkyDir
+from . import (sourcelist, views,  configuration, extended,  from_healpix,
                 bands,  localization, sedfuns, tools,
                 plotting, associate, printing, to_healpix
         )
@@ -88,48 +88,14 @@ class ROI(views.LikelihoodViews):
     )
 
     @keyword_options.decorate(defaults)
-    def __init__(self, config_dir, roi_spec=None, xml_file=None, **kwargs):
-        """Start pointlike v2 (like2) in the specified ROI
+    def __init__(self, pixel_table, ):
+        """Start pointlike v3 (like3) with a given pixel table. The pixel table must have a source_model attribute, which will be used to construct the source list for this ROI.
         
-        parameters
-        ----------
-        config_dir : string
-            file path to a folder containing a file config.txt
-            see configuration.Configuration
-        roi_spec : [None |integer | (ra,dec) tuple ]
-            If None, require that the input_model dict has a key 'xml_file'
-            if an integer, it must be <1728, the ROI number
-            if a string, assume a source name and load the ROI containing it
-            
-        """
-        keyword_options.process(self, kwargs)
-        self.config=config = configuration.Configuration(config_dir, quiet=self.quiet, postpone=self.postpone)
-        ecat = extended.ExtendedCatalog(config.extended)
-        
-        # if isinstance(roi_spec, str):
-        #     sourcelist=glob.glob('sources_*.csv')[0]
-        #     df = pd.read_csv(sourcelist, index_col=3 if roi_spec[0]=='J' else 0)
-        #     if roi_spec not in df.index:
-        #         print 'Source name "{}" not found '.format(roi_spec)
-        #         raise Exception
-        #     roi_index = int(df.loc[roi_spec]['roiname'][-4:]) 
-        #     print 'Loading ROI #{}, containing source "{}"'.format(roi_index, roi_spec)
-        # elif isinstance(roi_spec, int):
-        #     roi_index = roi_spec
-        # elif type(roi_spec)==tuple and len(roi_spec)==2:
-        #     roi_index = Band(12).index(SkyDir(*roi_spec))
-        # else:
-        #     raise Exception('Did not recoginze roi_spec: %s' %(roi_spec))         
-        roi_index = self.roi_index(roi_spec)    
-            
-        roi_sources = from_healpix.ROImodelFromHealpix(config, roi_index, ecat=ecat,)
-        config.roi_spec = configuration.ROIspec(healpix_index=roi_index)
+         Parameters
+         ----------
+         pixel_table : like3.pixel_table.PixelTable """
 
-        self.name = config.roi_spec.name if config.roi_spec is not None else roi_spec
-        
-        roi_bands = bands.BandSet(config, roi_index)
-        roi_bands.load_data()
-        super(ROI, self).__init__( roi_bands, roi_sources)
+        super(ROI, self).__init__(pixel_table)
     
     def roi_index(self, roi_spec):
         """ roi_spec : [integer | (ra,dec) tuple ]
@@ -638,8 +604,8 @@ class MultiROI(ROI):
         if self.config.modeldir is not None:
             roi_sources = from_healpix.ROImodelFromHealpix(self.config, roi_index, 
                 ecat=self.ecat, **load_kw)
-        else:
-            roi_sources = from_xml.ROImodelFromXML(self.config, roi_index, ecat=self.ecat)
+        # else:
+        #     roi_sources = from_xml.ROImodelFromXML(self.config, roi_index, ecat=self.ecat)
             
         self.name = 'HP12_%04d' % roi_index
         self.setup( roi_bands, roi_sources)
