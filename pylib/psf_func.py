@@ -1,11 +1,99 @@
 """ PSF functions management"""
 
 import sys
+import types
+import pickle
+import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from pylib.binned_data import BandList
 from utilities.ipynb_docgen import show, show_fig
+
+
+def _ensure_pandas_indexes_compat():
+    """Provide a lightweight shim for legacy pickles expecting pandas.indexes."""
+    if 'pandas.indexes' in sys.modules:
+        return
+    try:
+        from pandas import (
+            CategoricalIndex,
+            DatetimeIndex,
+            Index,
+            MultiIndex,
+            PeriodIndex,
+            RangeIndex,
+            TimedeltaIndex,
+        )
+    except Exception:
+        return
+
+    pkg = types.ModuleType('pandas.indexes')
+    pkg.__path__ = []
+
+    def _new_Index(cls, values=None, **kwargs):
+        name = kwargs.get('name', None)
+        data = values
+        if isinstance(values, dict):
+            name = values.get('name', name)
+            data = values.get('data', values.get('_data', values.get('values', None)))
+        if cls is RangeIndex and isinstance(values, dict):
+            return RangeIndex(
+                start=values.get('start', 0),
+                stop=values.get('stop', 0),
+                step=values.get('step', 1),
+                name=name,
+            )
+        try:
+            return cls(data, name=name)
+        except Exception:
+            try:
+                return Index(data if data is not None else [], name=name)
+            except Exception:
+                return Index([])
+
+    module_defs = {
+        'pandas.indexes.base': {'Index': Index, '_new_Index': _new_Index},
+        'pandas.indexes.multi': {'MultiIndex': MultiIndex},
+        'pandas.indexes.range': {'RangeIndex': RangeIndex},
+        'pandas.indexes.datetimes': {'DatetimeIndex': DatetimeIndex},
+        'pandas.indexes.timedeltas': {'TimedeltaIndex': TimedeltaIndex},
+        'pandas.indexes.period': {'PeriodIndex': PeriodIndex},
+        'pandas.indexes.category': {'CategoricalIndex': CategoricalIndex},
+    }
+
+    for mod_name, attrs in module_defs.items():
+        mod = types.ModuleType(mod_name)
+        for attr, value in attrs.items():
+            setattr(mod, attr, value)
+        sys.modules[mod_name] = mod
+        setattr(pkg, mod_name.rsplit('.', 1)[-1], mod)
+
+    pkg.Index = Index
+    pkg.MultiIndex = MultiIndex
+    pkg.RangeIndex = RangeIndex
+    pkg.DatetimeIndex = DatetimeIndex
+    pkg.TimedeltaIndex = TimedeltaIndex
+    pkg.PeriodIndex = PeriodIndex
+    pkg.CategoricalIndex = CategoricalIndex
+    sys.modules['pandas.indexes'] = pkg
+
+
+def _read_pickle_compat(path):
+    """Load a pickle with a latin1 fallback for legacy python2-encoded files."""
+    try:
+        return pd.read_pickle(path)
+    except Exception as first_error:
+        if 'ascii' not in str(first_error).lower() or 'decode' not in str(first_error).lower():
+            raise
+        with open(path, 'rb') as stream:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    'ignore',
+                    message=r'dtype\(\): align should be passed as Python or NumPy boolean',
+                    category=Warning,
+                )
+                return pickle.load(stream, encoding='latin1')
 
 
 class PSFlist(list):
@@ -71,6 +159,7 @@ class PSFlist(list):
     def __init__(self, event_type=None, table_path='files/loc'):
         from pathlib import Path
         path = Path(table_path)
+        _ensure_pandas_indexes_compat()
         if path.is_dir():
             et = None if event_type is None else int(event_type)
             load_fb  = et is None or et < 2
@@ -81,7 +170,7 @@ class PSFlist(list):
                 if not do_load:
                     continue
                 try:
-                    frames.append(pd.read_pickle(path / fname))
+                    frames.append(_read_pickle_compat(path / fname))
                 except Exception as msg:
                     print(msg, file=sys.stderr)
             if not frames:
@@ -89,7 +178,7 @@ class PSFlist(list):
             psf_table = pd.concat(frames, ignore_index=True)
         else:
             try:
-                psf_table = pd.read_pickle(path)
+                psf_table = _read_pickle_compat(path)
             except Exception as msg:
                 print(msg, file=sys.stderr)
                 return

@@ -15,7 +15,7 @@ from astropy.coordinates import SkyCoord, Angle
 from astropy.io import fits
 from astropy_healpix import HEALPix
 from pathlib import Path
-from typing import cast
+from typing import Callable, cast
 
 
 def _event_type_to_int(value):
@@ -110,7 +110,8 @@ class PixelTable(dict):
             self.energy = np.sqrt(self.e0 * self.e1)  # MeV, consistent with PixelTable.Band
  
             super().__init__(nside, frame='galactic', order=order)
-            self.psf = None  # set later by PixelTable.set_psf()
+            self.psf: Callable[[float], float] | None = None  # set later by PixelTable.set_psf()
+            self.r68: float | None = None
             self.source_model = source_model
             # Dense array caches built once from sparse pixel arrays; see exposure_map.
             self._exposure_dense: np.ndarray | None = None  # shape (12*nside^2,)
@@ -141,7 +142,41 @@ class PixelTable(dict):
 
         def response(self, source, pixels=None):
             """Return PSF response for a source evaluated on given pixel indices."""
-            return source.response(self).evaluate(pixels)
+            if source is None:
+                cpix = np.asarray([], dtype=np.int64)
+                return cpix, np.asarray([], dtype=float)
+
+            # Backward-compatible path used by tests and older adapters where
+            # source.response(band).evaluate(keys) supplies sparse weights.
+            if self.psf is None:
+                rsp = source.response(self)
+                if hasattr(rsp, 'evaluate'):
+                    return rsp.evaluate(pixels)
+                raise RuntimeError('PSF not configured for this band; call PixelTable.set_psf() first')
+
+            if getattr(source, 'skydir', None) is None:
+                cpix = np.asarray([], dtype=np.int64)
+                return cpix, np.asarray([], dtype=float)
+
+            sdir = source.skydir
+            sdir = sdir.coord if hasattr(sdir, 'coord') else sdir
+
+            if pixels is None:
+                if self.r68 is None:
+                    cpix = self.pix
+                else:
+                    cpix = self.cone_search_skycoord(sdir, Angle(5 * float(self.r68), 'deg'))
+            else:
+                cpix = np.asarray(pixels, dtype=np.int64)
+
+            if len(cpix) == 0:
+                return cpix, np.asarray([], dtype=float)
+
+            aa = sdir.separation(self.healpix_to_skycoord(cpix)).deg
+            psf = self.psf
+            assert psf is not None
+            vpix = np.array(list(map(psf, aa)), dtype=float) * self.pixel_area.value
+            return cpix, vpix
 
         @property
         def exposure_map(self):
@@ -645,8 +680,11 @@ class PixelTable(dict):
             float
                 ``sum(photons * log(model) - model)`` over all loaded pixels.
             """
+            sm = self.source_model
             if skydir is not None:
-                self.source_model.setposition(skydir)
+                if sm is None:
+                    raise ValueError('Cannot set trial position without an attached source_model')
+                sm.setposition(skydir)
             _, model = self.pixel_counts()
             model = model.clip(1e-30, None)
             photons = self.photons if self._fit_mask is None else self.photons[self._fit_mask]
@@ -708,6 +746,9 @@ class PixelTable(dict):
             emax = np.asarray(bands_data['E_MAX'], dtype=float) * 1e-3
             event_type = np.asarray(bands_data['EVENT_TYPE'], dtype=int)
             nbands = len(nside)
+            band_exposure = None
+            if 'EXPOSURE' in (bands_data.names or ()): 
+                band_exposure = np.asarray(bands_data['EXPOSURE'], dtype=float)
 
             # Read channel column first to build a combined sort+filter index.
             # This avoids holding all columns in memory while sorting.
@@ -769,6 +810,8 @@ class PixelTable(dict):
         emin = emin[keep]
         emax = emax[keep]
         event_type = event_type[keep]
+        if band_exposure is not None:
+            band_exposure = band_exposure[keep]
 
         event_labels = [_event_type_to_label(et) for et in event_type]
         meta = [
@@ -786,6 +829,27 @@ class PixelTable(dict):
 
 
         self._setup_from_arrays(meta, source=filename)
+
+        # After _setup_from_arrays normalizes each band's pixel_exposure, rebuild
+        # the table-level pixel_exposure array so it mirrors the normalized values.
+        if hasattr(self, 'pixel_exposure'):
+            self.pixel_exposure = np.concatenate([
+                self[k].pixel_exposure for k in sorted(self.keys())
+            ])
+
+        # Optional per-band mean exposure from BANDS HDU.
+        if band_exposure is not None:
+            self.meta_df['exposure'] = np.asarray(band_exposure, dtype=float)
+            for i, key in enumerate(self.keys()):
+                self[key].exposure = float(band_exposure[i])
+        elif hasattr(self, 'pixel_exposure'):
+            means = []
+            for key in self.keys():
+                b = self[key]
+                expo = float(np.mean(b.pixel_exposure)) if b.pixel_exposure is not None else np.nan
+                b.exposure = expo
+                means.append(expo)
+            self.meta_df['exposure'] = np.asarray(means, dtype=float)
 
     @property
     def e_egom_mean(self):
@@ -906,6 +970,119 @@ class PixelTable(dict):
                 psf.__dict__['event_type'] = et
             band.psf = psf
 
+        return self
+
+    @classmethod
+    def from_fits(cls, filename, *, emin=None, source_model=None, set_psf=False):
+        """Load a :class:`PixelTable` from a FITS file."""
+        return cls(root=filename, emin=emin, source_model=source_model, set_psf=set_psf)
+
+    def to_fits(self, filename):
+        """Write this pixel table to a FITS file compatible with ``from_fits``."""
+        from astropy.io import fits
+
+        nocc = np.asarray(self.meta_df.nocc, dtype=np.int64)
+        channels = np.repeat(np.arange(len(nocc), dtype=np.int64), nocc)
+        npix = len(self.pix)
+        diffuse_pix = np.asarray(self.diffuse[:npix], dtype=np.float32)
+        sources_pix = np.asarray(self.sources[:npix], dtype=np.float32)
+
+        skymap_cols = [
+            fits.Column(name='PIX', format='J', array=np.asarray(self.pix, dtype=np.int64)),
+            fits.Column(name='CHANNEL', format='J', array=channels),
+            fits.Column(name='COUNTS', format='J', array=np.asarray(self.photons, dtype=np.int32)),
+        ]
+
+        if hasattr(self, 'pixel_exposure'):
+            # De-normalize before writing: store pixel_exposure / _exposure_normalization
+            # so that _setup_from_arrays correctly restores physical values on reload.
+            raw_exposure = np.concatenate([
+                np.asarray(self[k].pixel_exposure, dtype=np.float64) / self[k]._exposure_normalization()
+                for k in sorted(self.keys())
+            ]).astype(np.float32)
+            skymap_cols.append(
+                fits.Column(name='EXPOSURE', format='E', array=raw_exposure)
+            )
+
+        # Keep diffuse/source component columns expected by from_fits loader.
+        skymap_cols.extend([
+            fits.Column(name='DIFFUSE', format='E', array=diffuse_pix),
+            fits.Column(name='SUNMOON', format='E', array=np.zeros(npix, dtype=np.float32)),
+            fits.Column(name='POINTSOURCES', format='E', array=sources_pix),
+            fits.Column(name='EXTENDEDSOURCES', format='E', array=np.zeros(npix, dtype=np.float32)),
+        ])
+        skymap_hdu = fits.BinTableHDU.from_columns(skymap_cols, name='SKYMAP')
+        skymap_hdu.header['ORDERING'] = 'NESTED' if str(self.order).lower() == 'nested' else 'RING'
+
+        event_codes = (
+            np.asarray(self.meta_df.event_type_code, dtype=np.int64)
+            if 'event_type_code' in self.meta_df.columns
+            else np.asarray([_event_type_to_int(v) for v in self.meta_df.event_type], dtype=np.int64)
+        )
+        bands_cols = [
+            fits.Column(name='NSIDE', format='J', array=np.asarray(self.meta_df.nside, dtype=np.int64)),
+            fits.Column(name='E_MIN', format='D', array=np.asarray(self.meta_df.emin, dtype=float) * 1e3),
+            fits.Column(name='E_MAX', format='D', array=np.asarray(self.meta_df.emax, dtype=float) * 1e3),
+            fits.Column(name='EVENT_TYPE', format='J', array=event_codes),
+        ]
+        if 'exposure' in self.meta_df.columns:
+            bands_cols.append(
+                fits.Column(name='EXPOSURE', format='D', array=np.asarray(self.meta_df.exposure, dtype=float))
+            )
+        bands_hdu = fits.BinTableHDU.from_columns(bands_cols, name='BANDS')
+
+        fits.HDUList([fits.PrimaryHDU(), skymap_hdu, bands_hdu]).writeto(filename, overwrite=True)
+
+    def attach_exposure(self, exposure_by_band, *, frame='galactic', nest=False):
+        """Attach per-band exposure values/maps and update derived exposure metadata."""
+        full = np.zeros(len(self.pix), dtype=float)
+        means = []
+        rows = []
+
+        for i, key in enumerate(self.keys()):
+            band = self[key]
+            spec = exposure_by_band[key]
+
+            if np.isscalar(spec):
+                px = np.full(len(band.pix), float(spec), dtype=float)
+            elif callable(spec):
+                # ExposureMap-like callable over pixel indices.
+                if hasattr(spec, 'map_values') or hasattr(spec, 'values'):
+                    vals = np.asarray(getattr(spec, 'map_values', getattr(spec, 'values')), dtype=float)
+                    band.exposure_map_values = vals
+                    px = vals[np.asarray(band.pix, dtype=np.intp)]
+                else:
+                    px = np.asarray(spec(band.pix), dtype=float)
+            else:
+                arr = np.asarray(spec, dtype=float)
+                if arr.ndim != 1:
+                    raise ValueError(f'Exposure entry for band {key!r} must be 1D')
+                if len(arr) == len(band.pix):
+                    px = arr
+                elif len(arr) == 12 * int(band.nside) ** 2:
+                    band.exposure_map_values = arr
+                    px = arr[np.asarray(band.pix, dtype=np.intp)]
+                else:
+                    raise ValueError(
+                        f'Exposure entry for band {key!r} has length {len(arr)}, '
+                        f'expected {len(band.pix)} or {12 * int(band.nside) ** 2}'
+                    )
+
+            band.pixel_exposure = np.asarray(px, dtype=float)
+            band.count_exposure = np.asarray(px, dtype=float)
+            band._exposure_dense = None
+            band._exposure_lookup = None
+            band.exposure = float(np.mean(px)) if len(px) else np.nan
+
+            sl = band.slice
+            if sl is not None:
+                full[sl] = px
+            means.append(band.exposure)
+            rows.extend((key, int(p), float(e)) for p, e in zip(band.pix, px))
+
+        self.pixel_exposure = full
+        self.meta_df['exposure'] = np.asarray(means, dtype=float)
+        self.pixel_exposure_df = pd.DataFrame(rows, columns=['band_key', 'pix', 'pixel_exposure'])
         return self
 
     def ring_map(self, nside=128, component='data', frame='galactic'):
@@ -1057,6 +1234,62 @@ class PixelTable(dict):
             print('select: no bands match the given filters')
         self._selected = selected
         return self
+
+    def show_selected(self, *, max_rows=20):
+        """Print a compact table describing the active band selection.
+
+        Parameters
+        ----------
+        max_rows : int, optional
+            Maximum number of rows to print from the selected set.  When more
+            rows are present, only the first ``max_rows`` entries are shown and
+            a truncation message is printed.  Default is 20.
+
+        Returns
+        -------
+        pandas.DataFrame
+            DataFrame with one row per active band in display order.
+        """
+        if max_rows < 1:
+            raise ValueError('max_rows must be >= 1')
+
+        if self._selected is None:
+            keys = sorted(self.keys())
+            scope = 'all bands (no active selection)'
+        else:
+            keys = list(self._selected)
+            scope = 'active selection'
+
+        if not keys:
+            print('show_selected: no bands are currently selected')
+            return pd.DataFrame(
+                columns=['key', #'event_type', 
+                         'label', 'emin_mev', 'emax_mev', 'energy_mev', 'nside', 'nocc']
+            )
+
+        rows = []
+        for key in keys:
+            band = self[key]
+            rows.append(
+                dict(
+                    key=key,
+                    # event_type=int(band.event_type),
+                    label=_event_type_to_label(band.event_type),
+                    emin_mev=int(band.e0),
+                    emax_mev=int(band.e1),
+                    energy_mev=int(band.energy),
+                    nside=int(band.nside),
+                    nocc=int(band.nocc),
+                )
+            )
+
+        df = pd.DataFrame(rows)
+        shown = df.head(max_rows)
+        print(f'show_selected: {len(df)} band(s), scope={scope}')
+        print(shown.to_string(index=False))
+        if len(df) > len(shown):
+            print(f'... truncated to first {len(shown)} rows (set max_rows to show more)')
+        return df
 
     @property
     def parameters(self):
@@ -1257,7 +1490,9 @@ class PixelTable(dict):
             raise ValueError('fit requires a source_model')
         from like3.fitter import Minimizer, Fitted
 
-        pset = self.source_model.parameters
+        source_model = self.source_model
+        assert source_model is not None
+        pset = source_model.parameters
         pixel_table = self
         initial_loglike = self.loglike()
         use_gradient = kwargs.pop('use_gradient', use_gradient)
@@ -1283,7 +1518,9 @@ class PixelTable(dict):
 
             @property
             def bounds(self):
-                b = pixel_table.source_model.bounds
+                sm = pixel_table.source_model
+                assert sm is not None
+                b = sm.bounds
                 return b[param_mask] if b is not None else None
 
             @property
@@ -1322,9 +1559,14 @@ class PixelTable(dict):
                     model = np.clip(model, 1e-30, None)
                     loglike += float(np.sum(counts * np.log(model) - model))
                     if need_grad:
+                        assert full_grad is not None
                         full_grad -= ((counts / model - 1.0)[:, None] * dm_dtheta).sum(axis=0)
 
-                grad = full_grad[param_mask] if need_grad else None
+                if need_grad:
+                    assert full_grad is not None
+                    grad = full_grad[param_mask]
+                else:
+                    grad = None
                 value = -float(loglike) + initial_loglike
                 self._cache_pars = np.array(pars, copy=True)
                 self._cache_value = value

@@ -20,6 +20,7 @@ Main Components:
 import os, pickle
 import importlib
 from collections import OrderedDict
+from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
@@ -32,6 +33,89 @@ sources = importlib.import_module(f'{_pkg}.sources')
 bands = importlib.import_module(f'{_pkg}.pixel_table')
 # 2/decade above 31.6 GeV
 energybins=np.concatenate( [np.logspace(2,4.25,10), np.logspace(4.5,6,4)])
+
+
+def _poisson_fitter_with_retry(func, tol, *, scale=None, delta=None):
+    """Run PoissonFitter with progressively looser fallback settings."""
+    attempts = [
+        dict(tol=float(tol)),
+        dict(tol=float(max(1.0, 2.0 * tol))),
+        dict(tol=float(max(2.0, 4.0 * tol)), delta=1e-3),
+    ]
+    if scale is not None:
+        for a in attempts:
+            a['scale'] = float(scale)
+    if delta is not None:
+        attempts[0]['delta'] = float(delta)
+
+    last_exc = None
+    for kw in attempts:
+        try:
+            return loglikelihood.PoissonFitter(func, **kw)
+        except Exception as exc:
+            last_exc = exc
+    assert last_exc is not None
+    raise last_exc
+
+
+def _poisson_fitter_robust(func, tol, *, scale_hint=None):
+    """Run PoissonFitter with retries, unitless scaling, and scan-seeded fallback."""
+    try:
+        return _poisson_fitter_with_retry(func, tol), 'ok', ''
+    except Exception as first_exc:
+        base = float(scale_hint) if scale_hint is not None and np.isfinite(scale_hint) and scale_hint > 0 else 1.0
+
+        # Retry in unitless coordinates u = flux / base and map fit back to flux.
+        def unitless(u):
+            return func(max(float(u), 0.0) * base)
+
+        try:
+            pf_u = _poisson_fitter_with_retry(unitless, tol, scale=1.0, delta=1e-4)
+            sp, e, b = pf_u.poiss.p
+            poiss_flux = loglikelihood.Poisson([sp * base, e / base, b * base])
+            pf_scaled = SimpleNamespace(
+                poiss=poiss_flux,
+                maxdev=float(pf_u.maxdev),
+                wprime=float(pf_u.wprime) / base,
+            )
+            return pf_scaled, 'scaled-unitless', f'initial retry failed: {first_exc}'
+        except Exception as scaled_exc:
+            scaled_reason = scaled_exc
+
+        # Scan nearby scales to find a stable seed for difficult profiles.
+        factors = np.array([0.0, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 13.0], dtype=float)
+        x_scan = np.clip(base * factors, 0.0, np.inf)
+
+        vals = []
+        good_x = []
+        for x in x_scan:
+            try:
+                v = float(func(x))
+            except Exception:
+                continue
+            if np.isfinite(v):
+                good_x.append(float(x))
+                vals.append(v)
+
+        if len(vals) < 3:
+            raise RuntimeError(
+                f'Poisson fit failed after retries; scan fallback had only {len(vals)} finite samples. '
+                f'first error: {first_exc}; scaled error: {scaled_reason}'
+            )
+
+        good_x = np.asarray(good_x, dtype=float)
+        vals = np.asarray(vals, dtype=float)
+        seed = float(max(good_x[int(np.argmax(vals))], 1e-8))
+        seed_delta = float(max(1e-4, min(1.0, 1e-3 * seed)))
+
+        try:
+            pf = _poisson_fitter_with_retry(func, tol, scale=seed, delta=seed_delta)
+            return pf, 'scan-seeded', f'initial retry failed: {first_exc}; scaled error: {scaled_reason}'
+        except Exception as second_exc:
+            raise RuntimeError(
+                f'Poisson fit failed after retries and scan-seeded fallback. '
+                f'first error: {first_exc}; scaled error: {scaled_reason}; scan error: {second_exc}'
+            )
        
 class SED(tools.WithMixin):
     """Measure the energy flux vs. energy for a given source.
@@ -261,6 +345,102 @@ class SED(tools.WithMixin):
         r.index.name='energy'
         return r
 
+    def poisson_table(self, event_type=None, tol=0.1):
+        """Generate a per-band SED table with one Poisson object per row.
+
+        Parameters
+        ----------
+        event_type : int or None
+            Event type selection (None=all, 0/1=front/back, 2-5=PSF0-3).
+        tol : float
+            Poisson tolerance (default: 0.1).
+
+        Returns
+        -------
+        pd.DataFrame
+            Table indexed by band-center energy with columns:
+            ``elow``, ``ehigh``, ``poiss``, ``maxdev``, ``wprime``,
+            ``flux``, ``lflux``, ``uflux``, and ``ts``.
+            The ``poiss`` column contains ``loglikelihood.Poisson`` objects
+            (or ``None`` when no fit is available).
+        """
+        ebins = self.energybins
+        if event_type is not None:
+            et_min = getattr(bands, 'event_type_min_energy', {})
+            emin_et = et_min.get(event_type, 0)
+            ebins = [e for e in ebins if e >= emin_et]
+
+        rows = []
+        try:
+            for elow, ehigh in zip(ebins[:-1], ebins[1:]):
+                row = dict(
+                    energy=float(np.sqrt(elow * ehigh)),
+                    elow=float(elow),
+                    ehigh=float(ehigh),
+                    poiss=None,
+                    maxdev=np.nan,
+                    wprime=np.nan,
+                    flux=np.nan,
+                    lflux=np.nan,
+                    uflux=np.nan,
+                    ts=np.nan,
+                    fit_status='pending',
+                    fail_reason='',
+                )
+                try:
+                    # Configure band selection and energy explicitly so robust fitting
+                    # can evaluate the function directly if needed.
+                    self.rs.select(event_type=event_type, elow=elow, ehigh=ehigh)
+                    has_data = np.any([b.band.has_pixels for b in self.rs.selected])
+                    if not has_data:
+                        row['fit_status'] = 'no-data'
+                        rows.append(row)
+                        continue
+                    self.func.set_energy(np.sqrt(elow * ehigh))
+                    scale_hint = float(self.func.eflux) if np.isfinite(self.func.eflux) else None
+                    pf, status, reason = _poisson_fitter_robust(self.func, tol, scale_hint=scale_hint)
+                except Exception as msg:
+                    print('Fail poiss fit for %.0f-%.0f MeV: %s ' % (elow, ehigh, msg))
+                    row['fit_status'] = 'failed'
+                    row['fail_reason'] = str(msg)
+                    rows.append(row)
+                    continue
+
+                if pf is None or np.isnan(pf.wprime):
+                    row['fit_status'] = 'invalid-wprime'
+                    row['fail_reason'] = 'wprime is NaN'
+                    rows.append(row)
+                    continue
+
+                w = pf.poiss
+                lf, uf = w.errors
+                row.update(
+                    poiss=w,
+                    maxdev=float(pf.maxdev),
+                    wprime=float(pf.wprime),
+                    flux=float(w.flux),
+                    lflux=float(lf),
+                    uflux=float(uf),
+                    ts=float(w.ts),
+                    fit_status=status,
+                    fail_reason=reason,
+                )
+                rows.append(row)
+        finally:
+            self.restore()
+
+        ret = pd.DataFrame(rows)
+        if len(ret) == 0:
+            ret = pd.DataFrame(
+                columns='elow ehigh poiss maxdev wprime flux lflux uflux ts fit_status fail_reason'.split()
+            )
+            ret.index.name = 'energy'
+            return ret
+
+        ret.index = np.array(ret.pop('energy'), int)
+        ret.index.name = 'energy'
+        return ret
+
         
     def restore(self):
         """Restore ROI and flux function to default selection state."""
@@ -319,7 +499,12 @@ def sed_table(roi, source_name=None, event_type=None, tol=0.1):
     Raises:
         Exception: If event_type name is not recognized
     """
-    source = roi.sources.find_source(source_name)
+    finder = getattr(roi, 'sources', None)
+    if finder is None:
+        finder = getattr(roi, 'source_model', None)
+    if finder is None or not hasattr(finder, 'find_source'):
+        raise AttributeError('Object passed to sed_table must provide sources.find_source or source_model.find_source')
+    source = finder.find_source(source_name)
     
     if isinstance(event_type,str):
         etname = event_type.lower()
@@ -331,6 +516,138 @@ def sed_table(roi, source_name=None, event_type=None, tol=0.1):
             
     with SED(roi, source.name) as sf:
         return sf.data_frame(event_type=event_type, tol=tol)
+
+
+def sed_poisson_table(roi, source_name=None, event_type=None, tol=0.1):
+    """Generate an SED table with a Poisson object in each energy-bin row.
+
+    Parameters
+    ----------
+    roi: ROI object
+    source_name : str or None
+        Source name (if None, uses default).
+    event_type : int, str, or None
+        Event type selection:
+        None=all, 0=front, 1=back, 2-5=PSF0-3, or a name string.
+    tol : float
+        Poisson tolerance (default: 0.1).
+
+    Returns
+    -------
+    pd.DataFrame
+        Per-band table indexed by energy. Includes a ``poiss`` column whose
+        entries are ``loglikelihood.Poisson`` objects.
+    """
+    finder = getattr(roi, 'sources', None)
+    if finder is None:
+        finder = getattr(roi, 'source_model', None)
+    if finder is None or not hasattr(finder, 'find_source'):
+        raise AttributeError('Object passed to sed_poisson_table must provide sources.find_source or source_model.find_source')
+    source = finder.find_source(source_name)
+
+    if isinstance(event_type, str):
+        etname = event_type.lower()
+        if etname == 'all':
+            event_type = None
+        elif hasattr(roi, 'config') and etname in roi.config.event_type_names:
+            event_type = roi.config.event_type_names.index(etname)
+        else:
+            raise Exception('event type name %s not recognized' % event_type)
+
+    # FermiFit-compatible path: operate directly on its PixelTable selections
+    # and likelihood view without requiring the legacy ROIstat interface.
+    if hasattr(roi, 'pixel_table') and hasattr(roi, 'energy_flux_view'):
+        pt = roi.pixel_table
+        func = roi.energy_flux_view(source.name, bound=-20)
+
+        emax = max(b.e1 for b in pt.values()) if len(pt) > 0 else 0
+        ebins = [e for e in energybins if e <= emax]
+        candidate_bands = list(pt.values())
+        if event_type is not None:
+            candidate_bands = [b for b in candidate_bands if int(b.event_type) == int(event_type)]
+
+        rows = []
+        try:
+            for elow, ehigh in zip(ebins[:-1], ebins[1:]):
+                row = dict(
+                    energy=float(np.sqrt(elow * ehigh)),
+                    elow=float(elow),
+                    ehigh=float(ehigh),
+                    poiss=None,
+                    maxdev=np.nan,
+                    wprime=np.nan,
+                    flux=np.nan,
+                    lflux=np.nan,
+                    uflux=np.nan,
+                    ts=np.nan,
+                    fit_status='pending',
+                    fail_reason='',
+                )
+
+                selected = [
+                    b for b in candidate_bands
+                    if float(b.e0) >= float(elow) and float(b.e1) <= float(ehigh)
+                ]
+                has_data = np.any([
+                    (getattr(b, 'nocc', 0) > 0) or (len(getattr(b, 'pix', [])) > 0)
+                    for b in selected
+                ])
+                if len(selected) == 0 or not has_data:
+                    row['fit_status'] = 'no-data'
+                    rows.append(row)
+                    continue
+
+                pt.select(keys=[b.key for b in selected])
+                func.set_energy(np.sqrt(elow * ehigh))
+                try:
+                    scale_hint = float(func.eflux) if np.isfinite(func.eflux) else None
+                    pf, status, reason = _poisson_fitter_robust(func, tol, scale_hint=scale_hint)
+                except Exception as msg:
+                    print('Fail poiss fit for %.0f-%.0f MeV: %s ' % (elow, ehigh, msg))
+                    row['fit_status'] = 'failed'
+                    row['fail_reason'] = str(msg)
+                    rows.append(row)
+                    continue
+
+                if np.isnan(pf.wprime):
+                    row['fit_status'] = 'invalid-wprime'
+                    row['fail_reason'] = 'wprime is NaN'
+                    rows.append(row)
+                    continue
+
+                w = pf.poiss
+                lf, uf = w.errors
+                row.update(
+                    poiss=w,
+                    maxdev=float(pf.maxdev),
+                    wprime=float(pf.wprime),
+                    flux=float(w.flux),
+                    lflux=float(lf),
+                    uflux=float(uf),
+                    ts=float(w.ts),
+                    fit_status=status,
+                    fail_reason=reason,
+                )
+                rows.append(row)
+        finally:
+            pt.select()
+            if hasattr(func, 'restore'):
+                func.restore()
+
+        ret = pd.DataFrame(rows)
+        if len(ret) == 0:
+            ret = pd.DataFrame(
+                columns='elow ehigh poiss maxdev wprime flux lflux uflux ts fit_status fail_reason'.split()
+            )
+            ret.index.name = 'energy'
+            return ret
+
+        ret.index = np.array(ret.pop('energy'), int)
+        ret.index.name = 'energy'
+        return ret
+
+    with SED(roi, source.name) as sf:
+        return sf.poisson_table(event_type=event_type, tol=tol)
 
 
 def norm_table(roi, source_name=None, event_type=None, tol=0.25, ignore_exception=True):

@@ -10,7 +10,17 @@ from typing import Any, cast
 # from . skydir import SkyDir
 from astropy.coordinates import SkyCoord#, Angle
 from . import spectral_models
-from . import response
+
+
+class _BandResponseAdapter:
+    """Compatibility adapter exposing ``evaluate`` for legacy call sites."""
+
+    def __init__(self, source, band):
+        self.source = source
+        self.band = band
+
+    def evaluate(self, pixels=None):
+        return self.band.response(self.source, pixels)
 
 # convenience adapters 
 def LogParabola(*pars):
@@ -262,8 +272,8 @@ class PointSource(Source):
         return ret
 
     def response(self, band,  ):
-        """Construct point-source response object for a given band."""
-        return response.PointResponse(self, band, )
+        """Return an adapter providing ``evaluate(pixels)`` response calls."""
+        return _BandResponseAdapter(self, band)
 
 
 class ExtendedSource(Source):
@@ -292,9 +302,7 @@ class ExtendedSource(Source):
         return ret
          
     def response(self, band, roi=None, **kwargs):
-        """ return a Respose object, which, given a band, can create a convolved image
-        and calculate expected counts
-        """
-        return response.ExtendedResponse(self, band, roi, **kwargs)
+        """Return an adapter providing ``evaluate(pixels)`` response calls."""
+        return _BandResponseAdapter(self, band)
 
         

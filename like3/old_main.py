@@ -1,18 +1,26 @@
-"""
-Top-level code for ROI analysis
+"""Legacy ROI analysis API for like3.
 
-$Header: /nfs/slac/g/glast/ground/cvs/pointlike/python/uw/like2/main.py,v 1.91 2018/01/27 15:37:17 burnett Exp $
+This module exposes the high-level :class:`ROI` convenience class used by older
+analysis scripts. The implementation now sits on top of the PixelTable-based
+likelihood views, but preserves familiar helper methods for fitting,
+localization, SED extraction, plotting, and exporting.
 
+The goal of this file is compatibility and operator ergonomics rather than a
+minimal surface area.
 """
-import types, time, glob
+import glob
+import io
+import time
+import types
+from contextlib import redirect_stderr, redirect_stdout
 import numpy as np
 import pandas as pd
 import matplotlib.pylab as plt
-from uw.utilities import keyword_options
-from skydir import SkyDir
-from . import (sourcelist, views,  configuration, extended,  from_healpix,
-                bands,  localization, sedfuns, tools,
-                plotting, associate, printing, to_healpix
+from . utilities import keyword_options
+from . skydir import SkyDir
+from . import (sourcelist, views,  #configuration, extended,  from_healpix,
+                sedfuns, tools, #localization, bands,  
+                 printing #associate, to_healpix, plotting, 
         )
 
 import warnings
@@ -24,8 +32,11 @@ warnings.filterwarnings('ignore', category=astropy.wcs.FITSFixedWarning)
 warnings.filterwarnings('ignore', category=astropy.io.fits.verify.VerifyWarning,)
 
 class ROI(views.LikelihoodViews):
-    """ROI analysis
-    This is a list of the properties and functions appropriate for user analysis of an ROI
+    """User-facing ROI analysis wrapper.
+
+    The class inherits low-level likelihood view behavior from
+    :class:`views.LikelihoodViews` and adds convenience methods that are commonly
+    used in interactive workflows.
     
     properties
     ----------
@@ -89,18 +100,50 @@ class ROI(views.LikelihoodViews):
 
     @keyword_options.decorate(defaults)
     def __init__(self, pixel_table, ):
-        """Start pointlike v3 (like3) with a given pixel table. The pixel table must have a source_model attribute, which will be used to construct the source list for this ROI.
-        
-         Parameters
-         ----------
-         pixel_table : like3.pixel_table.PixelTable """
+        """Initialize an ROI from a PixelTable-like object.
+
+        Parameters
+        ----------
+        pixel_table : object
+            PixelTable instance (or compatible object) expected by
+            :class:`views.LikelihoodViews`. It must provide source-model context
+            for ROI construction.
+        """
 
         super(ROI, self).__init__(pixel_table)
+
+    def __getitem__(self, key):
+        """Forward indexing to the underlying PixelTable and return a band.
+
+        Parameters
+        ----------
+        key : hashable
+            PixelTable band key, typically ``(psf_index, energy_index)``.
+
+        Returns
+        -------
+        PixelTable.Band
+            The selected band object.
+        """
+        if hasattr(self, 'pixel_table'):
+            return self.pixel_table[key]
+        return self.bands[key]
     
     def roi_index(self, roi_spec):
-        """ roi_spec : [integer | (ra,dec) tuple ]
-            if an integer, it must be <1728, the ROI number
-            if a string, assume a source name and load the ROI containing it
+        """Resolve an ROI identifier from an int, source name, or sky position.
+
+        Parameters
+        ----------
+        roi_spec : int | str | tuple[float, float]
+            If ``int``, interpreted as an ROI index.
+            If ``str``, interpreted as a source name and looked up in
+            ``sources_*.csv``.
+            If ``(ra, dec)``, converted to the corresponding ROI index.
+
+        Returns
+        -------
+        int
+            The resolved ROI index.
         """
         if isinstance(roi_spec, str):
             sourcelist=glob.glob('sources_*.csv')[0]
@@ -118,11 +161,11 @@ class ROI(views.LikelihoodViews):
             raise Exception('Did not recoginze roi_spec: %s' %(roi_spec)) 
         return roi_index      
 
-    def __repr__(self):
-        if hasattr(self, 'sources'):
-            return '%s.%s :\n\t%s\n\t%s' % (self.__module__, self.__class__.__name__, self.config, self.sources)
-        else:
-            return '%s.%s :\n\t %s\n\t%s' % (self.__module__, self.__class__.__name__, self.config, 'No sources')
+    # def __repr__(self):
+    #     if hasattr(self, 'sources'):
+    #         return '%s.%s :\n\t%s\n\t%s' % (self.__module__, self.__class__.__name__, self.config, self.sources)
+    #     else:
+    #         return '%s.%s :\n\t %s\n\t%s' % (self.__module__, self.__class__.__name__, self.config, 'No sources')
         
     def fit(self, select=None, exclude=None,  summarize=True, setpars=None, **kwargs):
         """ Perform fit, return fitter object to examine errors, or refit
@@ -272,7 +315,17 @@ class ROI(views.LikelihoodViews):
         return t
 
     def localize(self, source_name=None, update=False, ignore_exception=True, **kwargs):
-        """ localize the source, return elliptical parameters 
+        """Localize a source with a TS-map fit.
+
+        Parameters
+        ----------
+        source_name : str | None
+            Source to localize. If ``'all'``, localize all eligible sources.
+        update : bool
+            If ``True``, update the source sky position from the fitted ellipse
+            center when localization succeeds.
+        ignore_exception : bool
+            If ``True``, localization failures are reported and suppressed.
         """
         if source_name=='all':
             localization.localize_all(self, ignore_exception=ignore_exception, **kwargs)
@@ -291,9 +344,11 @@ class ROI(views.LikelihoodViews):
             tsm.source.skydir = SkyDir(t['ra'], t['dec'])
     
     def get_model(self, source_name=None):
+        """Return the spectral model for a selected source."""
         return self.sources.find_source(source_name).spectral_model
         
     def get_source(self, source_name=None):
+        """Select and return a source object from the ROI source list."""
         return self.sources.find_source(source_name)
         
     def TS(self, source_name=None, quick=True):
@@ -313,19 +368,167 @@ class ROI(views.LikelihoodViews):
         """ return the SED recarray for the source, including npred info
         source_name : string
             Name of a source in the ROI, with possible wildcards
-        event_type : None, or integer, 0/1 for front/back, 2-5 for psf0-3
+        event_type : None, integer/string, or iterable of those
+            0/1 for front/back, 2-5 for psf0-3, or labels like ``'PSF0'``.
         update : bool
             set True to force recalculation of sed recarray
         """
         source = self.sources.find_source(source_name)
-        if not hasattr(source, 'sedrec') or source.sedrec is None\
-                 or (update and np.any(source.model.free)):
-            with sedfuns.SED(self, source.name) as sf:
-                source.sedrec = sf.sed_rec(event_type=event_type, tol=tol)
+        if hasattr(self, 'pixel_table') and hasattr(self.pixel_table, '_iter_bands'):
+            pixel_table = self.pixel_table
+            pset = pixel_table.parameters
+            names = 'elow ehigh flux lflux uflux npred pindex ts mflux delta_ts pull maxdev zero_fract'.split()
+
+            def _event_to_code(ev):
+                if isinstance(ev, str):
+                    txt = ev.strip().upper()
+                    if txt == 'FRONT':
+                        return 0
+                    if txt == 'BACK':
+                        return 1
+                    if txt.startswith('PSF') and txt[3:].isdigit():
+                        return 2 + int(txt[3:])
+                    if txt.isdigit():
+                        return int(txt)
+                    raise ValueError(f'Unrecognized event type: {ev}')
+                return int(ev)
+
+            if isinstance(event_type, (list, tuple, set, np.ndarray)):
+                selected_event_types = {_event_to_code(ev) for ev in event_type}
+            elif event_type is None:
+                selected_event_types = None
+            else:
+                selected_event_types = {_event_to_code(event_type)}
+
+            cache_key = None if selected_event_types is None else tuple(sorted(selected_event_types))
+            if hasattr(source, 'sedrec') and source.sedrec is not None and not update:
+                if getattr(source, '_sedrec_event_key', None) == cache_key:
+                    return source.sedrec
+
+            def _event_match(band):
+                if selected_event_types is None:
+                    return True
+                return int(band.event_type) in selected_event_types
+
+            bands_by_bin = {}
+            for key in pixel_table.keys():
+                band = pixel_table[key]
+                if not _event_match(band):
+                    continue
+                ebin = (float(band.e0), float(band.e1))
+                bands_by_bin.setdefault(ebin, []).append(key)
+
+            pname = np.asarray(pset.parameter_names)
+            norm_name = f'{source.name}_Norm'
+            idx = np.where(pname == norm_name)[0]
+            if len(idx) == 0:
+                raise ValueError(f'Normalization parameter not found for source {source.name}')
+            norm_idx = int(idx[0])
+
+            saved_selected = pixel_table._selected
+            base_pars = np.array(pset.get_parameters(), copy=True)
+            rows = []
+
+            try:
+                for (elow, ehigh), keys in sorted(bands_by_bin.items()):
+                    pixel_table._selected = list(keys)
+                    pset.set_parameters(base_pars.copy())
+                    ll_baseline = float(pixel_table.loglike())
+
+                    try:
+                        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                            fit_out = pixel_table.fit(select=norm_name, quiet=True, use_gradient=True)
+                        errs = np.asarray(fit_out[2], dtype=float)
+                    except Exception as exc:
+                        msg = str(exc).lower()
+                        if 'inverting hessian' not in msg and 'singular matrix' not in msg:
+                            raise
+                        # Per-event fits can be underconstrained; retry without
+                        # covariance estimation and keep SED flux points.
+                        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                            pixel_table.fit(
+                                select=norm_name,
+                                quiet=True,
+                                use_gradient=True,
+                                estimate_errors=False,
+                            )
+                        errs = np.asarray([np.nan], dtype=float)
+                    fit_pars = np.array(pset.get_parameters(), copy=True)
+                    ll_max = float(pixel_table.loglike())
+
+                    energy = np.sqrt(elow * ehigh)
+                    flux = float(source.model(energy))
+                    mflux = float(source.model(energy))
+
+                    # 1-sigma band estimate from fitted internal-parameter uncertainty.
+                    if len(errs) > 0 and np.isfinite(errs[0]) and errs[0] > 0:
+                        err = float(errs[0])
+                        trial = fit_pars.copy()
+                        trial[norm_idx] = fit_pars[norm_idx] - err
+                        pset.set_parameters(trial)
+                        f_lo = float(source.model(energy))
+                        trial[norm_idx] = fit_pars[norm_idx] + err
+                        pset.set_parameters(trial)
+                        f_hi = float(source.model(energy))
+                        lflux, uflux = (f_lo, f_hi) if f_lo <= f_hi else (f_hi, f_lo)
+                        pset.set_parameters(fit_pars)
+                    else:
+                        lflux, uflux = np.nan, np.nan
+
+                    # Baseline model flux with global-fit parameters.
+                    pset.set_parameters(base_pars)
+                    mflux = float(source.model(energy))
+                    pset.set_parameters(fit_pars)
+
+                    null_pars = fit_pars.copy()
+                    null_pars[norm_idx] = -20.0
+                    pset.set_parameters(null_pars)
+                    ll_null = float(pixel_table.loglike())
+                    pset.set_parameters(fit_pars)
+
+                    ts = max(0.0, 2.0 * (ll_max - ll_null))
+                    delta_ts = max(0.0, 2.0 * (ll_max - ll_baseline))
+                    pull = np.sign(flux - mflux) * np.sqrt(delta_ts)
+
+                    # Predicted counts for this source integrated over all event types in the bin.
+                    npred = 0.0
+                    for bkey in keys:
+                        band = pixel_table[bkey]
+                        cpix, weight = band.response(source, band.pix)
+                        if len(cpix) == 0:
+                            continue
+                        npred += float(np.sum(np.asarray(weight, dtype=float) * source.model(band.energy) * band.exposure_map(cpix)))
+
+                    delta = 0.01
+                    f0 = float(source.model(energy))
+                    f1 = float(source.model((1.0 + delta) * energy)) if f0 > 0 else np.nan
+                    pindex = (1.0 - f1 / f0) / delta if f0 > 0 else np.nan
+
+                    rows.append((
+                        float(elow), float(ehigh), flux, lflux, uflux, npred,
+                        pindex, ts, mflux, delta_ts, pull, np.nan, np.nan
+                    ))
+            finally:
+                pset.set_parameters(base_pars)
+                pixel_table._selected = saved_selected
+
+            source.sedrec = np.rec.array(rows, dtype=[(n, 'f8') for n in names])
+            source._sedrec_event_key = cache_key
+        else:
+            if isinstance(event_type, (list, tuple, set, np.ndarray)):
+                event_vals = list(event_type)
+                if len(event_vals) > 1:
+                    raise ValueError('Multiple event types require the pixel_table backend')
+                event_type = event_vals[0] if len(event_vals) == 1 else None
+            if not hasattr(source, 'sedrec') or source.sedrec is None\
+                     or (update and np.any(source.model.free)):
+                with sedfuns.SED(self, source.name) as sf:
+                    source.sedrec = sf.sed_rec(event_type=event_type, tol=tol)
         
         return source.sedrec
 
     def band_ts(self, source_name=None, update=False):
+        """Return summed per-band TS for a source from its SED record."""
         sedrec = self.get_sed(source_name, update=update)
         return sedrec.ts.sum()
     
@@ -343,10 +546,115 @@ class ROI(views.LikelihoodViews):
         """
         return sum(self.get_counts(source_name))
     
-    @tools.decorate_with(plotting.sed.stacked_plots)    
+    # @tools.decorate_with(plotting.sed.stacked_plots)    
     def plot_sed(self, source_name=None, **kwargs):
+        """Plot a stacked SED view for one source or all sources.
+
+        Parameters are forwarded to :mod:`plotting.sed`. If ``source_name`` is
+        ``'all'``, the function generates SED products for all relevant sources.
+        Use ``psf_types`` (or ``event_type``) to select specific event classes.
+        Set ``by_event_type=True`` to plot separate entries for each event type.
+        """
+        event_type = kwargs.pop('event_type', None)
+        psf_types = kwargs.pop('psf_types', None)
+        by_event_type = kwargs.pop('by_event_type', False)
+        if event_type is not None and psf_types is not None:
+            raise ValueError('Specify either event_type or psf_types, not both')
+        sed_selector = psf_types if psf_types is not None else event_type
+
+        if hasattr(self, 'pixel_table') and hasattr(self.pixel_table, '_iter_bands'):
+            import matplotlib.pyplot as plt
+
+            source = self.sources.find_source(source_name)
+            update = kwargs.pop('update', False)
+
+            def _event_to_code(ev):
+                if isinstance(ev, str):
+                    txt = ev.strip().upper()
+                    if txt == 'FRONT':
+                        return 0
+                    if txt == 'BACK':
+                        return 1
+                    if txt.startswith('PSF') and txt[3:].isdigit():
+                        return 2 + int(txt[3:])
+                    if txt.isdigit():
+                        return int(txt)
+                    raise ValueError(f'Unrecognized event type: {ev}')
+                return int(ev)
+
+            def _event_label(code):
+                return {0: 'FRONT', 1: 'BACK'}.get(int(code), f'PSF{int(code)-2}')
+
+            if isinstance(sed_selector, (list, tuple, set, np.ndarray)):
+                selected_codes = sorted({_event_to_code(ev) for ev in sed_selector})
+            elif sed_selector is None:
+                selected_codes = sorted({int(self.pixel_table[key].event_type) for key in self.pixel_table.keys()})
+            else:
+                selected_codes = [_event_to_code(sed_selector)]
+
+            if by_event_type:
+                sed_sets = [
+                    (_event_label(ev), self.get_sed(source.name, event_type=ev, update=True))
+                    for ev in selected_codes
+                ]
+            else:
+                sed_sets = [
+                    (kwargs.pop('points_label', 'Band fit values'),
+                     self.get_sed(source.name, event_type=sed_selector, update=update))
+                ]
+
+            size = kwargs.pop('size', (6, 4))
+            ax = kwargs.pop('ax', None)
+            if ax is None:
+                _, ax = plt.subplots(figsize=size)
+
+            source.sed_plot(
+                ax=ax,
+                label=kwargs.pop('model_label', 'Model after fit'),
+                emin=kwargs.pop('emin', 100),
+                emax=kwargs.pop('emax', 1e5),
+                npts=kwargs.pop('npts', 50),
+                title=kwargs.pop('title', source.name),
+            )
+
+            for points_label, sedrec in sed_sets:
+                if len(sedrec) == 0:
+                    continue
+                ectr = np.sqrt(sedrec.elow * sedrec.ehigh)
+                y = ectr**2 * sedrec.flux
+                ylo = ectr**2 * sedrec.lflux
+                yhi = ectr**2 * sedrec.uflux
+                yerr = np.vstack([
+                    np.clip(y - ylo, 0.0, None),
+                    np.clip(yhi - y, 0.0, None),
+                ])
+                xerr = np.vstack([
+                    ectr - sedrec.elow,
+                    sedrec.ehigh - ectr,
+                ])
+                good = np.isfinite(y) & np.isfinite(yerr).all(axis=0) & (y > 0)
+                if np.any(good):
+                    ax.errorbar(
+                        ectr[good], y[good], yerr=yerr[:, good], xerr=xerr[:, good],
+                        fmt='o', ms=4, capsize=2,
+                        label=points_label
+                    )
+
+            xlim = kwargs.pop('xlim', (1e2, 1e5))
+            ylim = kwargs.pop('ylim', (1e-8, 1e-2))
+            if xlim is not None:
+                ax.set(xlim=xlim)
+            if ylim is not None:
+                ax.set(ylim=ylim)
+            ax.legend(loc=kwargs.pop('legend_loc', 'best'))
+            return ax.figure
+
         if source_name=='all':
             #flag to do them all
+            if by_event_type:
+                raise ValueError('by_event_type is only supported for single-source plot_sed calls')
+            if sed_selector is not None:
+                kwargs.update(event_type=sed_selector)
             sedfuns.makesed_all(self, **kwargs)
             return
         source = self.sources.find_source(source_name)
@@ -354,9 +662,15 @@ class ROI(views.LikelihoodViews):
         # need to thaw it temporarily
         not_free= not np.any(source.model.free)
         if not_free: self.thaw('Norm', source.name)
-        xlim, ylim = [kwargs.pop(x, None) for x in ('xlim','ylim')]
+        xlim = kwargs.pop('xlim', (1e2, 1e5))
+        ylim = kwargs.pop('ylim', (1e-8, 1e-2))
         showts = kwargs.pop('showts', True)
-        if kwargs.pop('update', False) or not hasattr(self,'sedrec') or self.sedrec is None:
+        update = kwargs.pop('update', False)
+        if by_event_type:
+            raise ValueError('by_event_type requires the pixel_table backend')
+        if sed_selector is not None:
+            self.get_sed(source.name, event_type=sed_selector, update=True)
+        elif update or not hasattr(self,'sedrec') or self.sedrec is None:
             self.get_sed(update=True)
         annotation =(0.04,0.88, 'TS=%.0f' % source.ts ) if showts and hasattr(source, 'ts') else None 
         kwargs.update(galmap=self.roi_dir, annotate=annotation)
@@ -435,6 +749,7 @@ class ROI(views.LikelihoodViews):
     
     @tools.decorate_with(printing.print_summary)
     def print_summary(self, **kwargs):
+        """Print a compact summary table while preserving source selection."""
         selected_source= self.sources.selected_source
         t = printing.print_summary(self, **kwargs)
         self.sources.selected_source=selected_source
@@ -535,8 +850,17 @@ class ROI(views.LikelihoodViews):
             fit_one(self.get_source(source_name))
         
     def correlation_info(self, corr_min=0.2, **fit_kw):
-        """
-        Return a list of pairs of correlated sources, assuming all parameters have been fit
+        """Return pairs of sources with correlated normalization parameters.
+
+        Parameters
+        ----------
+        corr_min : float
+            Minimum absolute correlation threshold for reporting.
+
+        Returns
+        -------
+        list[list]
+            Entries have the form ``[source_a, source_b, -int(100*corr)]``.
         """
         
         pnames = self.sources.parameter_names
@@ -558,6 +882,12 @@ class ROI(views.LikelihoodViews):
         return corr_src
 
     def refit_as_pulsar(self, source_name=None, update=True):
+        """Refit a source using a pulsar-like cutoff spectral model.
+
+        The method swaps the current model to ``PLSuperExpCutoff``, performs
+        staged fitting, optionally updates the source in place, and reports the
+        TS change.
+        """
         s = self.get_source(source_name)
         sname = s.name
        
@@ -581,31 +911,31 @@ class ROI(views.LikelihoodViews):
         else:
             print('Updated model')
 
-class MultiROI(ROI):
-    """ROI subclass that will perform a fixed analysis on multiple ROIs
-    Intended for subclasses
-    """
+# class MultiROI(ROI):
+#     """ROI subclass that will perform a fixed analysis on multiple ROIs
+#     Intended for subclasses
+#     """
     
-    def __init__(self, config_dir,  quiet=False, postpone=False, **kwargs):
-        """
-        """
-        self.config = configuration.Configuration(config_dir, quiet=quiet, postpone=postpone,
-             **self.config_kw)
-        self.ecat = extended.ExtendedCatalog(self.config.extended)
+#     def __init__(self, config_dir,  quiet=False, postpone=False, **kwargs):
+#         """
+#         """
+#         self.config = configuration.Configuration(config_dir, quiet=quiet, postpone=postpone,
+#              **self.config_kw)
+#         self.ecat = extended.ExtendedCatalog(self.config.extended)
 
-    def setup_roi(self, roi_spec, **load_kw):
-        try:
-            roi_index = self.roi_index(roi_spec)
-        except Exception as msg:
-            print('ROI specification "{}" unrecognized'.format(roi_spec))
-            return
-        roi_bands = bands.BandSet(self.config, roi_index)
-        roi_bands.load_data()
-        if self.config.modeldir is not None:
-            roi_sources = from_healpix.ROImodelFromHealpix(self.config, roi_index, 
-                ecat=self.ecat, **load_kw)
-        # else:
-        #     roi_sources = from_xml.ROImodelFromXML(self.config, roi_index, ecat=self.ecat)
+#     def setup_roi(self, roi_spec, **load_kw):
+#         try:
+#             roi_index = self.roi_index(roi_spec)
+#         except Exception as msg:
+#             print('ROI specification "{}" unrecognized'.format(roi_spec))
+#             return
+#         roi_bands = bands.BandSet(self.config, roi_index)
+#         roi_bands.load_data()
+#         if self.config.modeldir is not None:
+#             roi_sources = from_healpix.ROImodelFromHealpix(self.config, roi_index, 
+#                 ecat=self.ecat, **load_kw)
+#         # else:
+#         #     roi_sources = from_xml.ROImodelFromXML(self.config, roi_index, ecat=self.ecat)
             
-        self.name = 'HP12_%04d' % roi_index
-        self.setup( roi_bands, roi_sources)
+#         self.name = 'HP12_%04d' % roi_index
+#         self.setup( roi_bands, roi_sources)

@@ -20,6 +20,7 @@ class FermiFit(views.LikelihoodViews):
     def __init__(self, pixel_table):
         if pixel_table.source_model is None:
             raise ValueError('FermiFit requires a PixelTable with a source_model attached')
+        super().__init__(pixel_table)
         self.pixel_table = pixel_table
         self.fit_info: dict = {}
 
@@ -70,6 +71,322 @@ class FermiFit(views.LikelihoodViews):
                 source.sedrec = sf.sed_rec(event_type=event_type, tol=tol)
         
         return source.sedrec
+
+    def get_sed_poisson_table(self, source_name=None, event_type=None, tol=0.2):
+        """Return an SED table with one Poisson object per energy bin.
+
+        Parameters
+        ----------
+        source_name : str, Source, or None
+            Source selector forwarded to ``SourceModel.find_source``.
+        event_type : None, int, or str
+            Event-type selection forwarded to ``sedfuns.sed_poisson_table``.
+        tol : float
+            Fit-quality tolerance forwarded to ``PoissonFitter``.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Per-band SED table containing a ``poiss`` column with
+            ``like3.loglikelihood.Poisson`` entries.
+        """
+        source = self.source_model.find_source(source_name)
+        pkg = __package__ if __package__ else 'like3'
+        sedfuns = importlib.import_module(f'{pkg}.sedfuns')
+        return sedfuns.sed_poisson_table(
+            self,
+            source_name=source.name,
+            event_type=event_type,
+            tol=tol,
+        )
+
+    def plot_sed_with_band_points(
+        self,
+        source,
+        *,
+        ax=None,
+        update=False,
+        event_type=None,
+        tol=0.2,
+        emin=100,
+        emax=1e5,
+        xlim=None,
+        npts=100,
+        model_label=None,
+        points_label='Per-band SED',
+        title=None,
+        show_upper_limits=True,
+    ):
+        """Plot source SED model with per-band errorbar points.
+
+        Parameters
+        ----------
+        source : Source
+            Source object from the attached ``SourceModel``.
+        ax : matplotlib.axes.Axes or None, optional
+            Axes to draw into. A new figure is created when ``None``.
+        update : bool, optional
+            Force regeneration of ``source.sedrec``. Default ``False``.
+        event_type : None, int, or str, optional
+            Event-type selection forwarded to :meth:`get_sed`.
+        tol : float, optional
+            Poisson-fit tolerance forwarded to :meth:`get_sed`.
+        emin, emax : float, optional
+            Model-curve plotting range in MeV.
+        xlim : tuple[float, float] or None, optional
+            X-axis limits in MeV. Defaults to ``(emin, emax)``.
+        npts : int, optional
+            Number of model-curve points.
+        model_label : str or None, optional
+            Legend label for the model curve. Defaults to source name.
+        points_label : str, optional
+            Legend label for the binned points.
+        title : str or None, optional
+            Plot title. Defaults to source name.
+        show_upper_limits : bool, optional
+            If True, plot upper-limit markers for bins with ``flux <= 0``.
+
+        Returns
+        -------
+        matplotlib.axes.Axes
+            Axes with model SED and per-band points.
+        """
+        import matplotlib.pyplot as plt
+
+        src = self.source_model.find_source(source)
+        sed_table = self.get_sed_poisson_table(
+            source_name=src.name,
+            event_type=event_type,
+            tol=tol,
+        )
+        if update or not hasattr(src, 'sed_poisson_table'):
+            setattr(src, 'sed_poisson_table', sed_table)
+
+        if sed_table is None:
+            raise ValueError(f'No SED table available for source {src.name}')
+
+        fields = set(getattr(sed_table, 'columns', ()))
+        needed = {'elow', 'ehigh', 'flux', 'lflux', 'uflux'}
+        missing = needed - fields
+        if missing:
+            raise ValueError(f'sed table missing required fields: {sorted(missing)}')
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=(10, 6))
+
+        if xlim is None:
+            xlim = (emin, emax)
+
+        src.sed_plot(
+            ax=ax,
+            title=src.name.strip() if title is None else title,
+            label=src.name.strip() if model_label is None else model_label,
+            emin=emin,
+            emax=emax,
+            npts=npts,
+        )
+
+        elow = np.asarray(sed_table['elow'], dtype=float)
+        ehigh = np.asarray(sed_table['ehigh'], dtype=float)
+        flux = np.asarray(sed_table['flux'], dtype=float)
+        lflux = np.asarray(sed_table['lflux'], dtype=float)
+        uflux = np.asarray(sed_table['uflux'], dtype=float)
+
+        ecent = np.sqrt(elow * ehigh)
+        xerr = np.vstack([
+            np.clip(ecent - elow, 0, np.inf),
+            np.clip(ehigh - ecent, 0, np.inf),
+        ])
+        # sed_table fluxes are energy-flux values from EnergyFluxView (eV units).
+        # Convert to MeV units to match the model curve axis label.
+        y = flux * 1e-6
+        ylo = lflux * 1e-6
+        yhi = uflux * 1e-6
+
+        det_mask = np.isfinite(y) & np.isfinite(ylo) & np.isfinite(yhi) & (flux > 0)
+        if np.any(det_mask):
+            yerr = np.vstack([
+                np.clip(y[det_mask] - ylo[det_mask], 0, np.inf),
+                np.clip(yhi[det_mask] - y[det_mask], 0, np.inf),
+            ])
+            ax.errorbar(
+                ecent[det_mask],
+                y[det_mask],
+                xerr=xerr[:, det_mask],
+                yerr=yerr,
+                fmt='o',
+                ms=5,
+                capsize=2,
+                lw=1,
+                color='tab:orange',
+                label=points_label,
+            )
+
+        if show_upper_limits:
+            ul_mask = np.isfinite(uflux) & (flux <= 0)
+            if np.any(ul_mask):
+                y_ul = uflux[ul_mask] * 1e-6
+                yerr_ul = 0.35 * np.clip(y_ul, 0, np.inf)
+                ax.errorbar(
+                    ecent[ul_mask],
+                    y_ul,
+                    xerr=xerr[:, ul_mask],
+                    yerr=yerr_ul,
+                    uplims=True,
+                    fmt='v',
+                    ms=4,
+                    lw=1,
+                    color='tab:red',
+                    label='95% UL',
+                )
+
+        ax.set_xlim(xlim)
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.grid(True, which='both', alpha=0.25)
+        ax.legend()
+        return ax
+
+    def sed_poisson_delta_decomposition(
+        self,
+        source,
+        *,
+        alpha=1.05,
+        sed_table_attr='sed_poisson_table',
+        update=False,
+        event_type=None,
+        tol=0.2,
+    ):
+        """Compare per-band Poisson delta sum to direct all-band delta.
+
+        This evaluates each SED-bin Poisson object at two flux points:
+        the model-predicted reference flux and a perturbed flux scaled by
+        ``alpha``. It then compares the sum of per-bin Poisson deltas to the
+        direct all-band log-likelihood delta under the same normalization shift.
+
+        Parameters
+        ----------
+        source : Source
+            Source object from the attached ``SourceModel``.
+            The source is expected to carry a SED Poisson table on
+            ``getattr(source, sed_table_attr)``. If not present (or when
+            ``update=True``), one is generated and attached.
+        alpha : float, optional
+            Multiplicative factor applied to the source ``Norm`` parameter for
+            the perturbed state. Default is ``1.05``.
+        sed_table_attr : str, optional
+            Attribute name on ``source`` used to store/read the SED Poisson
+            table. Default is ``'sed_poisson_table'``.
+        update : bool, optional
+            Force regeneration of the source SED Poisson table. Default ``False``.
+        event_type : int, str, or None, optional
+            Event-type selection passed to ``get_sed_poisson_table`` when
+            generating the table.
+        tol : float, optional
+            Poisson-fit tolerance passed when generating the table.
+
+        Returns
+        -------
+        dict
+            Dictionary containing:
+            - ``per_band``: DataFrame with per-bin fluxes and Poisson deltas
+            - ``sum_poisson_delta``: sum of per-bin Poisson deltas
+            - ``all_band_delta``: direct all-band delta
+            - ``difference``: ``sum_poisson_delta - all_band_delta``
+            - ``alpha``: the input perturbation scale
+            - ``source_name``: source name used
+        """
+        import pandas as pd
+
+        if not hasattr(source, 'name') or not hasattr(source, 'model'):
+            raise TypeError('source must be a Source-like object with name and model attributes')
+
+        source_name = source.name
+        if update or not hasattr(source, sed_table_attr) or getattr(source, sed_table_attr) is None:
+            sed_table = self.get_sed_poisson_table(
+                source_name=source_name,
+                event_type=event_type,
+                tol=tol,
+            )
+            setattr(source, sed_table_attr, sed_table)
+        else:
+            sed_table = getattr(source, sed_table_attr)
+
+        if not isinstance(sed_table, pd.DataFrame):
+            raise TypeError(f'source.{sed_table_attr} must be a pandas.DataFrame')
+        needed = {'elow', 'ehigh', 'poiss'}
+        missing = needed - set(sed_table.columns)
+        if missing:
+            raise ValueError(
+                f'source.{sed_table_attr} missing required columns: {sorted(missing)}'
+            )
+
+        valid = sed_table[sed_table.poiss.notna()].copy()
+        if len(valid) == 0:
+            raise ValueError('No valid Poisson entries found in source SED table')
+
+        pt = self.pixel_table
+        src = self.source_model.find_source(source_name)
+        norm0 = float(src.model.getp('Norm'))
+        saved_keys = pt._selected
+        efv = self.energy_flux_view(source_name, bound=-20)
+        rows = []
+
+        try:
+            for energy_idx, row in valid.sort_index().iterrows():
+                elow, ehigh = float(row.elow), float(row.ehigh)
+                chosen = [
+                    b for b in pt.values()
+                    if float(b.e0) >= elow and float(b.e1) <= ehigh
+                ]
+                if len(chosen) == 0:
+                    continue
+
+                pt.select(keys=[b.key for b in chosen])
+                efv.set_energy(np.sqrt(elow * ehigh))
+
+                flux_ref = float(efv.eflux)
+                flux_test = alpha * flux_ref
+                dll_poiss = float(row.poiss(flux_test) - row.poiss(flux_ref))
+
+                rows.append(dict(
+                    energy=energy_idx,
+                    elow=elow,
+                    ehigh=ehigh,
+                    flux_ref=flux_ref,
+                    flux_test=flux_test,
+                    dll_poiss=dll_poiss,
+                ))
+
+            per_band = pd.DataFrame(rows)
+            sum_poisson_delta = float(per_band.dll_poiss.sum()) if len(per_band) else 0.0
+
+            # Direct all-band delta for the same normalization perturbation.
+            pt.select(keys=saved_keys)
+            src.model.setp('Norm', norm0)
+            src.changed = True
+            ll_ref_all = float(self.loglike())
+
+            src.model.setp('Norm', alpha * norm0)
+            src.changed = True
+            ll_test_all = float(self.loglike())
+
+            all_band_delta = ll_test_all - ll_ref_all
+        finally:
+            src.model.setp('Norm', norm0)
+            src.changed = True
+            pt.select(keys=saved_keys)
+            if hasattr(efv, 'restore'):
+                efv.restore()
+
+        return dict(
+            per_band=per_band,
+            sum_poisson_delta=sum_poisson_delta,
+            all_band_delta=float(all_band_delta),
+            difference=float(sum_poisson_delta - all_band_delta),
+            alpha=float(alpha),
+            source_name=source_name,
+        )
 
 
     # ------------------------------------------------------------------

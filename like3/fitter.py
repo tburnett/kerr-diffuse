@@ -451,8 +451,6 @@ class Minimizer(object):
         try:
             cov = np.linalg.inv(hess)
         except:
-            print('Error inverting hessian.')
-            #cov = np.zeros([nparams,nparams])
             raise Exception('Error inverting hessian')
         if full_output:
             return cov,hess,step_size,iters,min_flags,max_flags

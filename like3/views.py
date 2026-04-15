@@ -533,7 +533,8 @@ class FitterMixin(object):
             print(ret[2])
         f = ret 
         if estimate_errors:
-            self.covariance = cov = np.linalg.inv(self.hessian(f[0])) # was .I
+            # maximize(logL) by minimizing(-logL): cov = inv(-d2logL/dp2)
+            self.covariance = cov = np.linalg.inv(-self.hessian(f[0]))
             diag = np.array(cov.diagonal()).flatten()
             bad = diag<0
             if np.any(bad):
@@ -718,9 +719,9 @@ class FitterView(FitPlotMixin, FitterMixin, FitterSummaryMixin, WithMixin):
         return self.blike.log_like(summed=summed)
 
     def gradient(self,pars=None):
-        """Return gradient of log-likelihood with respect to free parameters."""
+        """Return gradient of objective (-log-likelihood) for free parameters."""
         if pars is not None: self.set_parameters(pars)
-        return self.blike.gradient()
+        return -self.blike.gradient()
     def hessian(self, pars=None):
         """Return Hessian matrix, computing at pars if provided."""
         if pars is not None: self.set_parameters(pars)
@@ -759,7 +760,15 @@ class SubsetFitterView(parameterset.ParSubSet, FitPlotMixin, FitterMixin, Fitter
             Parameter names or indices to exclude.
         """
         self.blike = blike
-        super().__init__(blike.sources, select, exclude)
+        selected = []
+        if select is not None:
+            selected.append(select)
+        super().__init__(blike.sources, *selected)
+        if exclude is not None:
+            excluded = self.select_parameters(exclude)
+            mask = self.mask.copy()
+            mask[list(excluded)] = False
+            self.set_mask(mask)
         self.initial_parameters = self.parameters[:]
         self.initial_likelihood = self.log_like()
         self.calls=0
@@ -1086,6 +1095,74 @@ class LikelihoodViews(object):
         if select is None:
             return FitterView(self, **kwargs)
         return SubsetFitterView(self, select, **kwargs)
+
+    def log_like(self, summed=True):
+        """Return total log-likelihood for current parameter state.
+
+        For PixelTable-backed instances this delegates to ``pixel_table.loglike``.
+        Legacy containers are supported if they expose ``log_like`` or ``loglike``.
+        """
+        if hasattr(self, 'pixel_table') and hasattr(self.pixel_table, 'loglike'):
+            return self.pixel_table.loglike()
+        if hasattr(self.bands, 'log_like'):
+            return self.bands.log_like(summed=summed)
+        if hasattr(self.bands, 'loglike'):
+            return self.bands.loglike()
+        raise AttributeError('No log-likelihood provider found for LikelihoodViews')
+
+    def update(self):
+        """Refresh cached likelihood state after parameter changes."""
+        if hasattr(self.bands, 'update'):
+            self.bands.update()
+
+    def initialize(self, *args, **kwargs):
+        """Reinitialize band-likelihood internals when available."""
+        if hasattr(self.bands, 'initialize'):
+            return self.bands.initialize(*args, **kwargs)
+
+    def gradient(self, pars=None):
+        """Numerical gradient of total log-likelihood for current free parameters."""
+        import numdifftools
+        if self.parameterset is None:
+            raise AttributeError('No parameterset available to compute gradient')
+        pset = self.parameterset
+        saved = pset.get_parameters().copy()
+        try:
+            if pars is not None:
+                pset.set_parameters(pars)
+            x0 = pset.get_parameters().copy()
+
+            def f(x):
+                pset.set_parameters(x)
+                self.update()
+                return self.log_like()
+
+            return np.array(numdifftools.Gradient(f)(x0), float)
+        finally:
+            pset.set_parameters(saved)
+            self.update()
+
+    def hessian(self, pars=None):
+        """Numerical Hessian of total log-likelihood for current free parameters."""
+        import numdifftools
+        if self.parameterset is None:
+            raise AttributeError('No parameterset available to compute hessian')
+        pset = self.parameterset
+        saved = pset.get_parameters().copy()
+        try:
+            if pars is not None:
+                pset.set_parameters(pars)
+            x0 = pset.get_parameters().copy()
+
+            def f(x):
+                pset.set_parameters(x)
+                self.update()
+                return self.log_like()
+
+            return np.array(numdifftools.Hessian(f)(x0), float)
+        finally:
+            pset.set_parameters(saved)
+            self.update()
 
     def energy_flux_view(self, source_name, energy=None, **kw):
         """Return a functor expressing log-likelihood as a function of energy flux.
