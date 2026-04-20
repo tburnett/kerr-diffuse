@@ -203,7 +203,7 @@ class Source(object):
     def isglobal(self):
         return self.skydir is None
 
-    def sed_plot(self, ax=None, title=None, label=None, emin=100, emax=1e5, npts=50):
+    def sed_plot(self, ax=None, title=None, label=None, emin=100, emax=1e5, npts=50, ylim=(0.1, None), butterfly=True):
         """Plot the SED (E² dN/dE vs E) for this source.
 
         Parameters
@@ -218,6 +218,10 @@ class Source(object):
             Energy range in MeV.
         npts : int
             Number of logarithmically-spaced evaluation points.
+        ylim : tuple[float | None, float | None]
+            Y-axis limits in eV cm^-2 s^-1. Defaults to ``(0.1, None)``.
+        butterfly : bool
+            If True, show 1-sigma limits as a shaded band ("butterfly").
 
         Returns
         -------
@@ -227,25 +231,34 @@ class Source(object):
 
         model = self.model
         energies = np.logspace(np.log10(emin), np.log10(emax), npts)  # MeV
-        dnde = model(energies)                                          # ph cm⁻² s⁻¹ MeV⁻¹
-        e2dnde = energies**2 * dnde                                     # MeV cm⁻² s⁻¹
+        dnde = model(energies)                                          # ph cm^-2 s^-1 MeV^-1
+        e2dnde_ev = energies**2 * dnde * 1e6                            # eV cm^-2 s^-1
 
         if ax is None:
             _, ax = plt.subplots(figsize=(6, 4))
 
-        ax.loglog(energies, e2dnde, label=self.name.strip() if label is None else label)
+        ax.loglog(energies, e2dnde_ev, label=self.name.strip() if label is None else label)
 
-        if model.has_errors():
+        # Mark e0 as a large dot on the curve
+        if hasattr(model, 'e0'):
+            e0 = model.e0
+            # Only plot if e0 is within the plotted energy range
+            if emin <= e0 <= emax:
+                y0 = (e0**2) * model(e0) * 1e6
+                ax.plot([e0], [y0], 'o', color=ax.lines[-1].get_color(), markersize=12, label=None, zorder=10)
+
+        if butterfly and model.has_errors():
             g = model.external_gradient(energies)   # shape (npar, npts)
             cov = model.get_cov_matrix()             # shape (npar, npar)
             var_dnde = np.sum((cov @ g) * g, axis=0)
             var_dnde = np.clip(var_dnde, 0, None)
-            sigma_e2dnde = energies**2 * np.sqrt(var_dnde)
-            ax.fill_between(energies, e2dnde - sigma_e2dnde,
-                            e2dnde + sigma_e2dnde, alpha=0.3)
+            sigma_e2dnde_ev = energies**2 * np.sqrt(var_dnde) * 1e6
+            ax.fill_between(energies, e2dnde_ev - sigma_e2dnde_ev,
+                            e2dnde_ev + sigma_e2dnde_ev, alpha=0.3, label=r'1$\sigma$ butterfly')
 
         ax.set_xlabel('Energy (MeV)')
-        ax.set_ylabel(r'$E^2\,dN/dE\ [\mathrm{MeV\,cm^{-2}\,s^{-1}}]$')
+        ax.set_ylabel(r'$E^2\,dN/dE\ [\mathrm{eV\,cm^{-2}\,s^{-1}}]$')
+        ax.set_ylim(*ylim)
         ax.set_title(self.name.strip() if title is None else title)
         ax.legend()
         return ax

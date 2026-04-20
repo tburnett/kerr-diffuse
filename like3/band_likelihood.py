@@ -31,8 +31,8 @@ class BandModel:
         self.data = data_counts[mask].astype(float)
 
         # Diffuse contribution aligned to the same restricted pixel set
-        if band.diffuse is not None:
-            self._diffuse = band.diffuse[mask]
+        if band.diffuse_counts is not None:
+            self._diffuse = band.diffuse_counts[mask]
         else:
             self._diffuse = 0.0
 

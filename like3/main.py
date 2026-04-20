@@ -1,11 +1,19 @@
 """
 FermiFit: fitting interface for a PixelTable + SourceModel pair.
 """
-from contextlib import contextmanager
+import argparse
+from contextlib import contextmanager, redirect_stdout
 import importlib
+import io
+from pathlib import Path
+import sys
 
+import matplotlib.pyplot as plt
+plt.style.use('dark_background')
 import numpy as np
-from . import views
+from astropy.coordinates import SkyCoord
+import pandas as pd
+from like3 import views
 
 
 class FermiFit(views.LikelihoodViews):
@@ -17,11 +25,12 @@ class FermiFit(views.LikelihoodViews):
         A loaded pixel table with a ``source_model`` attribute set.
     """
 
-    def __init__(self, pixel_table):
+    def __init__(self, pixel_table, verbose=False):
         if pixel_table.source_model is None:
             raise ValueError('FermiFit requires a PixelTable with a source_model attached')
-        super().__init__(pixel_table)
+        super().__init__(pixel_table, verbose=verbose)
         self.pixel_table = pixel_table
+        self.fermi_catalog = getattr(pixel_table.source_model, 'fermi_catalog', None)
         self.fit_info: dict = {}
 
     # def __getattr__(self, name):
@@ -100,10 +109,38 @@ class FermiFit(views.LikelihoodViews):
             tol=tol,
         )
 
+    def selected_source_energy_flux_view(self, energy=None, **kw):
+        """Return an energy-flux likelihood view for the selected source.
+
+        Parameters
+        ----------
+        energy : float or None, optional
+            Evaluation energy in MeV. If ``None``, the source model reference
+            energy is used.
+        **kw
+            Forwarded to :meth:`energy_flux_view`.
+
+        Returns
+        -------
+        like3.views.EnergyFluxView
+            Callable object that maps energy flux to negative log-likelihood.
+
+        Raises
+        ------
+        ValueError
+            If no source is currently selected.
+        """
+        src = self.source_model.selected_source
+        if src is None:
+            raise ValueError('No source is selected')
+        return self.energy_flux_view(src.name, energy=energy, **kw)
+
     def plot_sed_with_band_points(
         self,
-        source,
+        source=None,
         *,
+        sed_table=None,
+        set_kwargs=None,
         ax=None,
         update=False,
         event_type=None,
@@ -111,6 +148,7 @@ class FermiFit(views.LikelihoodViews):
         emin=100,
         emax=1e5,
         xlim=None,
+        ylim=(0.1, None),
         npts=100,
         model_label=None,
         points_label='Per-band SED',
@@ -121,12 +159,22 @@ class FermiFit(views.LikelihoodViews):
 
         Parameters
         ----------
-        source : Source
-            Source object from the attached ``SourceModel``.
+        source : Source, str, or None, optional
+            Source selector forwarded to ``SourceModel.find_source``.
+            When ``None`` (default), the currently selected source is used.
+        sed_table : pandas.DataFrame or None, optional
+            Precomputed SED Poisson table containing ``elow``, ``ehigh``,
+            ``flux``, ``lflux``, and ``uflux`` columns. When provided,
+            this table is used directly and no call to
+            :meth:`get_sed_poisson_table` is made.
+        set_kwargs : dict or None, optional
+            Keyword arguments forwarded to ``Axes.set``. These values override
+            the default axis settings used by this method.
         ax : matplotlib.axes.Axes or None, optional
             Axes to draw into. A new figure is created when ``None``.
         update : bool, optional
-            Force regeneration of ``source.sedrec``. Default ``False``.
+            Force regeneration of the source SED Poisson table when
+            ``sed_table`` is not provided. Default ``False``.
         event_type : None, int, or str, optional
             Event-type selection forwarded to :meth:`get_sed`.
         tol : float, optional
@@ -154,13 +202,16 @@ class FermiFit(views.LikelihoodViews):
         import matplotlib.pyplot as plt
 
         src = self.source_model.find_source(source)
-        sed_table = self.get_sed_poisson_table(
-            source_name=src.name,
-            event_type=event_type,
-            tol=tol,
-        )
-        if update or not hasattr(src, 'sed_poisson_table'):
-            setattr(src, 'sed_poisson_table', sed_table)
+        if sed_table is None:
+            if not update and hasattr(src, 'sedrec'):
+                sed_table = src.sedrec
+            else:
+                sed_table = self.get_sed_poisson_table(
+                    source_name=src.name,
+                    event_type=event_type,
+                    tol=tol,
+                )
+                src.sedrec = sed_table
 
         if sed_table is None:
             raise ValueError(f'No SED table available for source {src.name}')
@@ -177,14 +228,29 @@ class FermiFit(views.LikelihoodViews):
         if xlim is None:
             xlim = (emin, emax)
 
-        src.sed_plot(
-            ax=ax,
-            title=src.name.strip() if title is None else title,
+        # Plot model SED directly in eV cm^-2 s^-1 units.
+        model = src.model
+        energies = np.logspace(np.log10(emin), np.log10(emax), npts)
+        dnde = model(energies)  # ph cm^-2 s^-1 MeV^-1
+        e2dnde_ev = energies**2 * dnde * 1e6
+        ax.loglog(
+            energies,
+            e2dnde_ev,
             label=src.name.strip() if model_label is None else model_label,
-            emin=emin,
-            emax=emax,
-            npts=npts,
         )
+
+        if model.has_errors():
+            g = model.external_gradient(energies)
+            cov = model.get_cov_matrix()
+            var_dnde = np.sum((cov @ g) * g, axis=0)
+            var_dnde = np.clip(var_dnde, 0, None)
+            sigma_e2dnde_ev = energies**2 * np.sqrt(var_dnde) * 1e6
+            ax.fill_between(
+                energies,
+                e2dnde_ev - sigma_e2dnde_ev,
+                e2dnde_ev + sigma_e2dnde_ev,
+                alpha=0.3,
+            )
 
         elow = np.asarray(sed_table['elow'], dtype=float)
         ehigh = np.asarray(sed_table['ehigh'], dtype=float)
@@ -198,10 +264,9 @@ class FermiFit(views.LikelihoodViews):
             np.clip(ehigh - ecent, 0, np.inf),
         ])
         # sed_table fluxes are energy-flux values from EnergyFluxView (eV units).
-        # Convert to MeV units to match the model curve axis label.
-        y = flux * 1e-6
-        ylo = lflux * 1e-6
-        yhi = uflux * 1e-6
+        y = flux
+        ylo = lflux
+        yhi = uflux
 
         det_mask = np.isfinite(y) & np.isfinite(ylo) & np.isfinite(yhi) & (flux > 0)
         if np.any(det_mask):
@@ -225,7 +290,7 @@ class FermiFit(views.LikelihoodViews):
         if show_upper_limits:
             ul_mask = np.isfinite(uflux) & (flux <= 0)
             if np.any(ul_mask):
-                y_ul = uflux[ul_mask] * 1e-6
+                y_ul = uflux[ul_mask]
                 yerr_ul = 0.35 * np.clip(y_ul, 0, np.inf)
                 ax.errorbar(
                     ecent[ul_mask],
@@ -240,9 +305,19 @@ class FermiFit(views.LikelihoodViews):
                     label='95% UL',
                 )
 
-        ax.set_xlim(xlim)
-        ax.set_xscale('log')
-        ax.set_yscale('log')
+        defaults = dict(
+            xlabel='Energy (MeV)',
+            ylabel=r'$E^2\,dN/dE\ [\mathrm{eV\,cm^{-2}\,s^{-1}}]$',
+            title=src.name.strip() if title is None else title,
+            xlim=xlim,
+            ylim=ylim,
+            xscale='log',
+            yscale='log',
+        )
+        if set_kwargs is not None:
+            defaults.update(set_kwargs)
+        ax.set(**defaults)
+
         ax.grid(True, which='both', alpha=0.25)
         ax.legend()
         return ax
@@ -252,6 +327,7 @@ class FermiFit(views.LikelihoodViews):
         source,
         *,
         alpha=1.05,
+        sed_table=None,
         sed_table_attr='sed_poisson_table',
         update=False,
         event_type=None,
@@ -274,11 +350,15 @@ class FermiFit(views.LikelihoodViews):
         alpha : float, optional
             Multiplicative factor applied to the source ``Norm`` parameter for
             the perturbed state. Default is ``1.05``.
+        sed_table : pandas.DataFrame or None, optional
+            Precomputed SED Poisson table. When provided, this table is used
+            directly and no call to ``get_sed_poisson_table`` is made.
         sed_table_attr : str, optional
             Attribute name on ``source`` used to store/read the SED Poisson
             table. Default is ``'sed_poisson_table'``.
         update : bool, optional
-            Force regeneration of the source SED Poisson table. Default ``False``.
+            Force regeneration of the source SED Poisson table when
+            ``sed_table`` is not provided. Default ``False``.
         event_type : int, str, or None, optional
             Event-type selection passed to ``get_sed_poisson_table`` when
             generating the table.
@@ -302,15 +382,16 @@ class FermiFit(views.LikelihoodViews):
             raise TypeError('source must be a Source-like object with name and model attributes')
 
         source_name = source.name
-        if update or not hasattr(source, sed_table_attr) or getattr(source, sed_table_attr) is None:
-            sed_table = self.get_sed_poisson_table(
-                source_name=source_name,
-                event_type=event_type,
-                tol=tol,
-            )
-            setattr(source, sed_table_attr, sed_table)
-        else:
-            sed_table = getattr(source, sed_table_attr)
+        if sed_table is None:
+            if update or not hasattr(source, sed_table_attr) or getattr(source, sed_table_attr) is None:
+                sed_table = self.get_sed_poisson_table(
+                    source_name=source_name,
+                    event_type=event_type,
+                    tol=tol,
+                )
+                setattr(source, sed_table_attr, sed_table)
+            else:
+                sed_table = getattr(source, sed_table_attr)
 
         if not isinstance(sed_table, pd.DataFrame):
             raise TypeError(f'source.{sed_table_attr} must be a pandas.DataFrame')
@@ -496,6 +577,40 @@ class FermiFit(views.LikelihoodViews):
         pt = self.pixel_table
         return float(sum(band.loglike(skydir=skydir) for band in pt._iter_bands()))
 
+    def gradient(self, pars=None):
+        """Analytic gradient of the total log-likelihood for free parameters."""
+        if pars is not None:
+            self.parameters.set_parameters(pars)
+            self.update()
+
+        n_all = len(self.parameters.parameter_names)
+        full_grad = np.zeros(n_all, dtype=float)
+
+        for band in self.pixel_table._iter_bands():
+            counts = band.coverage['photons'].to_numpy() if band.coverage is not None else band.photons
+            model, dm_dtheta = band.pixel_counts_and_gradient()
+            model = np.clip(model, 1e-30, None)
+            full_grad += ((counts / model - 1.0)[:, None] * dm_dtheta).sum(axis=0)
+
+        return full_grad
+
+    def hessian(self, pars=None):
+        """Fisher-approximation Hessian of the total log-likelihood."""
+        if pars is not None:
+            self.parameters.set_parameters(pars)
+            self.update()
+
+        n_all = len(self.parameters.parameter_names)
+        fisher = np.zeros((n_all, n_all), dtype=float)
+
+        for band in self.pixel_table._iter_bands():
+            model, dm_dtheta = band.pixel_counts_and_gradient()
+            model = np.clip(model, 1e-30, None)
+            g = dm_dtheta.T
+            fisher += (g / model) @ g.T
+
+        return -fisher
+
     # ------------------------------------------------------------------
     # Simulation
     # ------------------------------------------------------------------
@@ -518,175 +633,238 @@ class FermiFit(views.LikelihoodViews):
     # Main fit
     # ------------------------------------------------------------------
 
-    def fit(self, select=None, *, method='l-bfgs-b', quiet=True, use_gradient=True, **kwargs):
-        """Optimize the free spectral parameters of the source model.
+    def fit(self, select=None, exclude=None, summarize=True, setpars=None, **kwargs):
+        """Perform a legacy-style fit using the shared fitter-view workflow.
 
         Parameters
         ----------
-        select : str | int | list[str | int] or None, optional
-            Subset of parameters to optimize, forwarded to ``ParSubSet``.
-            Supports source names (with ``*`` wildcards), parameter names
-            prefixed with ``_``, and integer indices.
-        method : str, optional
-            Optimization algorithm: ``'l-bfgs-b'`` (default), ``'simplex'``,
-            or ``'powell'``.
-        quiet : bool, optional
-            Suppress optimizer diagnostic output.
-        use_gradient : bool, optional
-            Pass the analytic gradient to the optimizer.
+        select : None, item, or list of items
+            Optional parameter selector forwarded to ``fitter_view``.
+        exclude : None, item, or list of items
+            Optional parameter selector to remove from ``select``.
+        summarize : bool, default=True
+            If True, print the fit summary after a successful fit.
+        setpars : dict or None
+            Optional parameter values to set before fitting.
         **kwargs
-            Forwarded to ``Minimizer.__call__``.
+            Legacy fitter options. Supported convenience keywords handled here
+            are ``ignore_exception``, ``update_by``, ``tolerance``, and
+            ``plot``; remaining keywords are forwarded to ``fv.maximize``.
+        """
+        if len(self.sources.parameters) == 0:
+            print('No parameters to fit')
+            return
+
+        ignore_exception = kwargs.pop('ignore_exception', False)
+        update_by = kwargs.pop('update_by', 1.0)
+        tolerance = kwargs.pop('tolerance', 0.0)
+        plot = kwargs.pop('plot', False)
+
+        if setpars is not None:
+            self.sources.parameters.setitems(setpars, quiet=True)
+
+        fit_kw = dict(use_gradient=True, estimate_errors=True)
+        fit_kw.update(kwargs)
+
+        with self.fitter_view(select, exclude=exclude) as fv:
+            if tolerance > 0:
+                qual = fv.delta_loglike()
+                if qual < tolerance and qual > 0:
+                    if summarize:
+                        print(
+                            'Not fitting, estimated improvement, %.2f, is less than tolerance= %.1f'
+                            % (qual, tolerance)
+                        )
+                    return
+            try:
+                qual = 99.0
+                fv.maximize(**fit_kw)
+                w = fv.log_like()
+                self.fmin_ret = fv.fmin_ret
+                if summarize:
+                    print(
+                        '%d calls: improvement, quality: %.2f, %.2f'
+                        % (fv.calls, w - fv.initial_likelihood, fv.delta_loglike())
+                    )
+                with redirect_stdout(io.StringIO()):
+                    fv.modify(update_by)
+                if fit_kw['estimate_errors']:
+                    fv.save_covariance()
+
+                if plot:
+                    fv.plot_all()
+
+            except Exception as msg:
+                print('Fit Failure %s: quality: %.2f' % (msg, qual))
+                fv.summary()
+                if not ignore_exception:
+                    raise
+
+            covariance = getattr(fv, 'covariance', None)
+            sigmas = None
+            cor = None
+            param_mask = np.array(getattr(fv, 'mask', []), dtype=bool)
+            grad = None
+            ts_values = None
+
+            # Preserve active-parameter diagnostics expected by summary().
+            try:
+                grad = np.asarray(fv.gradient(), dtype=float)
+            except Exception:
+                grad = None
+
+            # TS-like values: 2 * delta-loglike forcing each active Norm
+            # parameter to a very small internal value (-20), matching the
+            # previous summary-column behavior.
+            try:
+                active_names = np.asarray(fv.parameter_names)
+                x_fit = np.asarray(fv.get_parameters(), dtype=float)
+                logl_opt = float(fv.log_like())
+                ts_values = np.full(len(active_names), np.nan)
+                if len(active_names) == len(x_fit):
+                    for k, name in enumerate(active_names):
+                        if str(name).endswith('_Norm'):
+                            trial = x_fit.copy()
+                            trial[k] = -20.0
+                            fv.set_parameters(trial)
+                            ts_values[k] = round(2.0 * (logl_opt - float(fv.log_like())), 1)
+                    fv.set_parameters(x_fit)
+            except Exception:
+                ts_values = None
+
+            if covariance is not None:
+                cov = np.asarray(covariance, dtype=float)
+                if cov.ndim == 2 and cov.size > 0:
+                    diag = np.diag(cov).copy()
+                    diag[diag < 0] = np.nan
+                    sigmas = np.sqrt(diag)
+                    outer = np.outer(sigmas, sigmas)
+                    cor = np.full_like(cov, np.nan, dtype=float)
+                    valid = outer > 0
+                    cor[valid] = cov[valid] / outer[valid]
+
+
+            self.fit_info = dict(
+                # loglike=fv.log_like(),
+                calls=fv.calls,
+                # pars=fv.parameters[:],
+                # covariance=covariance,
+                # param_mask=param_mask if len(param_mask) > 0 else None,
+                grad=grad.round(),
+                ts_values=ts_values,
+                sigmas=sigmas.round(3) if sigmas is not None else None,
+                cor=100*cor.round(2) if cor is not None else None,
+                deltaTS=round(2.0 * (fv.log_like() - fv.initial_likelihood), 1),
+                # mask_indeces=np.arange(len(fv.mask))[fv.mask],
+                qual=float(fv.delta_loglike().round(2)),
+            )
+        if summarize:
+            self.summary()
+        return
+
+    # ------------------------------------------------------------------
+    # Repivot
+    # ------------------------------------------------------------------
+
+    def repivot(self, summarize=True, **fit_kwargs):
+        """Set each source's reference energy to its pivot energy, then refit.
+
+        The pivot energy is the energy at which the flux uncertainty is
+        minimised (the knot of the bow-tie). Repivoting removes the
+        correlation between the normalisation and spectral-index parameters
+        and is good practice after an initial fit has been performed.
+
+        Workflow
+        --------
+        1. If no fit has been performed yet (no covariance available on any
+           free source model), run :meth:`fit` first.
+        2. For each non-global source with at least one free parameter, call
+           ``model.pivot_energy()`` to find the pivot, then ``model.set_e0()``
+           to move the reference energy (adjusting the norm so the model
+           prediction is unchanged).
+        3. Run :meth:`fit` again.
+        4. Return a :class:`pandas.DataFrame` comparing old and new values of
+           ``e0``, ``Norm``, and ``Index`` (where present) for each source.
+
+        Parameters
+        ----------
+        summarize : bool, optional
+            Forwarded to each :meth:`fit` call.  Default ``True``.
+        **fit_kwargs
+            Additional keyword arguments forwarded to :meth:`fit`.
 
         Returns
         -------
-        tuple
-            ``(fitvalue, parameters, errors)`` as returned by ``Minimizer``.
-
-        Side Effects
-        ------------
-        Updates ``source_model`` parameters in place and populates
-        ``self.fit_info``.
+        pandas.DataFrame
+            One row per repivoted source with columns:
+            ``source``, ``e0_before``, ``e0_after``, ``pivot``,
+            ``norm_before``, ``norm_after``,
+            and ``index_before`` / ``index_after`` when the model has an
+            ``Index`` parameter.
         """
-        from like3.fitter import Minimizer, Fitted
-        from like3.parameterset import ParSubSet
+        import pandas as pd
 
-        pt = self.pixel_table
-        pset = self.source_model.parameters
-        initial_loglike = self.loglike()
-        use_gradient = kwargs.pop('use_gradient', use_gradient)
-
-        all_names = np.asarray(pset.parameter_names)
-        n_all = len(all_names)
-
-        if select is not None:
-            select_args = select if isinstance(select, (list, tuple)) else [select]
-            subset = ParSubSet(self.source_model, *select_args)
-            param_mask = subset._mask
-        else:
-            param_mask = np.ones(n_all, dtype=bool)
-
-        x_init = np.asarray(pset.get_parameters(), dtype=float)[param_mask].copy()
-
-        fit_obj = self
-
-        class _Objective(Fitted):
-            def __init__(self):
-                self._cache_pars = None
-                self._cache_value = None
-                self._cache_grad = None
-
-            @property
-            def bounds(self):
-                b = fit_obj.bounds
-                return b[param_mask] if b is not None else None
-
-            @property
-            def parameter_names(self):
-                return all_names[param_mask]
-
-            def get_parameters(self):
-                return np.asarray(pset.get_parameters())[param_mask]
-
-            def set_parameters(self, par):
-                full = np.asarray(pset.get_parameters(), dtype=float)
-                full[param_mask] = par
-                pset.set_parameters(full)
-
-            def _evaluate(self, pars, need_grad=False):
-                pars = np.asarray(pars, dtype=float)
-                if (
-                    self._cache_pars is not None
-                    and np.array_equal(pars, self._cache_pars)
-                    and (not need_grad or self._cache_grad is not None)
-                ):
-                    return self._cache_value, self._cache_grad
-
-                self.set_parameters(pars)
-                loglike = 0.0
-                full_grad = np.zeros(n_all, dtype=float) if need_grad else None
-
-                for band in pt._iter_bands():
-                    m = band._fit_mask
-                    counts = band.photons if m is None else band.photons[m]
-                    if need_grad:
-                        model, dm_dtheta = band.pixel_counts_and_gradient()
-                    else:
-                        _, model = band.pixel_counts()
-                    model = np.clip(model, 1e-30, None)
-                    loglike += float(np.sum(counts * np.log(model) - model))
-                    if need_grad:
-                        full_grad -= ((counts / model - 1.0)[:, None] * dm_dtheta).sum(axis=0)
-
-                grad = full_grad[param_mask] if (need_grad and full_grad is not None) else None
-                value = -float(loglike) + initial_loglike
-                self._cache_pars = np.array(pars, copy=True)
-                self._cache_value = value
-                self._cache_grad = None if grad is None else np.array(grad, copy=True)
-                return value, grad
-
-            def __call__(self, pars, *args):
-                value, _ = self._evaluate(pars, need_grad=use_gradient)
-                return value
-
-            def gradient(self, pars):
-                _, grad = self._evaluate(pars, need_grad=True)
-                return grad
-
-        objective = _Objective()
-        minimizer = Minimizer(objective, quiet=quiet)
-        fit_out = minimizer(method=method, use_gradient=use_gradient, **kwargs)
-        x_fit = np.array(fit_out[1], copy=True)
-        logl_opt = initial_loglike - float(fit_out[0])
-
-        # Analytical Hessian (Fisher information matrix).
-        n_active = int(param_mask.sum())
-        hess = np.zeros((n_active, n_active), dtype=float)
-        for band in pt._iter_bands():
-            band_model, dm_dtheta = band.pixel_counts_and_gradient()
-            band_model = np.clip(band_model, 1e-30, None)
-            G = dm_dtheta[:, param_mask].T  # (n_active, n_pix)
-            hess += (G / band_model) @ G.T
-
-        try:
-            cov = np.linalg.inv(hess)
-        except np.linalg.LinAlgError:
-            cov = np.full_like(hess, np.nan)
-        sigs = np.sqrt(np.clip(cov.diagonal(), 0.0, None))
-        outer = np.outer(sigs, sigs)
-        corr = np.where(outer > 0, cov / np.where(outer > 0, outer, 1.0), np.nan).round(2)
-        grad = objective.gradient(x_fit)
-
-        # TS values: 2 × Δloglike forcing each Norm parameter to -20.
-        active_names = all_names[param_mask]
-        ts_values = np.full(n_active, np.nan)
-        for k, name in enumerate(active_names):
-            if name.endswith('_Norm'):
-                trial = x_fit.copy()
-                trial[k] = -20.0
-                objective.set_parameters(trial)
-                ts_values[k] = round(2.0 * (logl_opt - self.loglike()), 1)
-                objective.set_parameters(x_fit)
-
-        # Write covariance back into source models so that pset.uncertainties
-        # (which applies the internal->external Jacobian) gives correct values.
-        old_mask = pset.mask.copy()
-        pset.mask = param_mask
-        pset.set_covariance(cov)
-        pset.mask = old_mask
-
-        self.fit_info = dict(
-            hess=hess,
-            cov=cov,
-            sigs=sigs.round(4),
-            corr=corr,
-            grad=grad,
-            x_fit=x_fit,
-            x_init=x_init,
-            delta_loglike=round(logl_opt - initial_loglike, 2),
-            ts_values=ts_values,
-            param_mask=param_mask,
+        # --- Step 1: initial fit if covariance is not yet available ----------
+        any_errors = any(
+            src.model.has_errors()
+            for src in self.source_model
+            if not getattr(src, 'isglobal', False) and np.any(src.model.free)
         )
-        return fit_out
+        if not any_errors:
+            print('repivot: no covariance found – running initial fit first')
+            self.fit(summarize=summarize, **fit_kwargs)
+
+        # --- Step 2: collect before-state and set new e0 --------------------
+        rows = []
+        for src in self.source_model:
+            if getattr(src, 'isglobal', False):
+                continue
+            m = src.model
+            if not np.any(m.free):
+                continue
+
+            pivot = m.pivot_energy(exception=False)
+            if not np.isfinite(pivot) or pivot <= 0:
+                continue
+
+            e0_before = float(m.e0)
+            norm_before = float(m.getp('Norm'))
+            param_names = set(getattr(m, 'param_names', []))
+            index_before = float(m.getp('Index')) if 'Index' in param_names else None
+
+            m.set_e0(float(pivot))
+
+            rows.append(dict(
+                source=src.name,
+                e0_before=round(e0_before, 1),
+                pivot=round(pivot, 1),
+                e0_after=round(float(m.e0), 1),
+                norm_before=norm_before,
+                norm_after=float(m.getp('Norm')),
+                index_before=index_before,
+                index_after=float(m.getp('Index')) if 'Index' in param_names else None,
+            ))
+
+        if not rows:
+            print('repivot: no sources could be repivoted (fit with errors first?)')
+            return pd.DataFrame()
+
+        # --- Step 3: refit with new pivot energies ---------------------------
+        self.fit(summarize=summarize, **fit_kwargs)
+
+        # Update norm_after from the refitted values.
+        for row in rows:
+            src = self.source_model.find_source(row['source'])
+            row['norm_after'] = float(src.model.getp('Norm'))
+            if 'Index' in set(getattr(src.model, 'param_names', [])):
+                row['index_after'] = float(src.model.getp('Index'))
+
+        # --- Step 4: build and return the comparison table ------------------
+        df = pd.DataFrame(rows)
+        # Drop index columns if no source has an Index parameter.
+        if df['index_before'].isna().all():
+            df = df.drop(columns=['index_before', 'index_after'])
+        return df
 
     # ------------------------------------------------------------------
     # Summary
@@ -951,7 +1129,7 @@ class FermiFit(views.LikelihoodViews):
         sm_context = self.source_model.localization_view(source_name)
         return context_cls(self.pixel_table, sm_context)
 
-    def localize(self, source_name=None, sigma=0.1, verbose=True):
+    def localize(self, source_name=None, sigma=0.1, verbose=False):
         """Run localization for a source.
 
         Parameters
@@ -968,3 +1146,125 @@ class FermiFit(views.LikelihoodViews):
         from like3.quadform import Localize
         with self.localization_view(source_name) as loc:
             return Localize(loc, sigma=sigma, verbose=verbose)
+
+
+def main(
+    source_name,
+    *,
+    pixel_table_path='files/kerr/toby_v4.fits',
+    catalog='v40',
+    query=None,
+    cone_size=1.0,
+    verbose=False,
+):
+    """Build and return a ``FermiFit`` for one catalog source.
+
+    Parameters
+    ----------
+    source_name : str
+        Catalog source name, forwarded to
+        ``SourceModel.from_fermi_catalog`` as the cone-center selector.
+    pixel_table_path : str, default='files/kerr/toby_v4.fits'
+        Pixel-table FITS path passed to ``PixelTable``.
+    catalog : str, default='v40'
+        Fermi catalog version passed as ``version=``.
+    query : str or None, optional
+        Optional catalog query filter.
+    cone_size : float, default=1.0
+        Cone radius in degrees used when building the source model.
+    verbose : bool, default=False
+        Verbosity flag forwarded to ``FermiFit``.
+
+    Returns
+    -------
+    FermiFit
+        Fit wrapper with attached ``pixel_table`` and ``source_model``.
+    """
+    package_root = Path(__file__).resolve().parent.parent
+    path_candidates = [
+        package_root,
+        package_root / 'wtlike',
+        package_root.parent / 'wtlike',
+    ]
+    for candidate in path_candidates:
+        if not (candidate / 'utilities').is_dir():
+            continue
+        if str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
+
+    pkg = __package__ if __package__ else 'like3'
+    pixel_table_mod = importlib.import_module(f'{pkg}.pixel_table')
+    sourcelist_mod = importlib.import_module(f'{pkg}.sourcelist')
+
+    source_model = sourcelist_mod.SourceModel.from_fermi_catalog(
+        source_name,
+        version=catalog,
+        query=query,
+        cone_size=cone_size,
+    )
+    pixel_table = pixel_table_mod.PixelTable(
+        pixel_table_path,
+        source_model=source_model,
+    )
+    plt.style.use('dark_background')
+    return FermiFit(pixel_table, verbose=verbose)
+
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(description='Build a FermiFit from a catalog source name.')
+    parser.add_argument('source_name', help='Catalog source name used to build the SourceModel.')
+    parser.add_argument(
+        '--pixel-table-path',
+        default='files/kerr/toby_v4.fits',
+        help='Pixel-table FITS path.',
+    )
+    parser.add_argument(
+        '--catalog',
+        default='v40',
+        help='Fermi catalog version passed to SourceModel.from_fermi_catalog.',
+    )
+    parser.add_argument(
+        '--query',
+        default=None,
+        help='Optional catalog query filter.',
+    )
+    parser.add_argument(
+        '--cone-size',
+        type=float,
+        default=1.0,
+        help='Cone radius in degrees for catalog selection.',
+    )
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Forward verbose=True to FermiFit.',
+    )
+    return parser.parse_args(argv)
+
+
+if __name__ == '__main__':
+    from utilities.ipynb_docgen import show, show_date, capture_hide
+    args = _parse_args()
+    show_date()
+    with capture_hide(f'Setup output for {args.source_name}') as setup_output:
+        ff = main(
+            args.source_name,
+            pixel_table_path=args.pixel_table_path,
+            catalog=args.catalog,
+            query=args.query,
+            cone_size=args.cone_size,
+            verbose=args.verbose,
+        )
+
+        pt = ff.pixel_table
+        sm = ff.source_model
+        selected = getattr(sm, 'selected_source', None)
+        selected_name = None if selected is None else selected.name
+ 
+    
+        print(f'Built FermiFit for {selected_name or args.source_name}')
+        print(f'Pixel table: {pt.name}')
+        print(f'Sources, selected near {args.source_name}: {", ".join(s.name for s in sm)}')
+
+    show(setup_output)
+    plt.style.use('dark_background')

@@ -362,8 +362,8 @@ class BandModel:
         self.data = band.photons[mask].astype(float)
 
         # Diffuse contribution aligned to the restricted pixel set (fixed)
-        if band.diffuse is not None:
-            self._diffuse = band.diffuse[mask].astype(float)
+        if band.diffuse_counts is not None:
+            self._diffuse = band.diffuse_counts[mask].astype(float)
         else:
             self._diffuse = np.zeros(len(self._pix), dtype=float)
 

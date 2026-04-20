@@ -8,6 +8,7 @@
 
 import numpy as np
 import pandas as pd
+import re
 
 from . import (sources, parameterset)
 from utilities.catalogs import Fermi4FGL
@@ -28,6 +29,7 @@ class SourceModel(list):
     def __init__(self, sources):
         """Initialize from an iterable of source objects."""
 
+        self.fermi_catalog = None
         for source in sources:
             self.add_source(source)
         
@@ -84,9 +86,18 @@ class SourceModel(list):
                           for source in self])
         return g [ self.parameters.mask]
        
-    def initialize(self, **kw):
-        """Rebuild flattened parameter view after any source/model changes."""
+    def reinitialize(self, **kw):
+        """Rebuild parameter mappings from current sources.
+
+        This reconstructs the flattened free-parameter bookkeeping used by
+        fitting and parameter selection, and should be called after any
+        source-model change that affects free parameters.
+        """
         self.parameters = parameterset.ParameterSet(self, **kw)
+
+    def initialize(self, **kw):
+        """Backward-compatible alias for :meth:`reinitialize`."""
+        self.reinitialize(**kw)
   
     def parsubset(self, *select):
         """Return a `ParSubSet` view with optional initial selection."""
@@ -110,7 +121,7 @@ class SourceModel(list):
                   f'qual={fit_info.get("qual", float("nan")):.3f}', file=out)
         self.parameters.parameter_summary(out=out)
 
-    def sed_plot(self, source_name=None, ax=None, title=None, label=None, emin=100, emax=1e5, npts=50):
+    def sed_plot(self, source_name=None, ax=None, title=None, label=None, emin=100, emax=1e5, npts=50, ylim=(0.1, None)):
         """Plot the SED (E² dN/dE vs E) for the selected or named source.
 
         Parameters
@@ -124,13 +135,15 @@ class SourceModel(list):
             Energy range in MeV.
         npts : int
             Number of logarithmically-spaced evaluation points.
+        ylim : tuple[float | None, float | None]
+            Y-axis limits in eV cm^-2 s^-1. Defaults to ``(0.1, None)``.
 
         Returns
         -------
         matplotlib.axes.Axes
         """
         return self.find_source(source_name).sed_plot(
-            ax=ax, title=title, label=label, emin=emin, emax=emax, npts=npts
+            ax=ax, title=title, label=label, emin=emin, emax=emax, npts=npts, ylim=ylim, butterfly=True
         )
 
 
@@ -156,6 +169,21 @@ class SourceModel(list):
             for pname in np.array(model.param_names)[np.array(model.free)]: # mod for future warning
                 names.append(source_name.strip()+'_'+pname)
         return np.array(names)
+
+    @staticmethod
+    def _canonical_source_name(name):
+        """Return a normalized source-name token for alias-friendly matching.
+
+        Normalization is case-insensitive, removes punctuation/whitespace,
+        and maps common Markarian aliases (``mrk``/``markarian``) to ``mkn``.
+        """
+        text = str(name).strip().lower()
+        text = re.sub(r'[^a-z0-9]+', '', text)
+        if text.startswith('markarian'):
+            text = 'mkn' + text[len('markarian'):]
+        elif text.startswith('mrk'):
+            text = 'mkn' + text[len('mrk'):]
+        return text
     
     def find_source(self, source_name=None):
         """Return and select a source by name or object.
@@ -219,8 +247,65 @@ class SourceModel(list):
             k = names.index(source_name)
             return found(self[k])
         except ValueError:
-            self.selected_source = None
-            not_found()
+            pass
+
+        # Alias-friendly fallback: canonicalized string matching.
+        if isinstance(source_name, str):
+            target = self._canonical_source_name(source_name)
+            canonical_names = [self._canonical_source_name(name) for name in names]
+            matches = [i for i, cname in enumerate(canonical_names) if cname == target]
+            if len(matches) > 0:
+                return found(self[matches[0]])
+
+            # Secondary alias match against per-source catalog aliases.
+            alias_matches = []
+            for i, src in enumerate(self):
+                alias_values = [src.name]
+                alias_values.extend(getattr(src, 'aliases', []))
+                canonical_aliases = {self._canonical_source_name(value) for value in alias_values}
+                if target in canonical_aliases:
+                    alias_matches.append(i)
+            if len(alias_matches) > 0:
+                return found(self[alias_matches[0]])
+
+            # Final fallback: resolve the requested string to coordinates and
+            # choose the nearest source in the current source list.
+            try:
+                from astropy.coordinates import SkyCoord
+
+                target_coord = self._coerce_catalog_skycoord(source_name, frame='icrs')
+                ras = []
+                decs = []
+                for src in self:
+                    sd = src.skydir
+                    if hasattr(sd, 'ra') and hasattr(sd.ra, 'deg'):
+                        ra = float(sd.ra.deg)
+                    elif hasattr(sd, 'ra') and callable(sd.ra):
+                        ra = float(sd.ra())
+                    else:
+                        ra = None
+
+                    if hasattr(sd, 'dec') and hasattr(sd.dec, 'deg'):
+                        dec = float(sd.dec.deg)
+                    elif hasattr(sd, 'dec') and callable(sd.dec):
+                        dec = float(sd.dec())
+                    else:
+                        dec = None
+                    if ra is None or dec is None:
+                        ras = []
+                        decs = []
+                        break
+                    ras.append(ra)
+                    decs.append(dec)
+                if len(ras) > 0:
+                    model_coords = SkyCoord(ras, decs, unit='deg', frame='icrs')
+                    k = int(np.argmin(target_coord.separation(model_coords).deg))
+                    return found(self[k])
+            except Exception:
+                pass
+
+        self.selected_source = None
+        not_found()
 
     def add_source(self, newsource=None, **kw):
         """Add a source to the model and rebuild parameter indexing.
@@ -368,16 +453,18 @@ class SourceModel(list):
         return model
 
     @staticmethod
-    def _coerce_catalog_skycoord(skydir, frame='icrs'):
+    def _coerce_catalog_skycoord(skycoord, frame='icrs'):
         """Normalize a catalog cone-center specification to ``SkyCoord``."""
         from astropy.coordinates import SkyCoord
 
-        if isinstance(skydir, SkyCoord):
-            return skydir
-        if hasattr(skydir, '__iter__'):
-            lon, lat = skydir
+        if isinstance(skycoord, SkyCoord):
+            return skycoord
+        if isinstance(skycoord, str):
+            return SkyCoord.from_name(skycoord, frame=frame)
+        if hasattr(skycoord, '__iter__'):
+            lon, lat = skycoord
             return SkyCoord(lon, lat, unit='deg', frame=frame)
-        raise TypeError('skydir must be a SkyCoord or a (lon, lat) pair in degrees')
+        raise TypeError('skycoord must be a SkyCoord, string, or a (lon, lat) pair in degrees')
 
     @staticmethod
     def _load_fermi_catalog(catalog=None, *, version=None, path='$FERMI/catalog/', reset_index=False):
@@ -385,7 +472,16 @@ class SourceModel(list):
         if catalog is not None:
             return catalog
         from utilities.catalogs import Fermi4FGL
-        return Fermi4FGL(version=version, path=path, reset_index=reset_index)
+        fermi_catalog = Fermi4FGL(version=version, path=path, reset_index=reset_index)
+        if not reset_index:
+            fermi_catalog.index = pd.Index(
+                [
+                    name.replace('FL16Y', '').strip() if isinstance(name, str) else name
+                    for name in fermi_catalog.index
+                ],
+                name=fermi_catalog.index.name,
+            )
+        return fermi_catalog
 
     @staticmethod
     def _apply_catalog_selection(catalog, select):
@@ -422,19 +518,17 @@ class SourceModel(list):
         return catalog.loc[items]
 
     @classmethod
-    def _subset_fermi_catalog(cls, catalog_id, *, select=None, query=None, skydir=None, cone_size=None, frame='icrs'):
+    def _subset_fermi_catalog(cls, catalog_id, *, select=None, query=None, skycoord=None, cone_size=1.0, frame='icrs'):
         """Return a filtered catalog dataframe based on subset arguments."""
         
         catalog =Fermi4FGL(catalog_id) if isinstance(catalog_id, str) else catalog_id
         subset = catalog
 
-        if skydir is not None or cone_size is not None:
-            if skydir is None or cone_size is None:
-                raise ValueError('skydir and cone_size must be provided together')
+        if skycoord is not None:
             if not hasattr(catalog, 'select_cone'):
                 raise TypeError('catalog does not support cone selection')
             subset = catalog.select_cone(
-                cls._coerce_catalog_skycoord(skydir, frame=frame),
+                cls._coerce_catalog_skycoord(skycoord, frame=frame),
                 cone_size=cone_size,
             )
             if subset is None:
@@ -449,7 +543,10 @@ class SourceModel(list):
         if len(subset) == 0:
             raise SourceModelException('no sources selected from the Fermi catalog')
 
-        return subset.copy()
+        result = subset.copy()
+        if skycoord is not None and 'sep' in result.columns:
+            result = result.sort_values('sep')
+        return result
 
     @staticmethod
     def _convert_fermi_model(specfunc):
@@ -489,31 +586,47 @@ class SourceModel(list):
     def _source_from_fermi_row(cls, source_name, row):
         """Create a ``PointSource`` from one Fermi catalog row."""
         resolved_name = row['name'] if 'name' in row.index else source_name
-        return sources.PointSource(
-            name=str(resolved_name),
+        resolved_name = str(resolved_name)
+        if resolved_name.startswith('FL16Y'):
+            resolved_name = resolved_name[5:].lstrip()
+        src = sources.PointSource(
+            name=resolved_name,
             skydir=(float(row.ra), float(row.dec)),
             frame='icrs',
             model=cls._convert_fermi_model(row.specfunc),
         )
 
+        # Preserve common catalog aliases for robust user-facing lookup.
+        alias_fields = ('name', 'assoc1', 'assoc2', 'assoc_name', 'alt_name', 'common_name', 'source_name', 'assoc')
+        aliases = [str(source_name)]
+        for key in alias_fields:
+            if key in row.index and pd.notna(row[key]):
+                value = str(row[key]).strip()
+                if value:
+                    aliases.append(value)
+        src.aliases = list(dict.fromkeys(aliases))
+        return src
+
     @classmethod
-    def from_fermi_catalog(
-        cls,
-        version=None,
-        *,
+    def from_fermi_catalog( cls,
+        skycoord,  *,
+        version='v40',
         catalog=None,
         path='$FERMI/catalog/',
         reset_index=False,
         select=None,
         query=None,
-        skydir=None,
-        cone_size=None,
+        cone_size=1.0,
         frame='icrs',
     ):
         """Build a ``SourceModel`` from a Fermi catalog subset.
 
         Parameters
         ----------
+        skycoord : SkyCoord, str, or tuple, optional
+            Cone center for spatial subset selection. Can be a SkyCoord object,
+            a source name string (resolved via SkyCoord.from_name), or a
+            (longitude, latitude) tuple in degrees -- see frame for coordinate frame, default 'icrs'.
         version : str or None, optional
             Catalog version forwarded to ``utilities.catalogs.Fermi4FGL`` when
             ``catalog`` is not provided.
@@ -531,18 +644,20 @@ class SourceModel(list):
             of those forms.
         query : str, optional
             Pandas query expression applied to the catalog before ``select``.
-        skydir : SkyCoord or tuple, optional
-            Cone center for spatial subset selection.
-        cone_size : float, optional
-            Cone radius in degrees. Must be supplied together with ``skydir``.
+        cone_size : float, default=1.0
+            Cone radius in degrees. Only used if ``skycoord`` is provided.
         frame : str, default='icrs'
-            Coordinate frame used when ``skydir`` is provided as a tuple.
+            Coordinate frame used when ``skycoord`` is provided as a tuple.
 
         Returns
         -------
         SourceModel
             Source model containing one point source per selected catalog row.
         """
+        cone_center = None
+        if skycoord is not None:
+            cone_center = cls._coerce_catalog_skycoord(skycoord, frame=frame)
+
         fermi_catalog = cls._load_fermi_catalog(
             catalog=catalog,
             version=version,
@@ -553,14 +668,40 @@ class SourceModel(list):
             fermi_catalog,
             select=select,
             query=query,
-            skydir=skydir,
+            skycoord=cone_center,
             cone_size=cone_size,
             frame=frame,
         )
-        return cls([
+        model = cls([
             cls._source_from_fermi_row(source_name, row)
             for source_name, row in catalog_subset.iterrows()
         ])
+        model.fermi_catalog = fermi_catalog
+
+        # If a target coordinate/name was given, ensure selected_source is
+        # deterministic for downstream code that relies on the active source.
+        if len(model) > 0 and cone_center is not None:
+            selected = False
+            if isinstance(skycoord, str):
+                target_name = skycoord.strip().lower()
+                for src in model:
+                    if src.name.strip().lower() == target_name:
+                        model.find_source(src.name)
+                        selected = True
+                        break
+            if not selected:
+                from astropy.coordinates import SkyCoord
+
+                cat_coords = SkyCoord(
+                    catalog_subset.ra.astype(float).values,
+                    catalog_subset.dec.astype(float).values,
+                    unit='deg',
+                    frame='icrs',
+                )
+                k = int(np.argmin(cone_center.separation(cat_coords).deg))
+                model.find_source(model[k].name)
+
+        return model
 
     def view(self):
         """Return a context-manager view that restores all source model state on exit.

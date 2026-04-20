@@ -221,7 +221,8 @@ class PoissonFitter(object):
         if scale is None: scale= 5/s if s>0 else 1.0
         self.smax = self.find_max(scale) if s>=0 else 0.
 
-        self.ts = 2.*(func(self.smax) - self.f0)
+        self.fmax = func(self.smax)
+        self.ts = 2.*(self.fmax - self.f0)
         # determine values of the function corresponding to delta L of 0.5, 1, 2, 4
         # depending on how peaked the function is, this will be from 5 to 8 
         # The Poisson will be fit to this set of values
@@ -235,9 +236,20 @@ class PoissonFitter(object):
             return #no test in this case
         else:
             dom = set()
+            low_hint = None
+            high_hint = None
             for delta in dlist:
-                a,b = self.find_delta(delta, scale, xtol=tol*1e-2)
+                a,b = self.find_delta(
+                    delta,
+                    scale,
+                    xtol=tol*1e-2,
+                    ll_max=self.fmax,
+                    ll_zero=self.f0,
+                    low_hint=low_hint,
+                    high_hint=high_hint,
+                )
                 dom.add(a); dom.add(b)
+                low_hint, high_hint = a, b
             self.dom = np.array(sorted(list(dom)))
             self.fit()
         self.maxdev=self.check(tol)[0]
@@ -267,17 +279,46 @@ class PoissonFitter(object):
         #    raise Exception('Failure to find max value: %s' % list(r))
         return t if t>0 else 0
     
-    def find_delta(self, delta_logl=.5, scale=1.0, xtol=1e-5):
+    def find_delta(
+        self,
+        delta_logl=.5,
+        scale=1.0,
+        xtol=1e-5,
+        ll_max=None,
+        ll_zero=None,
+        low_hint=None,
+        high_hint=None,
+    ):
         """Find positive points where the function decreases by delta from the max
+
+        Parameters
+        ----------
+        delta_logl : float
+            Target log-likelihood drop from the maximum.
+        scale : float
+            Characteristic flux scale used to seed the high-side bracket.
+        xtol : float
+            Absolute root-finder tolerance.
+        ll_max, ll_zero : float or None
+            Optional cached function values at ``self.smax`` and ``0``.
+        low_hint, high_hint : float or None
+            Optional bracketing hints from a previous call. For increasing
+            ``delta_logl`` these roots move monotonically away from ``self.smax``,
+            so reusing earlier roots reduces expensive likelihood evaluations.
         """
-        ll_max = self(self.smax)
-        ll_zero = self(0)
+        ll_max = self.fmax if ll_max is None else ll_max
+        ll_zero = self.f0 if ll_zero is None else ll_zero
         func = lambda s: ll_max-self(s)-delta_logl
         if ll_max-ll_zero<delta_logl:
             s_low = 0
         else:
-            s_low = optimize.brentq(func,0, self.smax, xtol=xtol)
-        if self.smax>0:
+            low_right = min(max(float(low_hint), 0.0), self.smax) if low_hint is not None else self.smax
+            if low_right <= 0:
+                low_right = self.smax
+            s_low = optimize.brentq(func, 0, low_right, xtol=xtol)
+        if high_hint is not None and high_hint > self.smax:
+            s_high = float(high_hint)
+        elif self.smax>0:
             s_high = self.smax*10
         else:
             s_high = scale

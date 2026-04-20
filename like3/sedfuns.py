@@ -549,6 +549,9 @@ def sed_poisson_table(roi, source_name=None, event_type=None, tol=0.1):
         etname = event_type.lower()
         if etname == 'all':
             event_type = None
+        elif etname.startswith('psf') and etname[3:].isdigit():
+            # 'PSF0'–'PSF3' → integer event-type codes 2–5
+            event_type = int(etname[3:]) + 2
         elif hasattr(roi, 'config') and etname in roi.config.event_type_names:
             event_type = roi.config.event_type_names.index(etname)
         else:
@@ -584,9 +587,10 @@ def sed_poisson_table(roi, source_name=None, event_type=None, tol=0.1):
                     fail_reason='',
                 )
 
+                # Include bands that overlap the energy bin, not only those fully contained.
                 selected = [
                     b for b in candidate_bands
-                    if float(b.e0) >= float(elow) and float(b.e1) <= float(ehigh)
+                    if float(b.e1) > float(elow) and float(b.e0) < float(ehigh)
                 ]
                 has_data = np.any([
                     (getattr(b, 'nocc', 0) > 0) or (len(getattr(b, 'pix', [])) > 0)

@@ -17,6 +17,8 @@ from astropy_healpix import HEALPix
 from pathlib import Path
 from typing import Callable, cast
 
+from .sky_display import _catalog_source_summary, _install_text_hover
+
 
 def _event_type_to_int(value):
     """Normalize event-type labels/codes to the FITS integer convention."""
@@ -49,6 +51,7 @@ def _event_type_to_label(value):
 
 
 _energy_index = lambda energy: (np.log10(energy) * 4 - 8).astype(int)
+e_mev = lambda energy_index: (10** (energy_index/4 + 0.125)*1e2).astype(int)
 
 
 class PixelTableLocalizationView:
@@ -106,7 +109,7 @@ class PixelTable(dict):
 
             # key is (psf index, energy index) tuple
             psf_index = self.event_type if self.event_type < 2 else self.event_type - 2
-            self.key = (int(psf_index), _energy_index(self.e0))
+            self.key = (int(psf_index), int(_energy_index(self.e0)))
             self.energy = np.sqrt(self.e0 * self.e1)  # MeV, consistent with PixelTable.Band
  
             super().__init__(nside, frame='galactic', order=order)
@@ -118,16 +121,17 @@ class PixelTable(dict):
             # Backward-compatible sparse lookup cache used by existing tests/callers.
             self._exposure_lookup: dict[int, float] | None = None
             self._pix_inv: np.ndarray | None = None          # pixel_index → pos in self.pix
-            # Coverage mask: boolean array over self.pix selecting pixels near sources.
-            # When set, loglike/gradient computations are restricted to these pixels.
-            self._fit_mask: np.ndarray | None = None
+            # Coverage DataFrame: columns pix, photons, diffuse_counts, source_counts,
+            # restricted to pixels near sources.  When set, loglike/gradient computations
+            # use this subset instead of the full self.pix arrays.
+            self.coverage: pd.DataFrame | None = None
             # Sparse per-pixel arrays; populated by PixelTable._setup_from_arrays.
             # Mandatory arrays are initialised empty so the type checker knows
             # they are always ndarray (never None) once set up.
             self.pix: np.ndarray = np.empty(0, dtype=np.int64)
             self.photons: np.ndarray = np.empty(0, dtype=np.int32)
-            self.diffuse: np.ndarray = np.empty(0, dtype=np.float32)
-            self.sources: np.ndarray = np.empty(0, dtype=np.float32)
+            self.diffuse_counts: np.ndarray = np.empty(0, dtype=np.float32)
+            self.source_counts: np.ndarray = np.empty(0, dtype=np.float32)
             # Optional arrays: only present when the FITS file contains the column.
             self.pixel_exposure: np.ndarray | None = None
             self.count_exposure: np.ndarray | None = None
@@ -214,8 +218,8 @@ class PixelTable(dict):
                     _, v = self.response(src, self.pix)
                     counts += v * flux
                 counts *= exp
-                return self.diffuse + counts
-            return self.diffuse + self.sources
+                return self.diffuse_counts + counts
+            return self.diffuse_counts + self.source_counts
         def _exposure_normalization(self):
             """factor to convert input counts per pixel for this power law to the weighted exposure times delta E."""
             return 1/(1e-14 * (np.sqrt(self.e0 * self.e1) * 1e-3) ** (-2.1))
@@ -237,13 +241,13 @@ class PixelTable(dict):
             if component == 'data':
                 return self.photons
             if component == 'diffuse':
-                return self.diffuse
+                return self.diffuse_counts
             if component == 'sources':
                 # When a source_model is set, derive source counts dynamically;
                 # otherwise fall back to the pre-computed FITS array.
                 if self.source_model is not None:
-                    return self.pixel_counts()[1] - self.diffuse
-                return self.sources
+                    return self.pixel_counts()[1] - self.diffuse_counts
+                return self.source_counts
             raise ValueError(f"Unknown component: {component!r}")
 
         def _pixels_in_frame(self, frame):
@@ -380,7 +384,7 @@ class PixelTable(dict):
                 afig.colorbar(label=label, shrink=shrink)
             return afig   
 
-        def zea_plot(self, center, component='data', *, nside=256, figsize=(6, 5),
+        def zea_plot(self, center=None, component='data', *, nside=256, figsize=(6, 5),
                     pixelsize=None, size=None, fig=None, axes_visible=True,
                     cmap='viridis', colorbar=True, title=None, log=True,
                     vmin=None, vmax=None, cb_label='counts/pixel', **kwargs):
@@ -391,18 +395,23 @@ class PixelTable(dict):
             ``size = 16 * r68``, ``pixelsize = r68 / 50``.  Both can be
             overridden explicitly.
 
-            After rendering the image the method overlays:
+                        After rendering the image the method overlays:
 
             * Energy and event-type label in the upper-right corner.
             * Optional *label* string in the upper-left corner.
             * A circle of radius ``r68`` in the lower-left corner as a PSF
               size indicator (only when PSF is attached).
+                        * Nearby catalog-source positions and names when a Fermi catalog is
+                            attached through ``self.source_model.fermi_catalog``. Sources in
+                            the current source model are highlighted.
+                        * Hover tooltips for those names on interactive Matplotlib backends.
 
             Parameters
             ----------
-            center : astropy.coordinates.SkyCoord or tuple
+            center : astropy.coordinates.SkyCoord or tuple or None, optional
                 Plot center. Tuples are interpreted as (lon, lat) in degrees
-                in the galactic frame.
+                in the galactic frame. When None, the currently selected
+                source position is used.
             component : str or None, optional
                 Component to visualize (see `ring_map` for valid names).
                 Pass ``None`` to create an empty axes. Default is 'data'.
@@ -442,6 +451,16 @@ class PixelTable(dict):
             """
             from utilities.skymaps import ZEAfigure
 
+            if center is None:
+                sm = getattr(self, 'source_model', None)
+                selected = None if sm is None else getattr(sm, 'selected_source', None)
+                if selected is None:
+                    raise ValueError(
+                        'zea_plot center is None and no selected source is available; '
+                        'pass center explicitly or select a source first'
+                    )
+                center = selected.skydir
+
             psf = self.psf
             if psf is not None:
                 _size      = size      if size      is not None else 16 * psf.r68
@@ -480,6 +499,68 @@ class PixelTable(dict):
                 ax.add_patch(Circle((cx, cy), r68_px,
                                     fill=False, edgecolor='white', linewidth=1.5))
 
+            sm = getattr(self, 'source_model', None)
+            catalog = None if sm is None else getattr(sm, 'fermi_catalog', None)
+            if catalog is not None and hasattr(catalog, 'select_cone'):
+                cone_size = _size / np.sqrt(2.0)
+                catalog_subset = catalog.select_cone(zfig.center, cone_size=cone_size)
+                if catalog_subset is not None and len(catalog_subset) > 0:
+                    if hasattr(catalog_subset, 'skycoord'):
+                        catalog_coords = catalog_subset.skycoord
+                    else:
+                        catalog_coords = SkyCoord(
+                            catalog_subset.ra.values,
+                            catalog_subset.dec.values,
+                            unit='deg',
+                            frame='fk5',
+                        )
+
+                    model_names = set()
+                    if sm is not None:
+                        model_names = {src.name for src in sm}
+                    model_mask = catalog_subset.index.isin(model_names)
+
+                    zfig.scatter(
+                        catalog_coords,
+                        marker='x',
+                        s=36,
+                        color='white',
+                        linewidths=0.8,
+                        alpha=0.8,
+                    )
+
+                    if np.any(model_mask):
+                        zfig.scatter(
+                            catalog_coords[model_mask],
+                            marker='o',
+                            s=70,
+                            facecolors='none',
+                            edgecolors='red',
+                            linewidths=1.5,
+                        )
+
+                    xpix, ypix = zfig.world_to_pixel(catalog_coords)
+                    nx, ny = zfig.array_shape
+                    hover_entries = []
+                    for x, y, name, in_model in zip(xpix, ypix, catalog_subset.index, model_mask):
+                        if not (0 <= x < nx and 0 <= y < ny):
+                            continue
+                        text_artist = zfig.ax.text(
+                            x + 4,
+                            y + 4,
+                            name if not name.startswith('FL16Y') else name[6:],
+                            color='red' if in_model else 'white',
+                            fontsize=8,
+                            ha='left',
+                            va='bottom',
+                        )
+                        text_artist.set_picker(True)
+                        hover_entries.append(
+                            (text_artist, _catalog_source_summary(catalog_subset.loc[name], in_model=in_model))
+                        )
+
+                    _install_text_hover(zfig.ax, hover_entries)
+
             return zfig
         
         def get_outliers(self, sigma_min=4):
@@ -506,27 +587,32 @@ class PixelTable(dict):
             pix = np.arange(12*self.nside**2)
             return pd.DataFrame( dict(pixel=self.ring_to_nested(pix[out]), data=d[out], model=m[out], sigma=r[out] )) 
 
-        def build_coverage_mask(self, r68_radius: float = 5.0) -> None:
-            """Build and cache a boolean mask restricting likelihood pixels to the source footprint.
+        def build_coverage(self, r68_radius: float = 4.0) -> None:
+            """Build and cache a coverage DataFrame restricting likelihood pixels to the source footprint.
 
-            Sets ``self._fit_mask`` to a boolean array (length = ``len(self.pix)``)
-            where ``True`` marks pixels within ``r68_radius`` × r68 of any source
-            in the attached source model.  Clears the mask (sets it to *None*) if
-            no source model is attached.
+            Sets ``self.coverage`` to a :class:`~pandas.DataFrame` with columns
+            ``pix``, ``photons``, ``diffuse_counts``, and ``source_counts`` for
+            pixels within ``r68_radius`` × r68 of any source in the attached source
+            model.  Sets ``self.coverage`` to *None* if no source model is attached.
 
             Parameters
             ----------
             r68_radius : float, optional
-                Cone radius in units of the band's PSF r68.  Default is 5.
+                Cone radius in units of the band's PSF r68.  Default is 4.
             """
             if self.source_model is None:
-                self._fit_mask = None
+                self.coverage = None
                 return
             radius_deg = r68_radius * self.psf.r68 if self.psf is not None else 2.0
             mask = np.zeros(len(self.pix), dtype=bool)
             for src in self.source_model:
                 mask |= self.cone_search(src.skydir, radius_deg)
-            self._fit_mask = mask
+            self.coverage = pd.DataFrame(dict(
+                pix=self.pix[mask],
+                photons=self.photons[mask],
+                diffuse_counts=self.diffuse_counts[mask],
+                source_counts=self.source_counts[mask],
+            ))
 
         def pixel_counts(self, pixels=None):
             """Return per-pixel model counts (diffuse + source model) for a pixel set.
@@ -545,22 +631,26 @@ class PixelTable(dict):
                 Pixel indices and corresponding model count values.
             """
             if pixels is None:
-                m = self._fit_mask
-                pix = self.pix if m is None else self.pix[m]
-                diff = (self.diffuse if m is None else self.diffuse[m]).astype(float)
+                cov = self.coverage
+                if cov is not None:
+                    pix = cov['pix'].to_numpy()
+                    diff = cov['diffuse_counts'].to_numpy().astype(float)
+                else:
+                    pix = self.pix
+                    diff = self.diffuse_counts.astype(float)
             else:
                 pix = np.asarray(pixels, dtype=int)
-                if self.diffuse is not None:
-                    diff_lookup = dict(zip(self.pix.tolist(), self.diffuse.tolist()))
-                    diff = np.array([diff_lookup.get(int(p), 0.0) for p in pix], dtype=float)
-                else:
-                    diff = np.zeros(len(pix), dtype=float)
+                diff_lookup = dict(zip(self.pix.tolist(), self.diffuse_counts.tolist()))
+                diff = np.array([diff_lookup.get(int(p), 0.0) for p in pix], dtype=float)
 
             if self.source_model is None:
                 if pixels is None:
-                    src = self.sources if m is None else self.sources[m]
+                    if cov is not None:
+                        src = cov['source_counts'].to_numpy().astype(float)
+                    else:
+                        src = self.source_counts.astype(float)
                 else:
-                    src_lookup = dict(zip(self.pix.tolist(), self.sources.tolist()))
+                    src_lookup = dict(zip(self.pix.tolist(), self.source_counts.tolist()))
                     src = np.array([src_lookup.get(int(p), 0.0) for p in pix], dtype=float)
                 return pix, diff + src
 
@@ -618,9 +708,13 @@ class PixelTable(dict):
                 raise ValueError('pixel_counts_and_gradient requires a source_model')
 
             # Apply coverage restriction when set.
-            m = self._fit_mask
-            pix = self.pix if m is None else self.pix[m]
-            diff = (self.diffuse if m is None else self.diffuse[m]).astype(float)
+            cov = self.coverage
+            if cov is not None:
+                pix = cov['pix'].to_numpy()
+                diff = cov['diffuse_counts'].to_numpy().astype(float)
+            else:
+                pix = self.pix
+                diff = self.diffuse_counts.astype(float)
 
             # response.evaluate(pix) always returns k=pix; assign PSF weights directly.
             exp = self.exposure_map(pix)
@@ -687,10 +781,10 @@ class PixelTable(dict):
                 sm.setposition(skydir)
             _, model = self.pixel_counts()
             model = model.clip(1e-30, None)
-            photons = self.photons if self._fit_mask is None else self.photons[self._fit_mask]
+            photons = self.coverage['photons'].to_numpy() if self.coverage is not None else self.photons
             return float(np.sum(photons * np.log(model) - model))
 
-    def __init__(self, root, *, emin=100, set_psf=True, source_model=None):
+    def __init__(self, root, *, emin=100, psf_path='files/loc', source_model=None):
         """Load a pixel table from a Kerr-style FITS file.
 
         Parameters
@@ -717,8 +811,8 @@ class PixelTable(dict):
             print(f"Attached source model with {len(self.source_model)} sources to pixel table")
         else:
             print("No source model attached to pixel table")
-        if set_psf:
-            self.set_psf()
+        if psf_path:
+            self.set_psf(psf_path)
         if self.source_model is not None:
             self.build_coverage()
 
@@ -824,8 +918,8 @@ class PixelTable(dict):
         if pixel_exposure is not None:
             self.pixel_exposure = pixel_exposure
         # FITS SKYMAP stores counts; initialize model arrays for API compatibility.
-        self.diffuse = fits_diffuse.astype(np.float32) if fits_diffuse is not None else np.zeros(len(pix), dtype=np.float32)
-        self.sources = fits_sources.astype(np.float32)
+        self.diffuse_counts = fits_diffuse.astype(np.float32) if fits_diffuse is not None else np.zeros(len(pix), dtype=np.float32)
+        self.source_counts = fits_sources.astype(np.float32)
 
 
         self._setup_from_arrays(meta, source=filename)
@@ -869,25 +963,29 @@ class PixelTable(dict):
             nocc = int(m[-1])
             sl = slice(offset, offset + nocc)
             b.slice = sl
-            for attr in ('diffuse', 'sources', 'photons',  'pix', 'pixel_exposure'):
+            for attr in ('diffuse_counts', 'source_counts', 'photons',  'pix', 'pixel_exposure'):
                 v = getattr(self, attr)[sl]
                 if attr == 'pixel_exposure': # and getattr(b, attr) is not None:
                     setattr(b, attr, v * b._exposure_normalization())
                     setattr(b, 'count_exposure', v)
+                elif attr == 'diffuse_counts':
+                    setattr(b, 'diffuse_counts', v)
+                elif attr == 'source_counts':
+                    setattr(b, 'source_counts', v)
                 else:
                     setattr(b, attr, v)
 
             offset += nocc
-            b.totals = dict(diffuse=self.diffuse[-nbands + i], sources=self.sources[-nbands + i])
+            b.totals = dict(diffuse=self.diffuse_counts[-nbands + i], sources=self.source_counts[-nbands + i])
 
         self.meta_df['event_type_code'] = [self[key].event_type for key in self.keys()]
 
-        if len(self.diffuse) >= offset + nbands and len(self.sources) >= offset + nbands:
-            self.totals = dict(diffuse=self.diffuse[offset:], sources=self.sources[offset:])
+        if len(self.diffuse_counts) >= offset + nbands and len(self.source_counts) >= offset + nbands:
+            self.totals = dict(diffuse=self.diffuse_counts[offset:], sources=self.source_counts[offset:])
         else:
             self.totals = dict(
-                diffuse=np.array([self.diffuse.sum()], dtype=float),
-                sources=np.array([self.sources.sum()], dtype=float),
+                diffuse=np.array([self.diffuse_counts.sum()], dtype=float),
+                sources=np.array([self.source_counts.sum()], dtype=float),
             )
 
         keys = sorted(self.keys())
@@ -899,9 +997,9 @@ class PixelTable(dict):
         # Map energy_index -> sorted list of (psf_index, energy_index) keys.
         bands_by_energy: dict[int, list] = {}
         for key in keys:
-            e_idx = key[1]
+            e_idx = int(key[1])
             bands_by_energy.setdefault(e_idx, []).append(key)
-        self.bands_by_energy = {e: sorted(ks) for e, ks in sorted(bands_by_energy.items())}
+        self.bands_by_energy = {int(e): sorted(ks) for e, ks in sorted(bands_by_energy.items())}
 
         print(f"""Loaded pixel table from "{source}":
             {len(self)} bands {self.band_summary}
@@ -984,8 +1082,8 @@ class PixelTable(dict):
         nocc = np.asarray(self.meta_df.nocc, dtype=np.int64)
         channels = np.repeat(np.arange(len(nocc), dtype=np.int64), nocc)
         npix = len(self.pix)
-        diffuse_pix = np.asarray(self.diffuse[:npix], dtype=np.float32)
-        sources_pix = np.asarray(self.sources[:npix], dtype=np.float32)
+        diffuse_pix = np.asarray(self.diffuse_counts[:npix], dtype=np.float32)
+        sources_pix = np.asarray(self.source_counts[:npix], dtype=np.float32)
 
         skymap_cols = [
             fits.Column(name='PIX', format='J', array=np.asarray(self.pix, dtype=np.int64)),
@@ -1117,12 +1215,22 @@ class PixelTable(dict):
             afig.colorbar(label='log10(counts)', shrink=shrink)
         return afig
     
-    def zea_plot(self, center, *, component='data', nside=256, 
+    def zea_plot(self, center=None, *, component='data', nside=256, 
                 figsize=(8,8), size=5, pixelsize=0.1, fig=None,
                 frame='icrs', proj='ZEA', cmap='viridis', 
                 colorbar=True, title=None,**kwargs):
         """Render a local ZEA projection aggregated across bands."""
         from utilities.skymaps import ZEAfigure
+
+        if center is None:
+            sm = getattr(self, 'source_model', None)
+            selected = None if sm is None else getattr(sm, 'selected_source', None)
+            if selected is None:
+                raise ValueError(
+                    "zea_plot center is None and no selected source is available; "
+                    "pass center explicitly or select a source first"
+                )
+            center = selected.skydir
 
         mp = self.ring_map(nside, component=component, frame=frame)
         mp[mp==0] = np.nan
@@ -1135,11 +1243,10 @@ class PixelTable(dict):
         return zfig
 
     def build_coverage(self, r68_radius: float = 5.0) -> 'PixelTable':
-        """Build per-band coverage masks restricting log-likelihood to source footprints.
+        """Build per-band coverage DataFrames restricting log-likelihood to source footprints.
 
-        Calls :meth:`Band.build_coverage_mask` on every band (or the current
-        selection when one is active).  Call again after changing the source
-        model position or after calling :meth:`select` with a new band set.
+        Calls :meth:`Band.build_coverage` on every band.  Call again after changing
+        the source model position or after calling :meth:`select` with a new band set.
 
         Parameters
         ----------
@@ -1152,7 +1259,7 @@ class PixelTable(dict):
             Returns *self* for method chaining.
         """
         for band in self.values():
-            band.build_coverage_mask(r68_radius)
+            band.build_coverage(r68_radius)
         return self
 
     def _iter_bands(self):
@@ -1161,7 +1268,7 @@ class PixelTable(dict):
             return self.values()
         return (self[k] for k in self._selected)
 
-    def select(self, keys=None, *, psf=None, emin=None, emax=None):
+    def select(self, keys=None, *, psf=None, emin=None, emax=None, energy=None):
         """Set active band selection for ``loglike``, ``simulate``, and ``fit``.
 
         Bands can be specified directly by key, or filtered by PSF type and/or
@@ -1184,6 +1291,10 @@ class PixelTable(dict):
             Upper energy bound in MeV (exclusive on the band's low edge ``e0``).
             Bands with ``e0 >= emax`` are excluded.
             Ignored when *keys* is given.
+        energy : float or None, optional
+            Select all bands whose energy interval ``[e0, e1)`` contains the
+            given energy in MeV, i.e. ``b.e0 <= energy < b.e1``.
+            Can be combined with *psf*.  Ignored when *keys* is given.
 
         Returns
         -------
@@ -1203,6 +1314,10 @@ class PixelTable(dict):
         Select by explicit keys::
 
             pt.select(keys=[(2, 4), (2, 5)])
+
+        Select all bands containing 1742 MeV::
+
+            pt.select(energy=1742)
         """
         if keys is not None:
             # Accept a single band key (2-tuple) or an iterable of keys.
@@ -1210,7 +1325,7 @@ class PixelTable(dict):
                 keys = [keys]
             self._selected = list(keys)
             return self
-        if psf is None and emin is None and emax is None:
+        if psf is None and emin is None and emax is None and energy is None:
             self._selected = None
             return self
 
@@ -1228,6 +1343,8 @@ class PixelTable(dict):
             if emin is not None and b.e0 < emin:
                 continue
             if emax is not None and b.e0 >= emax:
+                continue
+            if energy is not None and not (b.e0 <= energy < b.e1):
                 continue
             selected.append(k)
         if not selected:
@@ -1549,8 +1666,7 @@ class PixelTable(dict):
                 full_grad = np.zeros(n_all, dtype=float) if need_grad else None
 
                 for band in pixel_table._iter_bands():
-                    m = band._fit_mask
-                    counts = band.photons if m is None else band.photons[m]
+                    counts = band.coverage['photons'].to_numpy() if band.coverage is not None else band.photons
                     if need_grad:
                         # Single PSF pass yields both model and Jacobian.
                         model, dm_dtheta = band.pixel_counts_and_gradient()
@@ -2128,7 +2244,7 @@ def plot_residuals_for_given_energy(pixel_table, energy_index):
     """
     def mdplot(band,ax=None):
         """Render one PSF panel for the selected energy slice."""
-        d = band.photons; m = band.diffuse+band.sources
+        d = band.photons; m = band.diffuse_counts+band.source_counts
         fig, ax = plt.subplots(figsize=(5,5)) if ax is None else (ax.figure, ax)
         ax.scatter(m.clip(1,1e4), ((d-m)/np.sqrt(m)).clip(-5,10), s=2);
         ax.set(xscale='log',yscale='linear',xlabel='model counts/pixel', ylabel=r'residual ($\sigma$ units)', )

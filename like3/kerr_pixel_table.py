@@ -111,7 +111,7 @@ class KerrPixelTable(dict):
             self.slice: slice | None = None
   
             psf_index = self.event_type if self.event_type < 2 else self.event_type - 2
-            self.key = (int(psf_index), _energy_index(self.e0))
+            self.key = (int(psf_index), int(_energy_index(self.e0)))
             self.energy = f'{np.sqrt(self.e0 * self.e1) * 1e-3:.2f} GeV'
             super().__init__(nside=nside, frame='galactic', order='nested')
 

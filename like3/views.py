@@ -23,6 +23,22 @@ _pkg = __package__ if __package__ else 'like3'
 tools = importlib.import_module(f'{_pkg}.tools')
 
 
+def _is_verbose(obj):
+    """Return the effective verbose flag for a view-like object."""
+    if hasattr(obj, 'verbose'):
+        return bool(obj.verbose)
+    blike = getattr(obj, 'blike', None)
+    if blike is not None and hasattr(blike, 'verbose'):
+        return bool(blike.verbose)
+    return True
+
+
+def _verbose_print(obj, *args, **kwargs):
+    """Print only when the owning view has verbose output enabled."""
+    if _is_verbose(obj):
+        print(*args, **kwargs)
+
+
 def bounded_root(func, x0, bounds, method='hybr', tol=1e-8, maxiter=1000):
     """Find a bounded root using an unbounded-variable transform.
 
@@ -200,6 +216,9 @@ class FitterSummaryMixin(object):
         gradient : bool
             If True, include gradient values.
         """
+        if out is None and not _is_verbose(self):
+            return
+
         if title is not None:
             print(title, file=out)
 
@@ -250,7 +269,7 @@ class FitterSummaryMixin(object):
             H = np.array(self.hessian()) # in case matrix type
             return np.dot(np.dot(gv, np.linalg.inv(H)), gv)/4
         except Exception as msg:
-            print('Failed log likelihood estimate, returning 99.: %s' % msg)
+            _verbose_print(self, 'Failed log likelihood estimate, returning 99.: %s' % msg)
             return 99.
 
 
@@ -294,10 +313,39 @@ class FitPlotMixin(object):
             ``sigs`` are 1-sigma estimates from the covariance diagonal.
         """
         parz = self.get_parameters()
-        hess = self.hessian(parz)
-        cov = np.linalg.inv(hess) if len(parz)>1 else 1./hess
-        sigs = np.sqrt(np.asarray(cov.diagonal()).flatten())
-        parmax = parz-self.gradient(parz)*sigs**2/2.
+        hess = np.array(self.hessian(parz), dtype=float)
+
+        # Some callers provide Hessian(logL) (negative-definite near optimum)
+        # while others provide Hessian(-logL). Pick the sign that yields a
+        # physically meaningful covariance (non-negative diagonal).
+        if hess.ndim == 0:
+            candidates = [np.array([[hess]], dtype=float), np.array([[-hess]], dtype=float)]
+        else:
+            candidates = [hess, -hess]
+
+        cov = None
+        best_diag = None
+        for h in candidates:
+            try:
+                c = np.linalg.inv(h)
+            except np.linalg.LinAlgError:
+                continue
+            diag = np.diag(c).copy()
+            good = np.isfinite(diag) & (diag >= 0)
+            score = int(np.count_nonzero(good))
+            if cov is None or score > int(np.count_nonzero(np.isfinite(best_diag) & (best_diag >= 0))):
+                cov = c
+                best_diag = diag
+
+        if cov is None:
+            # Final fallback for near-singular cases used only for plotting.
+            h = candidates[0]
+            cov = np.linalg.pinv(h)
+            best_diag = np.diag(cov).copy()
+
+        best_diag[best_diag < 0] = np.nan
+        sigs = np.sqrt(best_diag)
+        parmax = parz - self.gradient(parz) * sigs**2 / 2.
         return parz, parmax, sigs
 
     def plot(self: Any, index, ax=None, nolabels=False , y2lim=(-5,5), estimate=None):
@@ -340,8 +388,9 @@ class FitPlotMixin(object):
         if not np.isnan(sig):
             xsig = np.linspace(-3, 3, 27)
             x =  x0 + xsig * sig 
-            ax.plot(xsig, list(map(func,x))-ref, '-b')
-            ax.plot(xsig, -0.5*((x-x0)/sig)**2, '--b')
+            profile = np.array(list(map(func, x)), dtype=float)
+            ax.plot(xsig, profile - ref, '-', color='orange')
+            ax.plot(xsig, -0.5*((x-x0)/sig)**2, '--', color='orange')
             ax.plot((pz-x0)/sig, func(pz)-ref, 'dk')
             ax.plot([-1,1], [-0.5,-0.5], '|-')
             ax.grid(False)
@@ -492,10 +541,12 @@ class FitterMixin(object):
         from scipy import optimize
         quiet = kwargs.pop('quiet', True)
         if not kwargs.pop('use_gradient', True):
-            print('Warning: ignoring use_gradient=False')
+            _verbose_print(self, 'Warning: ignoring use_gradient=False')
         estimate_errors = kwargs.pop('estimate_errors', True)
-        if not quiet: print('using optimize.fmin_l_bfgs_b with parameter bounds %s\n, kw= %s'% (
-                            self.bounds, kwargs))
+        if not quiet:
+            _verbose_print(self, 'using optimize.fmin_l_bfgs_b with parameter bounds %s\n, kw= %s'% (
+                self.bounds, kwargs
+            ))
         parz = self.get_parameters()
         winit = self.log_like()
         # assert len(parz)==len(self.gradient()), 'tracking a bug'
@@ -525,12 +576,12 @@ class FitterMixin(object):
             **kwargs)
         self.fmin_ret=ret
         if ret[2]['warnflag']>0: 
-            print('Fit failure: check parameters')
+            _verbose_print(self, 'Fit failure: check parameters')
             self.set_parameters(parz) #restore if error 
             self.covariance = None 
             raise Exception( 'Fit failure:\n%s' % ret[2])
         if not quiet:
-            print(ret[2])
+            _verbose_print(self, ret[2])
         f = ret 
         if estimate_errors:
             # maximize(logL) by minimizing(-logL): cov = inv(-d2logL/dp2)
@@ -538,7 +589,7 @@ class FitterMixin(object):
             diag = np.array(cov.diagonal()).flatten()
             bad = diag<0
             if np.any(bad):
-                print('Minimizer warning: bad errors for values %s'\
+                _verbose_print(self, 'Minimizer warning: bad errors for values %s'\
                     %np.asarray(self.parameter_names)[bad]) 
                 diag[bad]=0
             return f[1], f[0], np.sqrt(diag)
@@ -581,7 +632,7 @@ class FitterMixin(object):
         
     def restore(self: Any):
         """Restore parameters to the saved initial state."""
-        print(f'set parameters to {self.initial_parameters}')
+        _verbose_print(self, f'set parameters to {self.initial_parameters}')
         self.set_parameters(self.initial_parameters)
 
     def check_gradient(self: Any, delta=1e-5):
@@ -650,6 +701,7 @@ class FitterView(FitPlotMixin, FitterMixin, FitterSummaryMixin, WithMixin):
             Reserved; currently unused.
         """
         self.blike = blike
+        self.verbose = getattr(blike, 'verbose', True)
         self.parameters = blike.parameterset
         # self.parameters = blike.sources.parameters
         self.sources = self.parameters.free_sources
@@ -686,18 +738,18 @@ class FitterView(FitPlotMixin, FitterMixin, FitterSummaryMixin, WithMixin):
         if fraction==0 : return
         delta = self.get_parameters()-self.initial_parameters
         if fraction==1:
-            print(f'set parameters to current values')
+            _verbose_print(self, 'set parameters to current values')
             self.initial_parameters = self.get_parameters()
             return
         # fractional change
         self.initial_parameters += fraction * delta
-        print(f'parameters to save {self.initial_parameters}')
+        _verbose_print(self, f'parameters to save {self.initial_parameters}')
         
     def restore(self):
         """Restore parameters and print post-restore gradient."""
-        print(f'set parameters to {self.initial_parameters}')
+        _verbose_print(self, f'set parameters to {self.initial_parameters}')
         self.set_parameters(self.initial_parameters)
-        print(f'gradient after restore: {self.gradient()}')
+        _verbose_print(self, f'gradient after restore: {self.gradient()}')
 
     @property 
     def bounds(self):
@@ -760,6 +812,7 @@ class SubsetFitterView(parameterset.ParSubSet, FitPlotMixin, FitterMixin, Fitter
             Parameter names or indices to exclude.
         """
         self.blike = blike
+        self.verbose = getattr(blike, 'verbose', True)
         selected = []
         if select is not None:
             selected.append(select)
@@ -903,20 +956,21 @@ class EnergyFluxView(WithMixin):
     ----------
     blike : LikelihoodViews
         Band-likelihood container.
-    func : FitterView
-        Fitter view with the source normalization parameter selected.
+    source_name : str
+        Name of the source whose Norm parameter is selected for fitting.
     energy : float or None
         Evaluation energy in MeV. If None, uses the model reference energy.
     **kw
         ``bound`` (float): lower bound for the internal log-norm parameter.
     """
 
-    def __init__(self, blike, func, energy, **kw):
-        
-        self.func = func
-        self.blike=blike
-        self.source = source = self.func.source
-        self.model=model = source.spectral_model
+    def __init__(self, blike, source_name, energy, **kw):
+
+        self.blike = blike
+        self.source = source = blike.sources.find_source(source_name)
+        self.model = model = source.spectral_model
+        norm_param = source_name + '_' + model.param_names[0]
+        self.func = blike.fitter_view(norm_param)
         #assert model[0]==model['norm']
         self.norm = model[0]
         self.tointernal = model.mappers[0].tointernal
@@ -1036,7 +1090,25 @@ class LikelihoodViews(object):
 
     sources: Any  # provided by base class or initializer
 
-    def __init__(self, bands_or_pixel_table, sources=None):
+    @property
+    def parameterset(self):
+        """Current parameter set for the attached source model.
+
+        When the underlying source model is reinitialized after thaw/freeze or
+        model replacement, this property follows the current
+        ``sources.parameters`` object instead of holding a stale cached view.
+        """
+        if getattr(self, 'sources', None) is not None:
+            current = getattr(self.sources, 'parameters', None)
+            if current is not None:
+                return current
+        return getattr(self, '_parameterset', None)
+
+    @parameterset.setter
+    def parameterset(self, value):
+        self._parameterset = value
+
+    def __init__(self, bands_or_pixel_table, sources=None, verbose=True):
         """Initialize likelihood views from either PixelTable or legacy parts.
 
         Parameters
@@ -1046,12 +1118,16 @@ class LikelihoodViews(object):
             Legacy: band container object.
         sources : object or None
             Legacy source-model object when using the 2-argument constructor.
+        verbose : bool, optional
+            If False, suppress view-managed diagnostic printing.
 
         Notes
         -----
         New code should pass a PixelTable directly. Legacy callers that still
         pass ``(bands, sources)`` remain supported.
         """
+        self.verbose = bool(verbose)
+
         # New preferred path: PixelTable-like object.
         if sources is None and hasattr(bands_or_pixel_table, '_iter_bands') \
                 and hasattr(bands_or_pixel_table, 'source_model'):
@@ -1187,11 +1263,9 @@ class LikelihoodViews(object):
         """
         try:
             source = self.sources.find_source(source_name)
-            model = source.model
-            func = self.fitter_view(source_name + '_' + model.param_names[0])
         except Exception as msg:
             raise Exception('could not create energy flux function for source %s;%s' %(source_name, msg))
-        return EnergyFluxView(self, func, energy, **kw)
+        return EnergyFluxView(self, source.name, energy, **kw)
         
     def tsmap_view(self, source_name, **kw):
         """Return a TS-map view for position scanning of the named source.
