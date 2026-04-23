@@ -62,24 +62,24 @@ class FermiFit(views.LikelihoodViews):
         """Fitter-space parameter bounds."""
         return self.source_model.bounds
 
-    def get_sed(self, source_name=None, event_type=None, update=False, tol=0.2):
-        """ return the SED recarray for the source, including npred info
-        source_name : string
-            Name of a source in the ROI, with possible wildcards
-        event_type : None, or integer, 0/1 for front/back, 2-5 for psf0-3
-        update : bool
-            set True to force recalculation of sed recarray
-        """
+    # def get_sed(self, source_name=None, event_type=None, update=False, tol=0.2):
+    #     """ return the SED recarray for the source, including npred info
+    #     source_name : string
+    #         Name of a source in the ROI, with possible wildcards
+    #     event_type : None, or integer, 0/1 for front/back, 2-5 for psf0-3
+    #     update : bool
+    #         set True to force recalculation of sed recarray
+    #     """
         
-        source = self.source_model.find_source(source_name)
-        if not hasattr(source, 'sedrec') or source.sedrec is None\
-                 or (update and np.any(source.model.free)):
-            pkg = __package__ if __package__ else 'like3'
-            sedfuns = importlib.import_module(f'{pkg}.sedfuns')
-            with sedfuns.SED(self, source.name) as sf:
-                source.sedrec = sf.sed_rec(event_type=event_type, tol=tol)
+    #     source = self.source_model.find_source(source_name)
+    #     if not hasattr(source, 'sedrec') or source.sedrec is None\
+    #              or (update and np.any(source.model.free)):
+    #         pkg = __package__ if __package__ else 'like3'
+    #         sedfuns = importlib.import_module(f'{pkg}.sedfuns')
+    #         with sedfuns.SED(self, source.name) as sf:
+    #             source.sedrec = sf.sed_rec(event_type=event_type, tol=tol)
         
-        return source.sedrec
+    #     return source.sedrec
 
     def get_sed_poisson_table(self, source_name=None, event_type=None, tol=0.2):
         """Return an SED table with one Poisson object per energy bin.
@@ -1149,12 +1149,12 @@ class FermiFit(views.LikelihoodViews):
 
 
 def main(
-    source_name,
+    source_name, cone_size=1.0,
     *,
     pixel_table_path='files/kerr/toby_v4.fits',
     catalog='v40',
     query=None,
-    cone_size=1.0,
+
     verbose=False,
 ):
     """Build and return a ``FermiFit`` for one catalog source.
@@ -1213,6 +1213,8 @@ def main(
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(description='Build a FermiFit from a catalog source name.')
     parser.add_argument('source_name', help='Catalog source name used to build the SourceModel.')
+    parser.add_argument('cone_size',  help='Cone radius in degrees for catalog selection.')
+
     parser.add_argument(
         '--pixel-table-path',
         default='files/kerr/toby_v4.fits',
@@ -1228,12 +1230,12 @@ def _parse_args(argv=None):
         default=None,
         help='Optional catalog query filter.',
     )
-    parser.add_argument(
-        '--cone-size',
-        type=float,
-        default=1.0,
-        help='Cone radius in degrees for catalog selection.',
-    )
+    # parser.add_argument(
+    #     '--cone-size',
+    #     type=float,
+    #     default=1.0,
+    #     help='Cone radius in degrees for catalog selection.',
+    # )
     parser.add_argument(
         '--verbose',
         action='store_true',
@@ -1248,11 +1250,11 @@ if __name__ == '__main__':
     show_date()
     with capture_hide(f'Setup output for {args.source_name}') as setup_output:
         ff = main(
-            args.source_name,
+            args.source_name, 
+            float(args.cone_size),
             pixel_table_path=args.pixel_table_path,
             catalog=args.catalog,
             query=args.query,
-            cone_size=args.cone_size,
             verbose=args.verbose,
         )
 
