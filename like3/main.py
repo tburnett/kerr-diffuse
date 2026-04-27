@@ -12,8 +12,327 @@ import matplotlib.pyplot as plt
 plt.style.use('dark_background')
 import numpy as np
 from astropy.coordinates import SkyCoord
+from astropy_healpix import HEALPix
 import pandas as pd
 from like3 import views
+
+class PSFlookup:
+    
+    def __init__(self, table_path='files/loc'):
+        """ A functor that returns the PSF for a given band, using the same PSF for all pixels in the band.
+
+        Loads :class:`~pylib.psf_func.PSFlist` entries from *table_path* and
+        matches each band to the nearest-energy PSF for its event type.
+        When *table_path* is a directory, ``fb_psf_table.pkl`` is used for
+        FRONT/BACK bands (event types 0-1) and ``psf_psf_table.pkl`` for
+        PSF-partition bands (event types 2-5).  If an event type is absent
+        from the tables, the FRONT (event type 0) shapes are used as a
+        fallback.
+
+        Parameters
+        ----------
+        table_path : str or Path, optional
+            Directory containing ``fb_psf_table.pkl`` and
+            ``psf_psf_table.pkl``, or a direct path to a single pickle file.
+            Default is ``'files/loc'``.
+
+        Returns
+        -------
+        PixelTable
+            Returns *self* for method chaining.
+        """
+        from pylib.psf_func import PSFlist
+        import copy
+
+        all_psfs = PSFlist(event_type=None, table_path=table_path)
+        if not all_psfs:
+            print(f'PSFlookup: no PSF entries loaded from {table_path!r}')
+            return self
+
+        et_names = PSFlist.PSF.et_name
+        ets = sorted({p.event_type for p in all_psfs})
+        et_labels = [et_names[e] if e < len(et_names) else str(e) for e in ets]
+        # print(f'PSFlookup: {len(all_psfs)} PSF entries '
+        #       f'({", ".join(et_labels)}) from {table_path!r}')
+        self.psf_list = all_psfs
+
+    def __call__(self, band):
+        """Return the PSF for *band*."""
+        
+        for candidate_psf in self.psf_list:
+            if band.event_type != candidate_psf.event_type:
+                continue
+            if abs(candidate_psf.energy/band.energy-1)<0.1:
+                # print(f'PSFlookup: found PSF {candidate_psf} for band {band}')
+                return candidate_psf
+        raise ValueError(f'PSFlookup: no PSF found for band {band} ')
+    
+class MultiBandLikelihood(dict):
+    """Class to manage likelihood evaluation from multiple bands."""
+    def __init__(self, pixel_table, source_model):
+        self.pixel_table = pixel_table
+        self.source_model = source_model
+        self.selected = None
+        super().__init__({key: BandLikelihood(band, source_model) for key, band in self.pixel_table.items()})
+
+    @property
+    def parameter_names(self):
+        return self.source_model.parameter_names
+        
+    @property
+    def bounds(self):
+        return self.source_model.bounds 
+
+    #======= Parameter accessors with coverage update ++++++++++++++++++++++
+    @property
+    def parameters(self):
+        return self.source_model.parameters.get_parameters()
+    
+    @parameters.setter
+    def parameters(self, pars):
+        if pars is None:
+            return
+        if len(pars) != len(self.parameters):
+            raise ValueError(f'Expected {len(self.source_model.parameters)} parameters, got {len(pars)}')
+        self.source_model.parameters.set_parameters(pars)
+
+        # update pixels in selected bands
+        for bl in self._iter_bands():
+            bl.evaluate_source_model()
+    #============++++++++++++++++++++++
+
+    def select(self, *pars, **kwargs):
+        """Select bands, using pixel table selection."""
+        self.pixel_table.select(*pars, **kwargs)
+        self.selected =  self.pixel_table._selected
+        return self.selected
+
+    def _iter_bands(self):
+        """Iterate over selected bands, or all bands when no selection is active."""
+        if self.selected is None:
+            return self.values()
+        return (self[k] for k in self.selected)
+
+    def loglike(self, pars=None, **kwargs):
+        """Evaluate the total log-likelihood across all selected bands.
+        If `pars` is provided, update the source model parameters before computing."""
+        if pars is not None:
+            self.parameters = pars
+        return sum(bl.loglike() for bl in self._iter_bands())
+
+    def loglike_grad(self, pars=None):
+        """Compute the log-likelihood and its gradient for the current model parameters.
+        If `pars` is provided, update the source model parameters before computing."""
+        if pars is not None:
+            self.parameters = pars
+        total_loglike = 0.0
+        total_grad = np.zeros_like(self.parameters)
+        for bl in self._iter_bands():
+            loglike, grad = bl.loglike_grad()
+            total_loglike += loglike
+            total_grad += grad
+        return total_loglike, total_grad
+
+
+class BandLikelihood(HEALPix):
+    """ For a given band and source model, select active pixels from the SourceModel, 
+        evaluate PSF responses for those pixels,
+        and provide the likelihood function."""
+
+    def __init__(self, band, source_model):
+        self.band = band
+        self.source_model = source_model    
+        self.psf = PSFlookup()(band)
+        super().__init__(nside=band.nside, order=band.order, frame=band.frame)
+        self.center = source_model[0].skydir if len(source_model) > 0 else SkyCoord(0, 0, unit='deg')
+        self.coverage = None  # populated on demand by build_coverage()
+        self.psf_cache = {}  # populated on demand by response()
+        self.build_coverage() if source_model else None
+
+
+    def __repr__(self):
+        return f'BandLikelihood(band={self.band}, source_model={self.source_model})'
+    
+    @property
+    def parameter_names(self):
+        return self.source_model.parameter_names
+        
+    @property
+    def bounds(self):
+        return self.source_model.bounds 
+
+    #======= Parameter accessors with coverage update ++++++++++++++++++++++
+    @property
+    def parameters(self):
+        return self.source_model.parameters.get_parameters()
+    
+    @parameters.setter
+    def parameters(self, pars):
+        if pars is None:
+            return
+        if len(pars) != len(self.parameters):
+            raise ValueError(f'Expected {len(self.source_model.parameters)} parameters, got {len(pars)}')
+        self.source_model.parameters.set_parameters(pars)
+        self.evaluate_source_model()
+    #============++++++++++++++++++++++
+
+    def build_coverage(self, r68_radius: float = 4.0) -> None:
+        """Build and cache a coverage DataFrame for pixels to the source footprint."""
+        import pandas as pd
+        radius_deg = r68_radius * self.band.psf.r68 if self.band.psf is not None else 2.0
+        mask = np.zeros(len(self.band.pix), dtype=bool)
+        for src in self.source_model:
+            mask |= self.band.cone_search(src.skydir, radius_deg)
+        pix = self.band.pix[mask]
+        photons = self.band.photons[mask]
+        diffuse_counts = self.band.diffuse_counts[mask]
+        source_counts = self.band.source_counts[mask]
+        
+        self.coverage = pd.DataFrame(dict(
+            pix=pix,
+            photons=photons,
+            diffuse_counts=diffuse_counts,
+            source_counts=source_counts,
+            background_counts=diffuse_counts + source_counts,
+            exposure=self.band.exposure_map(pix).astype(np.float32),
+        ))
+        self.evaluate_source_model()   
+
+    def response(self, source, pixels=None):
+        """Return PSF response for a source evaluated on given pixel indices.
+        If *pixels* is None, the coverage pixels are used.  The PSF response is cached per source for efficiency."""
+        if source is None:
+            cpix = np.asarray([], dtype=np.int64)
+            return cpix, np.asarray([], dtype=float)
+
+        source_name = source.name if hasattr(source, 'name') else str(source)
+        cache = self.psf_cache
+        if source_name in cache:
+            return cache[source_name]
+        # Compute and cache the PSF list for this source
+        sdir = source.skydir
+        sdir = sdir.coord if hasattr(sdir, 'coord') else sdir
+
+        if pixels is None:
+            cpix = self.coverage['pix'].to_numpy() if self.coverage is not None else np.asarray([], dtype=np.int64)
+        else:
+            cpix = np.asarray(pixels, dtype=np.int64)
+        aa = sdir.separation(self.healpix_to_skycoord(cpix)).deg
+        psf = self.psf
+        vpix = np.array(list(map(psf, aa)), dtype=float) * self.pixel_area.value
+        cache[source_name] = vpix
+        return vpix
+
+    def evaluate_source_model(self, pix=None):
+        """Evaluate the source model counts for coverage pixels."""
+        if pix is None:
+            if self.coverage is not None:
+                pix = self.coverage['pix'].to_numpy()
+            else:
+                pix = self.band.pix
+        counts = np.zeros(len(pix), dtype=float)
+        exp = self.coverage['exposure'].to_numpy() #if self.coverage is not None else self.band.exposure_map(pix)
+        for src in self.source_model:
+            flux = src.model(self.band.energy)
+            v = self.response(src, pix)
+            counts += v * flux
+        counts *= exp
+        self.coverage['model_counts'] = counts
+    
+    def loglike(self, pars=None):
+        """Compute the log-likelihood for the current model parameters.
+        If `pars` is provided, update the source model parameters before computing."""
+        if pars is not None:
+            self.parameters = pars
+
+        # Model counts for coverage pixels
+        cov = self.coverage
+        data = cov['photons'].to_numpy()
+        model = cov['model_counts'].to_numpy()
+
+        # Poisson log-likelihood (ignoring constant term)
+        ll = np.sum(data * np.log(model + 1e-12) - model)
+        return float(ll)
+
+    def pixel_gradient(self):
+        """Evaluate per-pixel count gradients for free source-model parameters.
+
+        Returns
+        -------
+        np.ndarray
+            Gradient matrix of shape (n_pixels, n_free_parameters)."""
+        
+        g = []
+        keys = self.coverage['pix'].to_numpy() 
+        for src in self.source_model:
+            grad = src.model.gradient(self.band.energy)[src.model.free]
+            v = self.response(src)
+            g.append(v[:, None] * grad[None, :])
+        g_arr = np.hstack(g) if g else np.zeros((len(keys), 0))
+        # g_arr *= self.band.exposure_map(keys)[:, None]
+        g_arr *= self.coverage['exposure'].to_numpy()[:, None] #if self.coverage is not None else self.band.exposure_map(keys)[:, None]
+        return g_arr
+
+    def loglike_grad(self, pars=None):
+        """Compute the log-likelihood and its gradient for the current model parameters.
+        If `pars` is provided, update the source model parameters before computing."""
+        if pars is not None:
+            self.parameters = pars
+        cov = self.coverage
+        data = cov['photons'].to_numpy()
+        model = cov['model_counts'].to_numpy()
+        grad_matrix = np.zeros((len(model), 0))
+        if hasattr(self, 'pixel_gradient') and callable(self.pixel_gradient):
+            grad_matrix = self.pixel_gradient()
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratio = np.where(model > 0, data / model, 0.0)
+        grad = np.sum((ratio[:, None] - 1) * grad_matrix, axis=0) if grad_matrix.shape[1] > 0 else np.zeros(0)
+        ll = np.sum(data * np.log(model + 1e-12) - model)
+        return float(ll), grad
+
+    def expand_healpix_array(self,arr):
+            """Expand a per-pixel array to a full HEALPix array."""
+
+            if len(arr) == 12*self.nside**2:
+                return arr
+            
+            if len(arr) == len(self.coverage):
+                hpa = np.full(12*self.nside**2, np.nan, dtype=float)
+                hpa[self.coverage.pix] = arr
+                return hpa
+            raise ValueError(f'Cannot expand array of length {len(arr)} to HEALPix array of length {12*self.nside**2}')
+
+    @property
+    def residual(self):
+        """Compute the residual counts (data - model) for coverage pixels."""
+        return self.coverage['photons'].to_numpy() - self.coverage['source_counts'].to_numpy()
+    
+    @property
+    def sigma(self):
+        """Compute residual in (approximate) sigma units for coverage pixels."""
+        model = self.coverage['model_counts'].to_numpy()
+        data = self.coverage['photons'].to_numpy()
+        return np.where(model > 0, (data - model) / np.sqrt(model), 0.0)
+
+    def zea_plot(self, what, **kwargs):
+        """
+         Plot a HEALPix map of the given per-pixel quantity *what* in ZEA projection 
+         centered on the source model."""
+        from like3 import sky_display
+        if isinstance(what, str) and what in self.coverage:
+            arr = self.expand_healpix_array(self.coverage[what])
+        elif isinstance(what, np.ndarray):
+            arr = self.expand_healpix_array(what)
+        else:
+            raise ValueError(f"Unknown coverage key or array: {what}")
+        
+        zea = sky_display.zea_plot(self.center, arr, r68 = self.psf.r68, 
+                                   source_model=self.source_model, **kwargs)
+        zea.axes_text(0.98, 0.98,
+                        f'{self.band.energy / 1e3:.2f} GeV\nPSF{self.psf.event_type-2}',
+                        color='white', ha='right', va='top', fontsize=12)
+        return zea
+
 
 
 class FermiFit(views.LikelihoodViews):
@@ -33,12 +352,6 @@ class FermiFit(views.LikelihoodViews):
         self.fermi_catalog = getattr(pixel_table.source_model, 'fermi_catalog', None)
         self.fit_info: dict = {}
 
-    # def __getattr__(self, name):
-    #     # Delegate unknown attributes to the wrapped PixelTable.
-    #     # __getattr__ is only called when normal lookup fails, so this
-    #     # does not shadow any attribute defined directly on FermiFit.
-    #     return getattr(self.pixel_table, name)
-
     # ------------------------------------------------------------------
     # Parameter accessors
     # ------------------------------------------------------------------
@@ -51,6 +364,15 @@ class FermiFit(views.LikelihoodViews):
     def parameters(self):
         """Free-parameter set of the attached source model."""
         return self.source_model.parameters
+    @parameters.setter
+    def parameters(self, pars):
+        """Set free parameters of the attached source model."""
+        if pars is None:
+            return
+        if len(pars) != len(self.parameters):
+            raise ValueError(f'Expected {len(self.source_model.parameters)} parameters, got {len(pars)}')
+        self.source_model.parameters.set_parameters(pars)
+
 
     @property
     def parameter_names(self):
@@ -223,7 +545,7 @@ class FermiFit(views.LikelihoodViews):
             raise ValueError(f'sed table missing required fields: {sorted(missing)}')
 
         if ax is None:
-            _, ax = plt.subplots(figsize=(10, 6))
+            _, ax = plt.subplots(figsize=(6, 4))
 
         if xlim is None:
             xlim = (emin, emax)
@@ -1154,7 +1476,7 @@ def main(
     pixel_table_path='files/kerr/toby_v4.fits',
     catalog='v40',
     query=None,
-
+    frame='galactic',
     verbose=False,
 ):
     """Build and return a ``FermiFit`` for one catalog source.
@@ -1197,7 +1519,7 @@ def main(
     sourcelist_mod = importlib.import_module(f'{pkg}.sourcelist')
 
     source_model = sourcelist_mod.SourceModel.from_fermi_catalog(
-        source_name,
+        source_name, frame=frame,
         version=catalog,
         query=query,
         cone_size=cone_size,
@@ -1230,12 +1552,12 @@ def _parse_args(argv=None):
         default=None,
         help='Optional catalog query filter.',
     )
-    # parser.add_argument(
-    #     '--cone-size',
-    #     type=float,
-    #     default=1.0,
-    #     help='Cone radius in degrees for catalog selection.',
-    # )
+    parser.add_argument(
+        '--frame',
+        default='galactic',
+        help='Coordinate frame for the center (e.g., "galactic" or "icrs").',
+    )
+
     parser.add_argument(
         '--verbose',
         action='store_true',
@@ -1256,6 +1578,7 @@ if __name__ == '__main__':
             catalog=args.catalog,
             query=args.query,
             verbose=args.verbose,
+            frame=args.frame,
         )
 
         pt = ff.pixel_table

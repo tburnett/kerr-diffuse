@@ -18,6 +18,7 @@ class SourceModelException(Exception):
     """Raised for source-lookup and source-list management errors."""
 
 class SourceModel(list):
+
     """List-like container for model sources plus parameter-management helpers.
 
     Notes
@@ -30,6 +31,7 @@ class SourceModel(list):
         """Initialize from an iterable of source objects."""
 
         self.fermi_catalog = None
+        self.name=''
         for source in sources:
             self.add_source(source)
         
@@ -42,8 +44,15 @@ class SourceModel(list):
             self.selected_source = None
             self.selected_source_index = -1
 
+    def clear(self):
+            """Remove all sources from the model and reset selection."""
+            super().clear()
+            self.selected_source = None
+            self.selected_source_index = -1
+            self.initialize()
+
     def __repr__(self):
-        return f'SourceModel: {len(self)} sources with {len(self.parameters)} free parameters'
+        return f'SourceModel: @{self.name} {len(self)} sources with {len(self.parameters)} free parameters'
 
     def model_counts(self, band, pix):
         """Return predicted counts for pixels in one energy band.
@@ -337,6 +346,7 @@ class SourceModel(list):
             return None
         self.append(newsource)
         self.initialize()
+        self.selected_source = newsource
         return newsource
      
     def del_source(self, source_name):
@@ -677,6 +687,14 @@ class SourceModel(list):
             for source_name, row in catalog_subset.iterrows()
         ])
         model.fermi_catalog = fermi_catalog
+
+        # Set a descriptive name for the SourceModel
+        if isinstance(skycoord, str):
+            model.name = f"{skycoord} ({version})"
+        elif hasattr(cone_center, 'to_string'):
+            model.name = f"ROI@{cone_center.to_string('hmsdms')} ({version})"
+        else:
+            model.name = f"Fermi4FGL ({version})"
 
         # If a target coordinate/name was given, ensure selected_source is
         # deterministic for downstream code that relies on the active source.
