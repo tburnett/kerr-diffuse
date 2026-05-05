@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 
 import matplotlib.pyplot as plt
+
 plt.style.use('dark_background')
 import numpy as np
 from astropy.coordinates import SkyCoord
@@ -66,22 +67,43 @@ class PSFlookup:
                 # print(f'PSFlookup: found PSF {candidate_psf} for band {band}')
                 return candidate_psf
         raise ValueError(f'PSFlookup: no PSF found for band {band} ')
+
+
+from like3.fitter import Fitted   
+class MultiBandLikelihood(dict, Fitted):
+
+
+    """A collection of BandLikelihood objects, one per band, that share a common SourceModel.
+    It implements the Fitted interface by delegating parameter access to the shared SourceModel and summing log-likelihoods across bands.
+    """
     
-class MultiBandLikelihood(dict):
-    """Class to manage likelihood evaluation from multiple bands."""
     def __init__(self, pixel_table, source_model):
         self.pixel_table = pixel_table
         self.source_model = source_model
         self.selected = None
+        self.energies = pixel_table.energies
         super().__init__({key: BandLikelihood(band, source_model) for key, band in self.pixel_table.items()})
+
+        self.llz = self.loglike()  # baseline log-likelihood for delta-TS calculations
+        
+    @property
+    def sources(self):
+        # For compatibility with FermiFit-like interface
+        return self.source_model
 
     @property
     def parameter_names(self):
         return self.source_model.parameter_names
-        
+
+    # ============== needed by Fitter interface ======================        
     @property
     def bounds(self):
         return self.source_model.bounds 
+    def get_parameters(self):
+        return self.parameters
+    def set_parameters(self, pars):
+        self.parameters = pars
+    # =============================================================
 
     #======= Parameter accessors with coverage update ++++++++++++++++++++++
     @property
@@ -101,6 +123,7 @@ class MultiBandLikelihood(dict):
             bl.evaluate_source_model()
     #============++++++++++++++++++++++
 
+
     def select(self, *pars, **kwargs):
         """Select bands, using pixel table selection."""
         self.pixel_table.select(*pars, **kwargs)
@@ -113,9 +136,28 @@ class MultiBandLikelihood(dict):
             return self.values()
         return (self[k] for k in self.selected)
 
-    def loglike(self, pars=None, **kwargs):
+    def loglike(self, pars=None, *, skydir=None, ):
         """Evaluate the total log-likelihood across all selected bands.
-        If `pars` is provided, update the source model parameters before computing."""
+        If `pars` is provided, update the source model parameters before computing.
+        If `skydir` is provided, update the source position before computing."""
+
+        if skydir is not None:
+            src = self.source_model.selected_source
+            if src is None:
+                raise ValueError('No source selected in source model for position update')
+ 
+            if isinstance(skydir, tuple):
+                skydir = SkyCoord(*skydir, unit='deg', frame='icrs')  
+            if not isinstance(skydir, SkyCoord):
+                raise ValueError(f'Expected skydir as SkyCoord or (ra, dec) tuple, got {type(skydir)}') 
+
+            src.skydir = skydir
+            total_loglike = 0.0
+            for bl in self._iter_bands():
+                bl.update_position(src) # ensure pixels are updated for new position
+                total_loglike += bl.loglike(skydir=skydir, )
+            return total_loglike
+        
         if pars is not None:
             self.parameters = pars
         return sum(bl.loglike() for bl in self._iter_bands())
@@ -133,6 +175,218 @@ class MultiBandLikelihood(dict):
             total_grad += grad
         return total_loglike, total_grad
 
+    def __call__(self, pars=None, use_gradient=False, **kwargs):
+        """Callable interface to negative log-likelihood, for compatibility with optimizers."""
+        # print(f'MultiBandLikelihood called with pars={pars}' f' and kwargs={kwargs}')
+        if use_gradient:
+            ll, grad = self.loglike_grad(pars)
+            return -ll, -grad
+        return -self.loglike(pars)
+    
+    def gradient(self, pars=None):
+        """Callable interface to negative log-likelihood gradient, for compatibility with optimizers."""
+        _, grad = self.loglike_grad(pars)
+        return -grad
+    
+    def delta_ts(self, skydir):
+        """Return TS difference at ``skydir`` relative to nominal maximum."""
+        # print(f'Computing delta-TS at {skydir.to_string()}')
+        return 2 * (self.loglike(skydir=skydir) - self.llz)
+    
+    
+    def localize(self, update=False, sigma=0.1, **kwargs):
+        """Localize the currently selected source with a TS-map fit.
+
+        Parameters
+        ----------
+        update : bool, optional
+            If ``True``, keep the localized sky position applied by
+            ``Localization.localize``. If ``False``, restore the original
+            source position after the fit and return only the ellipse result.
+        sigma : float, optional
+            Initial localization scale in degrees. If the source already has
+            an ``ellipse`` entry with a ``sigma`` value, that value is used
+            instead.
+        **kwargs
+            Additional keyword arguments forwarded to ``Localization``.
+
+        Returns
+        -------
+        dict
+            Ellipse parameters returned by ``Localization.localize``. The
+            result is also attached to ``source.ellipse``.
+
+        Raises
+        ------
+        ValueError
+            If no source is currently selected in the source model.
+        """
+
+        from .localization import Localization
+        
+        _loglike = self.loglike # capture for use in TSmap_function closure
+
+        class TSmap_function:
+
+            def __init__(self, source) :
+                self.source = source
+                self.skydir = source.skydir
+                self._llz = _loglike(skydir=source.skydir)
+    
+            def __call__(self, skydir):
+                """ TS map function: returns 2*(loglike(skydir) - loglike(nominal)) """
+                return 2*(_loglike(skydir=skydir) -self._llz)
+
+        source = self.source_model.selected_source
+        if source is None:
+            raise ValueError("No source selected in the MultiBandLikelihood's source model")
+
+        saved_skydir = source.skydir  
+
+        # use existing ellipse sigma if available, otherwise default to 0.1 deg 
+        if hasattr(source, 'ellipse'):
+            sigma = source.ellipse.get('sigma', sigma)
+        ellipse = Localization(TSmap_function(source), **kwargs).localize(sigma=sigma)
+        if not update:
+            # move only if requested, otherwise just return the ellipse parameters
+            source.skydir = saved_skydir
+        # attach result in any case
+        source.ellipse = ellipse
+        return ellipse
+    
+       
+    
+    def fitter_view(self, select=None, exclude=None):
+        """Context manager for fitting, similar to FermiFit.fitter_view, for MultiBandLikelihood.
+
+        Parameters
+        ----------
+        select : None, item, or list of items
+            Optional parameter selector (not yet implemented).
+        exclude : None, item, or list of items
+            Optional parameter selector to remove from select (not yet implemented).
+
+        Returns
+        -------
+        context manager yielding a FitterView-like object.
+        """
+        # This is a minimal implementation for demonstration.
+        # In a real implementation, you may want to support select/exclude and diagnostics.
+        from contextlib import contextmanager
+        class DummyFitterView:
+            def __init__(self, mbl):
+                self.mbl = mbl
+                self.calls = 0
+                self.initial_likelihood = self.mbl.loglike()
+                self.parameter_names = self.mbl.parameters.parameter_names
+                self.mask = np.ones(len(self.parameter_names), dtype=bool)
+                self.covariance = None
+                self.fmin_ret = None
+            def maximize(self, **kwargs):
+                # Placeholder: call maximize on parameters if available
+                if hasattr(self.mbl.parameters, 'maximize'):
+                    self.mbl.parameters.maximize(**kwargs)
+                    self.calls += 1
+            def log_like(self):
+                return self.mbl.loglike()
+            def delta_loglike(self):
+                return float(self.log_like() - self.initial_likelihood)
+            def get_parameters(self):
+                return self.mbl.parameters.get_parameters()
+            def set_parameters(self, pars):
+                self.mbl.parameters.set_parameters(pars)
+            def gradient(self):
+                # Placeholder: call gradient if available
+                if hasattr(self.mbl, 'gradient'):
+                    return self.mbl.gradient()
+                return None
+            def save_covariance(self):
+                # Placeholder: set dummy covariance
+                n = len(self.parameter_names)
+                self.covariance = np.eye(n)
+            def plot_all(self):
+                print('plot_all: not implemented for MultiBandLikelihood')
+            def summary(self):
+                print('summary: not implemented for MultiBandLikelihood')
+        @contextmanager
+        def _ctx():
+            fv = DummyFitterView(self)
+            try:
+                yield fv
+            finally:
+                pass
+        return _ctx()
+
+    def fit(self, select=None, exclude=None, summarize=True, setpars=None, **kwargs):
+            """Perform a legacy-style fit using the shared fitter-view workflow, adapted for MultiBandLikelihood.
+
+            Parameters
+            ----------
+            select : None, item, or list of items
+                Optional parameter selector forwarded to ``fitter_view``.
+            exclude : None, item, or list of items
+                Optional parameter selector to remove from ``select``.
+            summarize : bool, default=True
+                If True, print the fit summary after a successful fit.
+            setpars : dict or None
+                Optional parameter values to set before fitting.
+            **kwargs
+                Legacy fitter options. Supported convenience keywords handled here
+                are ``ignore_exception``, ``update_by``, ``tolerance``, and
+                ``plot``; remaining keywords are forwarded to ``fv.maximize``.
+            """
+            # This method is adapted from FermiFit.fit for MultiBandLikelihood usage.
+            if len(self.source_model.parameters) == 0:
+                print('No parameters to fit')
+                return
+
+            ignore_exception = kwargs.pop('ignore_exception', False)
+            update_by = kwargs.pop('update_by', 1.0)
+            tolerance = kwargs.pop('tolerance', 0.0)
+            plot = kwargs.pop('plot', False)
+
+            if setpars is not None:
+                self.source_model.parameters.setitems(setpars, quiet=True)
+
+            fit_kw = dict(use_gradient=True, estimate_errors=True)
+            fit_kw.update(kwargs)
+
+            # Use a context manager if available, else just call maximize directly
+            # For MultiBandLikelihood, we assume a 'fitter_view' context manager is not present,
+            # so we call maximize directly on the source_model.parameters
+            # This may need to be adapted if a fitter_view is implemented.
+            try:
+                # Placeholder for delta_loglike check if implemented
+                qual = 99.0
+                # Assume source_model.parameters has a maximize method (or similar)
+                if hasattr(self, 'maximize'):
+                    self.maximize(**fit_kw)
+                else:
+                    print('No maximize method found on source_model.parameters')
+                    return
+                # Optionally, retrieve fit results and diagnostics here
+                if summarize:
+                    print('Fit completed for MultiBandLikelihood.')
+            except Exception as msg:
+                print(f'Fit Failure {msg}: quality: {qual:.2f}')
+                if not ignore_exception:
+                    raise
+            return
+
+    def localization_view(self):
+        """Return a LocalizedSourceView for the current source model.
+
+        Returns
+        -------
+        LocalizedSourceView
+            Helper for localization and delta-TS scans for the selected source.
+        Raises
+        ------
+        SourceModelException
+            If no source is selected in the source model.
+        """
+        from .sourcelist import LocalizedSourceView
+        return LocalizedSourceView(self.source_model)
 
 class BandLikelihood(HEALPix):
     """ For a given band and source model, select active pixels from the SourceModel, 
@@ -198,16 +452,32 @@ class BandLikelihood(HEALPix):
         ))
         self.evaluate_source_model()   
 
-    def response(self, source, pixels=None):
+    def response(self, source, pixels=None,*, ignore_cache_for=None):
         """Return PSF response for a source evaluated on given pixel indices.
-        If *pixels* is None, the coverage pixels are used.  The PSF response is cached per source for efficiency."""
+        If *pixels* is None, the coverage pixels are used.  
+        The PSF response is cached per source for efficiency.
+         Parameters
+        ----------
+        source : object
+            The source for which to compute the PSF response.
+        pixels : array-like, optional
+            The pixel indices on which to evaluate the PSF response. If None, the coverage pixels are used.
+        ignore_cache_for : str, optional
+            If the cache contains an entry for this source, it will be ignored and recomputed. 
+            This is useful when the source position has changed and the PSF response needs to be updated.
+
+        Returns
+        -------
+        np.ndarray
+            The PSF response values for the specified pixels.
+        """
         if source is None:
             cpix = np.asarray([], dtype=np.int64)
             return cpix, np.asarray([], dtype=float)
 
         source_name = source.name if hasattr(source, 'name') else str(source)
         cache = self.psf_cache
-        if source_name in cache:
+        if source_name in cache and ignore_cache_for != source_name:
             return cache[source_name]
         # Compute and cache the PSF list for this source
         sdir = source.skydir
@@ -239,16 +509,55 @@ class BandLikelihood(HEALPix):
         counts *= exp
         self.coverage['model_counts'] = counts
     
-    def loglike(self, pars=None):
+    def update_position(self, source, new_skydir=None):
+        """Update the position of a source and invalidate the PSF cache for that source.
+        Parameters
+        ----------
+        source : object
+            The source for which to update the position.
+        new_skydir : SkyCoord or tuple, optional
+            The new sky coordinates for the source. If None, the position is not updated but the pixels are.
+        """
+  
+        if new_skydir is not None:
+            source.skydir = new_skydir
+        self.psf_cache.pop(source.name, None)  # Invalidate cache for this source
+        self.evaluate_source_model()  # Update model counts based on new position
+
+        
+    def loglike(self, pars=None, skydir=None):
         """Compute the log-likelihood for the current model parameters.
-        If `pars` is provided, update the source model parameters before computing."""
-        if pars is not None:
+        If `pars` is provided, update the source model parameters before computing.
+        If `skydir` is provided, evaluate the model with the selected source at that position .
+            `pars` must be None in this case
+         """
+        
+        if skydir is not None:
+            if pars is not None:
+                raise ValueError('skydir-based loglike evaluation ignores pars')
+            if isinstance(skydir, SkyCoord):
+                pass
+            elif isinstance(skydir, tuple):
+                skydir = SkyCoord(*skydir, unit='deg', frame='icrs')
+            src = self.source_model.selected_source
+            if src is None:
+                raise ValueError('No source is selected for skydir-based loglike evaluation')
+            # src.skydir = skydir # need check for skydir attribute and type conversion here
+
+            self.update_position(src, skydir)
+        
+        elif pars is not None:
             self.parameters = pars
 
-        # Model counts for coverage pixels
+        else:
+            # case where neither pars nor skydir is provided: just evaluate with current parameters and position,
+            # which may be needed to populate model counts in coverage if parameters were updated externally
+            self.evaluate_source_model()
+
+        # Data and model (diffuse + other sources + active source counts for coverage pixels)
         cov = self.coverage
         data = cov['photons'].to_numpy()
-        model = cov['model_counts'].to_numpy()
+        model = cov['model_counts'].to_numpy() # temporary for bright source testing!
 
         # Poisson log-likelihood (ignoring constant term)
         ll = np.sum(data * np.log(model + 1e-12) - model)
@@ -333,7 +642,30 @@ class BandLikelihood(HEALPix):
                         color='white', ha='right', va='top', fontsize=12)
         return zea
 
+def gradient_check(bl,  eps=1e-3):
+    """Compare analytic gradient from grad_fn to numerical gradient of loglike_fn at pars."""
 
+    def numerical_gradient(loglike_fn, pars):
+        """Compute numerical gradient of loglike_fn at pars using central differences."""
+        grad = np.zeros_like(pars, dtype=float)
+        for i in range(len(pars)):
+            p_hi = np.array(pars, dtype=float)
+            p_lo = np.array(pars, dtype=float)
+            p_hi[i] += eps
+            p_lo[i] -= eps
+            f_hi = loglike_fn(p_hi)
+            f_lo = loglike_fn(p_lo)
+            grad[i] = (f_hi - f_lo) / (2 * eps)
+        return grad
+    
+    pars0 = bl.parameters# if hasattr(bl.source_model, 'parameters') else np.concatenate([src.model.parameters[src.model.free] for src in bl.source_model])
+    ll, analytic_grad = bl.loglike_grad(pars0)
+    num_grad = numerical_gradient(bl.loglike, pars0)
+    bl.parameters = pars0
+
+    print(f'Analytic gradient: {analytic_grad.round().astype(int)}')
+    print(f'Numerical gradient: {num_grad.round().astype(int)}')
+    print(f'Difference: {(analytic_grad - num_grad).round(1)}')
 
 class FermiFit(views.LikelihoodViews):
     """Fitting engine that wraps a PixelTable and its attached SourceModel.

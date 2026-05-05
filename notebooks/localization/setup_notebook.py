@@ -5,8 +5,8 @@ import sys
 
 repo_root = Path.cwd().resolve()
 if str(repo_root) not in sys.path:
-    print(f'Adding {repo_root} to sys.path')
+    # print(f'Adding {repo_root} to sys.path')
     sys.path.insert(0, str(repo_root))
 
-%run pylib/tools dark
+
 from importlib import reload

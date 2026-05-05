@@ -373,11 +373,12 @@ class Localize:
             Initial position uncertainty in degrees. Defaults to ``0.1``.
         """
         self.verbose = verbose
-        if not hasattr(psl, 'delta_ts'):
-            raise TypeError('Localize requires a localization view exposing delta_ts()')
+        if not not callable(psl):
+            raise TypeError('Localize requires a localization view which is callable for TS evaluation')
 
         self.psl = psl
-        self._delta_ts = psl.delta_ts()
+        self.delta_ts = self._delta_ts = psl.delta_ts ### ??? had a ()
+        
         self.dir: SkyCoord = self._get_skydir(psl)
         dir_icrs = cast(Any, self.dir.icrs)
         self.ra = float(dir_icrs.ra.deg)
@@ -386,14 +387,16 @@ class Localize:
         self.qual_cache = -1
         if verbose:
             print(('initial: ra,dec, sigma:' + 3 * '%10.4f') % (self.ra, self.dec, self.sigma))
-
+        e = None
         try:
             self.fit(update=True)
-        except:
+        except Exception as e:
             if self.verbose:
-                print('update failed: center on highest TS and try again')
-            self.recenter()
-            self.fit(update=True)
+                raise Exception(f'{e}')
+            else:
+                print(f'update failed: {e}, so center on highest TS and try again')
+                self.recenter()
+                self.fit(update=True)
 
     def recenter(self):
         """Find the TS peak on the ring and move the source center there.
@@ -440,7 +443,7 @@ class Localize:
         verbose = self.verbose
         self.rcirc = self.circle()
         self.qual_cache = -1
-        self.ts = [self.TS(r) for r in self.rcirc]
+        self.ts = [self.delta_ts(r) for r in self.rcirc]
         if verbose:
             print(('ts:   ' + ' '.join(9 * ['%9.2f'])) % tuple(self.ts))
         self.ellipse = Ellipse(self.ts)

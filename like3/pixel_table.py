@@ -687,57 +687,57 @@ class PixelTable(dict):
         #         return self.roi.pixel_counts_and_gradient()
         #     raise ValueError('No ROI/source_model attached to this band')
 
-        def simulate(self, random_state=None, total_counts=None):
-            """Simulate pixel counts from the band model.
+        # def simulate(self, random_state=None, total_counts=None):
+        #     """Simulate pixel counts from the band model.
 
-            Parameters
-            ----------
-            random_state : int, np.random.Generator, or None
-                Seed or RNG for Poisson sampling. If None, returns deterministic
-                integer floor of model counts without noise.
-            total_counts : float or None
-                If provided, normalise the model shape to this total before sampling.
+        #     Parameters
+        #     ----------
+        #     random_state : int, np.random.Generator, or None
+        #         Seed or RNG for Poisson sampling. If None, returns deterministic
+        #         integer floor of model counts without noise.
+        #     total_counts : float or None
+        #         If provided, normalise the model shape to this total before sampling.
 
-            Returns
-            -------
-            tuple[np.ndarray, np.ndarray]
-                Sparse pixel indices and counts; only non-zero pixels are returned.
-            """
-            counts = self.pixel_counts()
-            if total_counts is not None:
-                counts = total_counts * counts / counts.sum()
-            if random_state is not None:
-                rng = np.random.default_rng(random_state)
-                counts = rng.poisson(counts)
-            else:
-                counts = counts.astype(int)
-            select = counts > 0
-            return self.pix[select], counts[select]
+        #     Returns
+        #     -------
+        #     tuple[np.ndarray, np.ndarray]
+        #         Sparse pixel indices and counts; only non-zero pixels are returned.
+        #     """
+        #     counts = self.pixel_counts()
+        #     if total_counts is not None:
+        #         counts = total_counts * counts / counts.sum()
+        #     if random_state is not None:
+        #         rng = np.random.default_rng(random_state)
+        #         counts = rng.poisson(counts)
+        #     else:
+        #         counts = counts.astype(int)
+        #     select = counts > 0
+        #     return self.pix[select], counts[select]
 
-        def loglike(self, skydir=None):
-            """Poisson log-likelihood of the band's photon data against the model.
+        # def loglike(self, skydir=None):
+        #     """Poisson log-likelihood of the band's photon data against the model.
 
-            Parameters
-            ----------
-            skydir : SkyCoord or None, optional
-                Trial sky position forwarded to ``source_model.setposition``.
+        #     Parameters
+        #     ----------
+        #     skydir : SkyCoord or None, optional
+        #         Trial sky position forwarded to ``source_model.setposition``.
 
-            Returns
-            -------
-            float
-                ``sum(photons * log(model) - model)`` over all loaded pixels.
-            """
-            sm = self.source_model
-            if skydir is not None:
-                sm.setposition(skydir)
-            # need to flag the PSF to evaluate the model counts when a source_model is attached; otherwise the diffuse+source FITS arrays are used directly.
+        #     Returns
+        #     -------
+        #     float
+        #         ``sum(photons * log(model) - model)`` over all loaded pixels.
+        #     """
+        #     sm = self.source_model
+        #     if skydir is not None:
+        #         sm.setposition(skydir)
+        #     # need to flag the PSF to evaluate the model counts when a source_model is attached; otherwise the diffuse+source FITS arrays are used directly.
             
-            # model is the predicted counts for each pixel, including diffuse and source contributions. 
-            model = self.pixel_counts()
+        #     # model is the predicted counts for each pixel, including diffuse and source contributions. 
+        #     model = self.pixel_counts()
 
-            model = model.clip(1e-30, None)
-            photons = self.coverage['photons'].to_numpy() #if self.coverage is not None else self.photons
-            return float(np.sum(photons * np.log(model) - model))
+        #     model = model.clip(1e-30, None)
+        #     photons = self.coverage['photons'].to_numpy() #if self.coverage is not None else self.photons
+        #     return float(np.sum(photons * np.log(model) - model))
 
     def __init__(self, root, source_model=[], *, emin=100, psf_path='files/loc'):
         """Load a pixel table from a Kerr-style FITS file.
@@ -1200,25 +1200,25 @@ class PixelTable(dict):
             zfig.colorbar(label='log10(counts)', shrink=0.7)
         return zfig
 
-    def build_coverage(self, r68_radius: float = 4.0) -> 'PixelTable':
-        """Build per-band coverage DataFrames restricting log-likelihood to source footprints.
+    # def build_coverage(self, r68_radius: float = 4.0) -> 'PixelTable':
+    #     """Build per-band coverage DataFrames restricting log-likelihood to source footprints.
 
-        Calls :meth:`Band.build_coverage` on every band.  Call again after changing
-        the source model position or after calling :meth:`select` with a new band set.
+    #     Calls :meth:`Band.build_coverage` on every band.  Call again after changing
+    #     the source model position or after calling :meth:`select` with a new band set.
 
-        Parameters
-        ----------
-        r68_radius : float, optional
-            Cone radius in units of r68.  Default is 4.
+    #     Parameters
+    #     ----------
+    #     r68_radius : float, optional
+    #         Cone radius in units of r68.  Default is 4.
 
-        Returns
-        -------
-        self : PixelTable
-            Returns *self* for method chaining.
-        """
-        for band in self.values():
-            band.build_coverage(r68_radius)
-        return self
+    #     Returns
+    #     -------
+    #     self : PixelTable
+    #         Returns *self* for method chaining.
+    #     """
+    #     for band in self.values():
+    #         band.build_coverage(r68_radius)
+    #     return self
 
     def _iter_bands(self):
         """Iterate over selected bands, or all bands when no selection is active."""
@@ -1366,163 +1366,163 @@ class PixelTable(dict):
             print(f'... truncated to first {len(shown)} rows (set max_rows to show more)')
         return df
 
-    @property
-    def parameters(self):
-        """Free-parameter set of the attached source model."""
-        if self.source_model is None:
-            raise AttributeError('parameters requires a source_model')
-        return self.source_model.parameters
+    # @property
+    # def parameters(self):
+    #     """Free-parameter set of the attached source model."""
+    #     if self.source_model is None:
+    #         raise AttributeError('parameters requires a source_model')
+    #     return self.source_model.parameters
 
-    def preserve_parameters(self):
-        """Context manager that restores source-model parameter values on exit.
+    # def preserve_parameters(self):
+    #     """Context manager that restores source-model parameter values on exit.
 
-        Snapshots the current free parameters on entry and writes them back
-        on exit, even if an exception is raised.  Useful for trial fits or
-        scan loops that should not permanently modify the model.
+    #     Snapshots the current free parameters on entry and writes them back
+    #     on exit, even if an exception is raised.  Useful for trial fits or
+    #     scan loops that should not permanently modify the model.
 
-        Example
-        -------
-        >>> with pixtab.preserve_parameters():
-        ...     pixtab.fit()
-        ...     print(pixtab.parameters.get_parameters())
-        # parameters are restored here
-        """
-        from contextlib import contextmanager
+    #     Example
+    #     -------
+    #     >>> with pixtab.preserve_parameters():
+    #     ...     pixtab.fit()
+    #     ...     print(pixtab.parameters.get_parameters())
+    #     # parameters are restored here
+    #     """
+    #     from contextlib import contextmanager
 
-        @contextmanager
-        def _ctx():
-            pset = self.parameters
-            saved = np.array(pset.get_parameters(), copy=True)
-            try:
-                yield
-            finally:
-                pset.set_parameters(saved)
+    #     @contextmanager
+    #     def _ctx():
+    #         pset = self.parameters
+    #         saved = np.array(pset.get_parameters(), copy=True)
+    #         try:
+    #             yield
+    #         finally:
+    #             pset.set_parameters(saved)
 
-        return _ctx()
+    #     return _ctx()
 
-    @property
-    def parameter_names(self):
-        """Names of the free parameters of the attached source model."""
-        if self.source_model is None:
-            raise AttributeError('parameter_names requires a source_model')
-        return self.source_model.parameter_names
+    # @property
+    # def parameter_names(self):
+    #     """Names of the free parameters of the attached source model."""
+    #     if self.source_model is None:
+    #         raise AttributeError('parameter_names requires a source_model')
+    #     return self.source_model.parameter_names
 
-    @property
-    def bounds(self):
-        """Fitter-space parameter bounds from the attached source model."""
-        if self.source_model is None:
-            return None
-        return self.source_model.bounds
+    # @property
+    # def bounds(self):
+    #     """Fitter-space parameter bounds from the attached source model."""
+    #     if self.source_model is None:
+    #         return None
+    #     return self.source_model.bounds
 
-    def preserve_position(self):
-        """Context manager that restores the selected source's sky position on exit.
+    # def preserve_position(self):
+    #     """Context manager that restores the selected source's sky position on exit.
 
-        Snapshots ``source_model.selected_source.skydir`` on entry and writes
-        it back on exit, even if an exception is raised.  Useful for trial
-        localization scans that should not permanently move the source.
+    #     Snapshots ``source_model.selected_source.skydir`` on entry and writes
+    #     it back on exit, even if an exception is raised.  Useful for trial
+    #     localization scans that should not permanently move the source.
 
-        Example
-        -------
-        >>> with pixtab.preserve_position():
-        ...     pixtab.source_model.setposition(trial_skydir)
-        ...     print(pixtab.loglike())
-        # source position is restored here
-        """
-        from contextlib import contextmanager
+    #     Example
+    #     -------
+    #     >>> with pixtab.preserve_position():
+    #     ...     pixtab.source_model.setposition(trial_skydir)
+    #     ...     print(pixtab.loglike())
+    #     # source position is restored here
+    #     """
+    #     from contextlib import contextmanager
 
-        @contextmanager
-        def _ctx():
-            if self.source_model is None:
-                raise ValueError('preserve_position requires a source_model')
-            src = self.source_model.selected_source
-            if src is None:
-                raise ValueError('preserve_position requires a selected source')
-            saved = src.skydir
-            try:
-                yield
-            finally:
-                src.skydir = saved
+    #     @contextmanager
+    #     def _ctx():
+    #         if self.source_model is None:
+    #             raise ValueError('preserve_position requires a source_model')
+    #         src = self.source_model.selected_source
+    #         if src is None:
+    #             raise ValueError('preserve_position requires a selected source')
+    #         saved = src.skydir
+    #         try:
+    #             yield
+    #         finally:
+    #             src.skydir = saved
 
-        return _ctx()
+    #     return _ctx()
 
-    def localization_view(self, source_name=None):
-        """Return a localization context manager for the selected source.
+    # def localization_view(self, source_name=None):
+    #     """Return a localization context manager for the selected source.
 
-        Mirrors ``PixelTable.localization_view``; uses ``self.loglike`` so
-        localization is driven by the full pixel-table likelihood.
+    #     Mirrors ``PixelTable.localization_view``; uses ``self.loglike`` so
+    #     localization is driven by the full pixel-table likelihood.
 
-        Parameters
-        ----------
-        source_name : str, Source-like, or None
-            Source identifier forwarded to ``SourceModel.localization_view``.
+    #     Parameters
+    #     ----------
+    #     source_name : str, Source-like, or None
+    #         Source identifier forwarded to ``SourceModel.localization_view``.
 
-        Returns
-        -------
-        _PixelTableLocalizationContext
-            Context manager yielding a ``PixelTableLocalizationView`` on entry.
-        """
-        if self.source_model is None:
-            raise ValueError('localization_view requires a source_model')
-        sm_context = self.source_model.localization_view(source_name)
-        return _PixelTableLocalizationContext(self, sm_context)
+    #     Returns
+    #     -------
+    #     _PixelTableLocalizationContext
+    #         Context manager yielding a ``PixelTableLocalizationView`` on entry.
+    #     """
+    #     if self.source_model is None:
+    #         raise ValueError('localization_view requires a source_model')
+    #     sm_context = self.source_model.localization_view(source_name)
+    #     return _PixelTableLocalizationContext(self, sm_context)
 
-    def localize(self, source_name=None, sigma=0.1, verbose=True):
-        """Run localization for a source and return a ``quadform.Localize`` result.
+    # def localize(self, source_name=None, sigma=0.1, verbose=True):
+        # """Run localization for a source and return a ``quadform.Localize`` result.
 
-        Parameters
-        ----------
-        source_name : str, Source-like, or None
-            Source identifier forwarded to ``SourceModel.localization_view``.
-        sigma : float, optional
-            Initial localization uncertainty in degrees.
-        verbose : bool, optional
-            Print localization diagnostics.
+        # Parameters
+        # ----------
+        # source_name : str, Source-like, or None
+        #     Source identifier forwarded to ``SourceModel.localization_view``.
+        # sigma : float, optional
+        #     Initial localization uncertainty in degrees.
+        # verbose : bool, optional
+        #     Print localization diagnostics.
 
-        Returns
-        -------
-        like3.quadform.Localize
-            Completed localization result.
-        """
-        from like3.quadform import Localize
-        with self.localization_view(source_name) as loc:
-            return Localize(loc, sigma=sigma, verbose=verbose)
+        # Returns
+        # -------
+        # like3.quadform.Localize
+        #     Completed localization result.
+        # """
+        # from like3.quadform import Localize
+        # with self.localization_view(source_name) as loc:
+        #     return Localize(loc, sigma=sigma, verbose=verbose)
 
-    def loglike(self, skydir=None):
-        """Total Poisson log-likelihood summed over selected bands.
+    # def loglike(self, skydir=None):
+        # """Total Poisson log-likelihood summed over selected bands.
 
-        Parameters
-        ----------
-        skydir : SkyCoord or None, optional
-            Trial sky position forwarded to each ``Band.loglike`` call.
+        # Parameters
+        # ----------
+        # skydir : SkyCoord or None, optional
+        #     Trial sky position forwarded to each ``Band.loglike`` call.
 
-        Returns
-        -------
-        float
-            Sum of per-band log-likelihood values.
-        """
-        if self.source_model is None:
-            raise ValueError('loglike requires a source_model')
-        return float(sum(band.loglike(skydir=skydir) for band in self._iter_bands()))
+        # Returns
+        # -------
+        # float
+        #     Sum of per-band log-likelihood values.
+        # """
+        # if self.source_model is None:
+        #     raise ValueError('loglike requires a source_model')
+        # return float(sum(band.loglike(skydir=skydir) for band in self._iter_bands()))
 
-    def simulate(self, random_state=42):
-        """Simulate per-band photon counts from the source model.
+    # def simulate(self, random_state=42):
+    #     """Simulate per-band photon counts from the source model.
 
-        Replaces ``band.photons`` for each selected band in place with Poisson
-        samples drawn from the current model prediction.
+    #     Replaces ``band.photons`` for each selected band in place with Poisson
+    #     samples drawn from the current model prediction.
 
-        Parameters
-        ----------
-        random_state : int or np.random.Generator, optional
-            Seed or RNG for reproducible Poisson sampling.
-        """
-        if self.source_model is None:
-            raise ValueError('simulate requires a source_model')
-        rng = np.random.default_rng(random_state)
-        for band in self._iter_bands():
-            model = band.pixel_counts()
-            band.photons[:] = rng.poisson(model)
+    #     Parameters
+    #     ----------
+    #     random_state : int or np.random.Generator, optional
+    #         Seed or RNG for reproducible Poisson sampling.
+    #     """
+    #     if self.source_model is None:
+    #         raise ValueError('simulate requires a source_model')
+    #     rng = np.random.default_rng(random_state)
+    #     for band in self._iter_bands():
+    #         model = band.pixel_counts()
+    #         band.photons[:] = rng.poisson(model)
 
-    def fit(self, select=None, *, method='l-bfgs-b', quiet=True, use_gradient=True, **kwargs):
+    # def fit(self, select=None, *, method='l-bfgs-b', quiet=True, use_gradient=True, **kwargs):
         """Optimize the free spectral parameters of the source model.
 
         Minimizes the negative Poisson log-likelihood summed over all bands

@@ -177,7 +177,7 @@ def zea_plot(center, pixel_data,  *, psf=None, figsize=(6, 5), r68=None,
         ax.add_patch(Circle((cx, cy), r68_px,
                             fill=False, edgecolor='white', linewidth=1.5))
         ax.text(cx, cy, rf'${r68:.2f}^\circ$', color='white', fontsize=10,
-                ha='center', va='center')
+                ha='center', va='center',)
 
     sm = source_model 
 

@@ -20,11 +20,20 @@ runtime behavior for compatibility.
 """
 import os,sys
 import numpy as np
-from . skydir import SkyDir
 from . import quadform
 from . utilities import keyword_options
 from . import (sources, plotting )
+from astropy.coordinates import SkyCoord
+import astropy.units as u
 
+
+class SkyDir(SkyCoord):
+    """Simple wrapper around SkyCoord for ra,dec in degrees."""
+    def __init__(self, ra, dec):
+        super().__init__(ra=ra*u.deg, dec=dec*u.deg, frame='icrs')
+    def separation(self, other):
+        return self.separation(other).deg
+    
 def moment_analysis(tsmap, wcs, fudge=1.44):
     """Estimate localization ellipse parameters from TS-map moments.
 
@@ -66,7 +75,7 @@ def moment_analysis(tsmap, wcs, fudge=1.44):
     size = nx*scale
     # adjust variance
     variance = scale**2 * variance
-    offset = np.degrees(peak.difference(SkyDir(rac,decc)))
+    offset = peak.separation(SkyCoord(ra=rac, dec=decc, unit='deg', frame='icrs')).deg
 
     # Keep current variance model (historical behavior).
     var = variance
@@ -193,11 +202,6 @@ def full_localization(roi, source_name=None, ignore_exception=False,
             print((len(labels)*'%10s') % tuple(labels))
             p = loc.qform.par[0:2] + loc.qform.par[3:7]
             print(len(p)*'%10.4f' % tuple(p))
-        if associator is not None:
-            try:
-                make_association(source, loc.TSmap, associator, quiet=roi.quiet)
-            except Exception as msg:
-                print('Exception raised associating %s: %s' % (source.name, msg))
         
         if tsmap_dir is not None:
             if hasattr(loc, 'ellipse'):
@@ -274,9 +278,9 @@ class Localization(object):
     success.
     """
     defaults = (
-        ('tolerance',1e-4),
+        ('tolerance',1e-3),
         ('verbose',False),
-        ('update',False,"Update the source position after localization"),
+        # ('update',False,"Update the source position after localization"),
         ('max_iteration',15,"Number of iterations"),
         #('bandfits',True,"Default use bandfits"),
         ('maxdist',1,"fail if try to move further than this"),
@@ -301,57 +305,27 @@ class Localization(object):
         keyword_options.process(self, kwargs)
         
         self.tsm = tsm # roistat.tsmap_view(source_name)
-        self.maxlike = self.log_like()
+
         self.skydir  = self.tsm.skydir
+        assert isinstance(self.skydir, SkyCoord), 'expected skydir to be a SkyCoord, got %s' % type(self.skydir)
         if self.seedpos is not None: 
-            if not isinstance(self.seedpos, SkyDir):
-                self.seedpos = SkyDir(*self.seedpos)
+            if not isinstance(self.seedpos, SkyCoord):
+                self.seedpos = SkyCoord(*self.seedpos, unit='deg', frame='icrs')
             self.skydir = self.seedpos
         self.name = self.tsm.source.name
         if self.factor!=1.0: 
             print('Applying factor {:.2f}'.format(self.factor))
     
-    def log_like(self, skydir=None):
-        """Return log-likelihood proxy at ``skydir``.
-
-        The TS-map callable returns approximately ``2*logL`` differences; this
-        method converts by dividing by 2 for compatibility with legacy math.
-        """
-        return self.tsm(skydir)/2
-   
-    def TSmap(self, skydir):
+    def delta_ts(self, skydir):
         """Return TS difference at ``skydir`` relative to nominal maximum."""
-        val= 2*(self.log_like(skydir)-self.maxlike)
-        return val / self.factor
+        return self.tsm(skydir) /self.factor
+      
 
-    # Minimizer interface expected by quadform.Localize.
-    def get_parameters(self):
-        return np.array([self.tsm.skydir.ra(), self.tsm.skydir.dec()])
-    
-    def set_parameters(self, par):
-        self.skydir = SkyDir(par[0],par[1])
-        self.tsm.skydir = self.tsm.set_dir(self.skydir)
-        
-    def __call__(self, par):
-        # Negative sign because minimizers perform minimization.
-        return -self.TSmap(SkyDir(par[0],par[1]))
-    
     def reset(self):
         """Restore source/TS-map state modified during localization."""
         self.tsm.reset()
-      
-    def dir(self):
-        return self.skydir
 
-    def errorCircle(self):
-        """Return initial guess for isotropic error-circle radius in degrees."""
-        return 0.05 #initial guess
-
-    def spatialLikelihood(self, sd):  # Negative sign kept for legacy fitter logic.
-        """Legacy-sign convention adapter used by the historical fitter path."""
-        return -self.log_like(sd)
-        
-    def localize(self):
+    def localize(self, sigma=0.1, **kwargs):
         """Localize source position with an elliptic likelihood approximation.
 
         Returns
@@ -363,21 +337,19 @@ class Localization(object):
         #bandfits = self.bandfits
         verbose = self.verbose
         tolerance = self.tolerance
-        l = quadform.Localize(self, verbose=verbose)
+        l = quadform.Localize(self, sigma=sigma, verbose=verbose)
         ld = l.dir
-
-        ll0 = self.spatialLikelihood(self.skydir)
-
-        if not self.quiet:
-            fmt ='Localizing source %s, tolerance=%.1e...\n\t'+7*'%10s'
-            tup = (self.name, tolerance,)+tuple('moved delta ra     dec    a     b  qual'.split())
-            print(fmt % tup)
-            print(('\t' + 4 * '%10.4f') % (0, 0, self.skydir.ra(), self.skydir.dec()))
-            diff = np.degrees(l.dir.difference(self.skydir))
-            print(('\t' + 7 * '%10.4f') % (diff, diff, l.par[0], l.par[1], l.par[3], l.par[4], l.par[6]))
         
-        old_sigma = 1.0
-        for i in range(self.max_iteration):
+        if not self.quiet:
+            fmt ='Localizing source %s, tolerance=%.1e...\n\t    '+7*'%-10s'
+            tup = (self.name, tolerance,)+tuple('step total ra     dec    a     b  qual'.split())
+            print(fmt % tup)
+            print(('\t       -  ' +3 * '%10.4f') % ( 0, self.skydir.ra.deg, self.skydir.dec.deg, ))
+            diff = l.dir.separation(self.skydir).deg
+            print(('\t' + 6 * '%10.4f' + '%10.1f') % (diff, diff, l.par[0], l.par[1], l.par[3], l.par[4], l.par[6]))
+        
+        old_sigma = 1
+        for iter in range(self.max_iteration):
             try:
                 l.fit(update=True)
             except:
@@ -386,21 +358,21 @@ class Localization(object):
                 if not self.quiet:
                     print('trying a recenter...')
                 continue
-            diff = np.degrees(l.dir.difference(ld))
-            delt = np.degrees(l.dir.difference(self.skydir))
+            diff = l.dir.separation(ld).deg
+            delt = l.dir.separation(self.skydir).deg
             sigma = l.par[3]
             if not self.quiet:
-                print(('\t' + 7 * '%10.4f') % (diff, delt, l.par[0], l.par[1], l.par[3], l.par[4], l.par[6]))
+                print(('\t' + 6 * '%10.4f' + '%10.1f') % (diff, delt, l.par[0], l.par[1], l.par[3], l.par[4], l.par[6]))
             if delt > self.maxdist:
                 l.par[6] = 99  # Flag very bad quality and reset position.
                 l.sigma = 1.0
-                l.par[0] = self.skydir.ra()
-                l.par[1] = self.skydir.dec()
+                l.par[0] = self.skydir.ra.deg
+                l.par[1] = self.skydir.dec.deg
                 if not self.quiet:
                     print('\t -attempt to move beyond maxdist=%.1f' % self.maxdist)
                 break
                 #self.tsm.source.ellipse = self.qform.par[0:2]+self.qform.par[3:7]
-                return False # hope this does not screw things up
+                return None # hope this does not screw things up
                 #raise Exception('localize failure: -attempt to move beyond maxdist=%.1f' % self.maxdist)
             if (diff < tolerance) and (abs(sigma - old_sigma) < tolerance):
                 break  # converge
@@ -413,27 +385,26 @@ class Localization(object):
         self.ellipse = dict(ra=float(q[0]), dec=float(q[1]),
                 a=float(q[3]), b=float(q[4]),
                 ang=float(q[5]), qual=float(q[6]),
-                lsigma = l.sigma)
+                sigma = float(l.sigma))
 
-        ll1 = self.spatialLikelihood(l.dir)
+        self.deltaTS = self.tsm(l.dir)
         if not self.quiet:
-            print('TS change: %.2f' % (2 * (ll0 - ll1)))
+            print('TS change: %.2f' % (self.deltaTS))
 
-        #roi.delta_loc_logl = (ll0 - ll1)
         # Keep these diagnostics even if fit quality is poor.
-        delt = np.degrees(l.dir.difference(self.skydir))
-        self.delta_ts = 2 * (ll0 - ll1)
+        delt = l.dir.separation(self.skydir).deg
+
         self.delt = delt
-        self.niter = i
+        self.niter = iter+1
         # Persist ellipse parameters on the source for downstream consumers.
-        self.tsm.source.ellipse = self.qform.par[0:2] + self.qform.par[3:7] + [self.delta_ts]
-        return True  # success
+        # self.tsm.source.ellipse = self.qform.par[0:2] + self.qform.par[3:7] 
+        return self.ellipse # success
         
     def summary(self):
         """Print a concise post-fit localization summary if available."""
         if hasattr(self, 'niter') and self.niter > 0:
             print('Localized %s: %d iterations, moved %.3f deg, deltaTS: %.1f' % \
-                (self.name, self.niter, self.delt, self.delta_ts))
+                (self.name, self.niter, self.delt, self.deltaTS))
             labels = 'ra dec a b ang qual'.split()
             print((len(labels)*'%10s') % tuple(labels))
             p = self.qform.par[0:2] + self.qform.par[3:7]
@@ -493,7 +464,7 @@ def localize_all(roi, ignore_exception=True, **kwargs):
     tsfits = kwargs.pop('tsfits', True)
     if len(list(kwargs.keys())) > 0:
         print('Warning: unrecognized args to localize_all: %s' % kwargs)
-    initw = roi.log_like()
+    # initw = roi.log_like()
     
     for source in vpsources:
         if prefix is not None and not source.name.startswith(prefix):
@@ -502,17 +473,6 @@ def localize_all(roi, ignore_exception=True, **kwargs):
         full_localization(roi, source.name, ignore_exception=ignore_exception,
             update=update, associator=associator, tsmap_dir=tsmap_dir, tsfits=tsfits)
         
-
-    curw = roi.log_like()
-    if abs(initw - curw) > 1.0 and not update:
-        print(
-            'localize_all: unexpected change in roi state after localization, '
-            'from %.1f to %.1f (%+.1f)'
-            % (initw, curw, curw - initw)
-        )
-        return False
-    else:
-        return True
 
 class TS_function(object):
     """Context-manager helper exposing a temporary TS function.
