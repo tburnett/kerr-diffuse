@@ -76,20 +76,21 @@ class Poisson(object):
         f = r_peak*np.log(r) - r
         return f - const
 
-    def __str__(self):
+    # def __str__(self):
 
-        e, beta, mu = self.altpars()
-        return 'Poisson: mu,beta= %.1f, %.1f' %( mu, beta)
+    #     e, beta, mu = self.altpars()
+    #     return 'Poisson: mu,beta= %.1f, %.1f' %( mu, beta)
     
     def __repr__(self):
         if self.flux==0:
-            return 'flux is zero for source'
-        t = np.array(self.errors)/self.flux-1
+            return f'< {self.uflux:.3g} '
         relerr = np.abs(np.array(self.errors)/self.flux-1)
-        return '{}.{}: {:.3e}[1+{:.2f}-{:.2f}'.format(self.__module__, self.__class__.__name__, self.flux, relerr[0],relerr[1] )
+        return '{:.3g}[1+{:.3f}-{:.3f}]'.format(self.flux, relerr[0],relerr[1] )
+    
+
     @property
     def flux(self):
-        return max(self.p[0], 0)
+        return float(max(self.p[0], 0))
     
     @property
     def errors(self):
@@ -379,7 +380,7 @@ class PoissonFitter(object):
         offset = self(self.smax)
         deltas = np.array([np.exp(self.func(x)-offset)-np.exp(self._poiss(x)) for x in self.dom])
         t = np.abs(deltas).max()
-        if t>tol: raise Exception('PoissonFitter: max dev= {:.2f} > tol= {}. (wprime={:.2f})'
+        if t>tol: raise Exception('PoissonFitter: max dev= {:.2g} > tol= {}. (wprime={:.2g})'
             .format(t,tol, self.wprime) )
         return t, deltas
     
@@ -400,7 +401,7 @@ class PoissonFitter(object):
         if xticks:
             ax.set_xticks([0, xp[-1]])
         ax.grid(alpha=0.4)
-        fig.set_facecolor('white')
+        # fig.set_facecolor('white')
         return fig
 
     def normalization_summary(self, nominal=None):

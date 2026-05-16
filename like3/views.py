@@ -985,11 +985,13 @@ class EnergyFluxView(WithMixin):
         energy : float or None
             New energy in MeV; defaults to the model reference energy.
         """
+        self.blike.select(energy=energy)
         if energy is None:
             energy=self.model.e0
         self.model[0]=self.norm # get original norm 
         self.source.changed=True
-        self.blike.update()
+        # self.blike.update()
+        
         self.energy = energy
         self.eflux = self.model(energy) * energy**2 * 1e6
         self.ratio = self.model[0]/self.eflux

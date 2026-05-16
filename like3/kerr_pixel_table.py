@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 from astropy.coordinates import SkyCoord, Angle
 from astropy_healpix import HEALPix 
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Sequence, cast
 
 _energy_index = lambda energy: (np.log10(energy) * 4 - 8).astype(int)
 
@@ -330,30 +330,220 @@ class _ToFITS:
         hdus.info()
         return cls(kerrmodel)
 
+
+class KerrPtsrcInfo:
+
+    class PtBand:
+        """Pixels associated with one or more sources in a specific band."""
+
+        def __init__(self, source_indices: Sequence[int], band_index: int, meta_row: pd.Series, table: pd.DataFrame) -> None:
+            self.source_indices = [int(v) for v in source_indices]
+            # Backward-compatible alias for single-source PtBand instances.
+            self.source_index = self.source_indices[0] if len(self.source_indices) == 1 else None
+            self.band_index = int(band_index)
+            self.meta = meta_row
+            self.table = table
+
+        def __repr__(self) -> str:
+            src_repr = self.source_index if self.source_index is not None else self.source_indices
+            return (
+                f"PtBand(source={src_repr}, band={self.band_index}, "
+                f"pixels={len(self.table)})"
+            )
     
-    # @classmethod
-    # def to_fits(cls, kerrfile: str | Path, fitsfile: str | Path, *, ring: bool = False, overwrite: bool = True) -> None:
-    #     """Translate a Kerr `.npz/.pickle` pair into FITS representation.
+    def __init__(self, root = 'files/kerr/toby_v5'):    
+        import pickle    
+        
+        r, v = root.split('_')
+        if not Path((ptsrc_file:=r+'_ptsrcs_' + v + '.npz')).exists():
+            raise FileNotFoundError(f"ptsrcs file {ptsrc_file} not found")
+        meta_file =  Path(root).with_suffix('.pickle')
+        if not meta_file.exists():
+            raise FileNotFoundError(f"meta file {meta_file} not found ")
+        
+        self.columns = []
+        with np.load(ptsrc_file) as data:
+            self.columns += list(data.keys())
+            for key, value in data.items():
+                setattr(self, key, value)
+        print(f"Loaded columns {list(data.keys())} from {ptsrc_file}")
 
-    #     Parameters
-    #     ----------
-    #     kerrfile : str or Path
-    #         Path stem for input .npz/.pickle files.
-    #     fitsfile : str or Path
-    #         Output FITS filename.
-    #     ring : bool, optional
-    #         If True, convert pixels to RING ordering before export. Default is False.
-    #     overwrite : bool, optional
-    #         Overwrite existing FITS file. Default is True.
+        npix = sum(self.entries_per_band)
+        print(f"Total number of pixels: {npix:,d}")
+        if npix != len(self.nameidx):
+            raise ValueError(f"Total number of pixels {npix} does not match length of nameidx {len(self.nameidx)}")
+            
+        # read the meta file and make it a dataframe
+        with open(meta_file, 'rb') as f:
+            meta = pickle.load(f)
+        self.meta = pd.DataFrame(meta, columns='event_type emin emax nside entries'.split())
+        # replace "entries" with the actual number of entries per band
+        self.meta['entries'] = self.entries_per_band
+        self.meta['energy'] = np.sqrt(self.meta['emin'] * self.meta['emax']).astype(int)
+        self.meta = self.meta.astype({'event_type': 'category', 'emin':int, 'emax':int, 'nside':int, 'entries':int})
 
-    #     Returns
-    #     -------
-    #     None
+        # make a slice column that gives the slice of the pixel table for each band
+        sl = []
+        offset = 0
+        for i, row in self.meta.iterrows():
+            sl.append(slice(offset, offset + row.entries))
+            offset += row.entries
+        self.meta['slice'] = sl
+        print(f"Loaded meta data describing {len(self.meta)} bands from {meta_file}")
 
-    #     Notes
-    #     -----
-    #     This is a convenience classmethod that loads the pixel table and
-    #     calls writeto() in a single operation.
-    #     """
-    #     km = PixelTable(kerrfile, ring=ring )
-    #     cls(km).writeto(fitsfile, overwrite=overwrite)
+    def create_ptband(self, source_index: int | Sequence[int], band: int | pd.Series) -> PtBand:
+        """Collect per-pixel counts for one or more sources in one band.
+
+        Parameters
+        ----------
+        source_index : int or sequence of int
+            Source index (or source indices) matching entries in
+            ``self.nameidx``.
+        band : int or pandas.Series
+            Band selector. Either an integer row index into ``self.meta`` or
+            a row from ``self.meta``.
+
+        Returns
+        -------
+        PtBand
+            For a single source, object holding ``pixel_id`` and ``counts``.
+            For multiple sources, object holding ``pixel_id`` and one
+            ``counts_<source_index>`` column per source.
+            In both cases, ``other_counts`` gives the sum from all non-
+            requested sources for the same pixels.
+        """
+        if isinstance(band, pd.Series):
+            if 'slice' not in band:
+                raise KeyError("Band row must contain a 'slice' entry")
+            meta_row = band
+            band_index = int(meta_row.name) if isinstance(meta_row.name, (int, np.integer)) else -1
+        else:
+            band_index = int(band)
+            if band_index < 0 or band_index >= len(self.meta):
+                raise IndexError(f"Band index {band_index} out of range for {len(self.meta)} bands")
+            meta_row = self.meta.iloc[band_index]
+
+        if isinstance(source_index, (int, np.integer)):
+            source_indices = [int(source_index)]
+            single_source = True
+        else:
+            source_indices = [int(v) for v in source_index]
+            if len(source_indices) == 0:
+                raise ValueError("source_index sequence must not be empty")
+            # Remove duplicates while preserving caller-provided order.
+            source_indices = list(dict.fromkeys(source_indices))
+            single_source = len(source_indices) == 1
+
+        sl = meta_row['slice']
+        band_pixels = self.healpixidx[sl]
+        band_counts = self.pscounts[sl]#.round(1)  # round to 0.1 photons for cleaner output
+        band_nameidx = self.nameidx[sl]
+        total_by_pixel = pd.DataFrame(
+            {
+                'pixel_id': band_pixels,
+                '_total_counts': band_counts,
+            }
+        ).groupby('pixel_id', as_index=False)['_total_counts'].sum()
+
+        if single_source:
+            src_index = source_indices[0]
+            mask = band_nameidx == src_index
+            table = pd.DataFrame(
+                {
+                    'pixel_id': band_pixels[mask],
+                    'counts': band_counts[mask],
+                }
+            )
+            table = table.groupby('pixel_id', as_index=False)['counts'].sum()
+            requested_sum = table['counts']
+        else:
+            selected = np.isin(band_nameidx, np.asarray(source_indices, dtype=band_nameidx.dtype))
+            pixel_id = np.asarray(np.unique(band_pixels[selected]))
+            table = pd.DataFrame({'pixel_id': pixel_id})
+            for src_index in source_indices:
+                mask = band_nameidx == src_index
+                col_name = f'counts_{src_index}'
+                src_table = pd.DataFrame(
+                    {
+                        'pixel_id': band_pixels[mask],
+                        col_name: band_counts[mask],
+                    }
+                ).groupby('pixel_id', as_index=False)[col_name].sum()
+                table = table.merge(src_table, on='pixel_id', how='left')
+            fill_cols = [c for c in table.columns if c != 'pixel_id']
+            table[fill_cols] = table[fill_cols].fillna(0.0)
+            requested_sum = table[fill_cols].sum(axis=1)
+
+        table = table.merge(total_by_pixel, on='pixel_id', how='left')
+        table['_total_counts'] = table['_total_counts'].fillna(0.0)
+        table['other_counts'] = np.maximum(table['_total_counts'] - requested_sum, 0.0)
+        table = table.drop(columns=['_total_counts'])
+
+        return self.PtBand(source_indices, band_index, meta_row, table)
+
+    @classmethod
+    def test_demo(
+        cls,
+        root: str = 'files/kerr/toby_v5',
+        band_index: int = 30,
+        n_sources: int = 3,
+        verbose: bool = True,
+    ) -> tuple['KerrPtsrcInfo', 'KerrPtsrcInfo.PtBand', 'KerrPtsrcInfo.PtBand']:
+        """Run a demonstration test of the PtBand creation for one band and multiple sources.
+
+        Parameters
+        ----------
+        root : str, optional
+            Root file stem passed to ``KerrPtsrcInfo``.
+        band_index : int, optional
+            Band row index in ``self.meta`` to test.
+        n_sources : int, optional
+            Number of sources to include in the multi-source PtBand test.
+        verbose : bool, optional
+            If True, print a short summary matching the notebook output style.
+
+        Returns
+        -------
+        tuple
+            ``(ptsrc_info, ptband_multi, ptband_single)``.
+        """
+        if n_sources < 2:
+            raise ValueError('n_sources must be at least 2')
+
+        ptsrc_info = cls(root)
+        band_row = ptsrc_info.meta.iloc[int(band_index)]
+        sl = band_row['slice']
+
+        if int(band_row['entries']) == 0:
+            raise RuntimeError(f'Band {band_index} has no entries to test')
+
+        source_indices = [int(v) for v in np.unique(ptsrc_info.nameidx[sl])[:n_sources]]
+        if len(source_indices) < 2:
+            raise RuntimeError('Need at least two sources in this band to test multi-source PtBand')
+
+        ptband = ptsrc_info.create_ptband(source_indices, int(band_index))
+
+        expected_cols = ['pixel_id'] + [f'counts_{s}' for s in source_indices] + ['other_counts']
+        if list(ptband.table.columns) != expected_cols:
+            raise AssertionError(
+                f'Unexpected columns: {list(ptband.table.columns)} != {expected_cols}'
+            )
+        if len(ptband.table) == 0:
+            raise AssertionError('Multi-source PtBand table is empty')
+        if not (ptband.table[expected_cols[1:]] >= 0).all().all():
+            raise AssertionError('Multi-source PtBand has negative values in count columns')
+
+        ptband_single = ptsrc_info.create_ptband(source_indices[0], int(band_index))
+        expected_single = ['pixel_id', 'counts', 'other_counts']
+        if list(ptband_single.table.columns) != expected_single:
+            raise AssertionError(
+                f'Unexpected single-source columns: {list(ptband_single.table.columns)} != {expected_single}'
+            )
+
+        if verbose:
+            print(ptband)
+            print('columns:', list(ptband.table.columns))
+            print('rows:', len(ptband.table))
+            print(ptband.table.head())
+
+        return ptsrc_info, ptband, ptband_single

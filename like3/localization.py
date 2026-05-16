@@ -348,7 +348,7 @@ class Localization(object):
             diff = l.dir.separation(self.skydir).deg
             print(('\t' + 6 * '%10.4f' + '%10.1f') % (diff, diff, l.par[0], l.par[1], l.par[3], l.par[4], l.par[6]))
         
-        old_sigma = 1
+        old_sigma = sigma
         for iter in range(self.max_iteration):
             try:
                 l.fit(update=True)
@@ -374,6 +374,7 @@ class Localization(object):
                 #self.tsm.source.ellipse = self.qform.par[0:2]+self.qform.par[3:7]
                 return None # hope this does not screw things up
                 #raise Exception('localize failure: -attempt to move beyond maxdist=%.1f' % self.maxdist)
+            # print('diff=%.4f, sigma=%.4f, old_sigma=%.4f' % (diff, sigma, old_sigma)    )
             if (diff < tolerance) and (abs(sigma - old_sigma) < tolerance):
                 break  # converge
             ld = l.dir

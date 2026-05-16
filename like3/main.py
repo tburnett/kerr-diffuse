@@ -84,7 +84,7 @@ class MultiBandLikelihood(dict, Fitted):
         self.energies = pixel_table.energies
         super().__init__({key: BandLikelihood(band, source_model) for key, band in self.pixel_table.items()})
 
-        self.llz = self.loglike()  # baseline log-likelihood for delta-TS calculations
+        self.llz = self.log_like()  # baseline log-likelihood for delta-TS calculations
         
     @property
     def sources(self):
@@ -94,6 +94,11 @@ class MultiBandLikelihood(dict, Fitted):
     @property
     def parameter_names(self):
         return self.source_model.parameter_names
+
+    @property
+    def parameterset(self):
+        """ParameterSet interface used by views.FitterView."""
+        return self.source_model.parameters
 
     # ============== needed by Fitter interface ======================        
     @property
@@ -136,7 +141,12 @@ class MultiBandLikelihood(dict, Fitted):
             return self.values()
         return (self[k] for k in self.selected)
 
-    def loglike(self, pars=None, *, skydir=None, ):
+    def update(self):
+        """Refresh per-band model counts after parameter changes."""
+        for bl in self._iter_bands():
+            bl.evaluate_source_model()
+
+    def log_like(self, pars=None, *, skydir=None, summed=True):
         """Evaluate the total log-likelihood across all selected bands.
         If `pars` is provided, update the source model parameters before computing.
         If `skydir` is provided, update the source position before computing."""
@@ -155,12 +165,12 @@ class MultiBandLikelihood(dict, Fitted):
             total_loglike = 0.0
             for bl in self._iter_bands():
                 bl.update_position(src) # ensure pixels are updated for new position
-                total_loglike += bl.loglike(skydir=skydir, )
+                total_loglike += bl.log_like(skydir=skydir, )
             return total_loglike
         
         if pars is not None:
             self.parameters = pars
-        return sum(bl.loglike() for bl in self._iter_bands())
+        return sum(bl.log_like() for bl in self._iter_bands())
 
     def loglike_grad(self, pars=None):
         """Compute the log-likelihood and its gradient for the current model parameters.
@@ -181,7 +191,7 @@ class MultiBandLikelihood(dict, Fitted):
         if use_gradient:
             ll, grad = self.loglike_grad(pars)
             return -ll, -grad
-        return -self.loglike(pars)
+        return -self.log_like(pars)
     
     def gradient(self, pars=None):
         """Callable interface to negative log-likelihood gradient, for compatibility with optimizers."""
@@ -191,7 +201,73 @@ class MultiBandLikelihood(dict, Fitted):
     def delta_ts(self, skydir):
         """Return TS difference at ``skydir`` relative to nominal maximum."""
         # print(f'Computing delta-TS at {skydir.to_string()}')
-        return 2 * (self.loglike(skydir=skydir) - self.llz)
+        return 2 * (self.log_like(skydir=skydir) - self.llz)
+
+    @contextmanager
+    def tsmap_view(self, source_name=None):
+        """Yield a TS-map callable for localization scans of one source.
+
+        Parameters
+        ----------
+        source_name : str, source-like, or None, optional
+            Source selector. When ``None``, the currently selected source is
+            used.
+
+        Yields
+        ------
+        object
+            Callable TS-map helper with ``source``, ``skydir``,
+            ``saved_skydir``, and ``reset()`` attributes.
+
+        Raises
+        ------
+        ValueError
+            If no source is selected and ``source_name`` is not provided.
+        """
+
+        source_model = self.source_model
+        selected_source = getattr(source_model, 'selected_source', None)
+        selected_source_index = getattr(source_model, 'selected_source_index', None)
+
+        if source_name is not None and not isinstance(source_name, str) and hasattr(source_name, 'name'):
+            if source_name in source_model:
+                source_model.selected_source = source_name
+                source_model.selected_source_index = source_model.index(source_name)
+                source = source_name
+            else:
+                source = source_model.find_source(source_name.name)
+        elif source_name is None:
+            source = source_model.selected_source
+        else:
+            source = source_model.find_source(source_name)
+
+        if source is None:
+            raise ValueError('No source is selected in the source model for a tsmap')
+
+        loglike = self.loglike
+
+        class TSmap_function:
+
+            def __init__(self, ts_source):
+                self.source = ts_source
+                self.skydir = ts_source.skydir
+                self.saved_skydir = ts_source.skydir
+                self._llz = log_like(skydir=ts_source.skydir)
+
+            def __call__(self, skydir):
+                """Return ``2 * (log_like(skydir) - log_like(nominal))``."""
+                return 2 * (log_like(skydir=skydir) - self._llz)
+
+            def reset(self):
+                self.source.skydir = self.saved_skydir
+
+        tsm = TSmap_function(source)
+        try:
+            yield tsm
+        finally:
+            source.skydir = tsm.saved_skydir
+            source_model.selected_source = selected_source
+            source_model.selected_source_index = selected_source_index
     
     
     def localize(self, update=False, sigma=0.1, **kwargs):
@@ -223,170 +299,517 @@ class MultiBandLikelihood(dict, Fitted):
         """
 
         from .localization import Localization
-        
-        _loglike = self.loglike # capture for use in TSmap_function closure
-
-        class TSmap_function:
-
-            def __init__(self, source) :
-                self.source = source
-                self.skydir = source.skydir
-                self._llz = _loglike(skydir=source.skydir)
-    
-            def __call__(self, skydir):
-                """ TS map function: returns 2*(loglike(skydir) - loglike(nominal)) """
-                return 2*(_loglike(skydir=skydir) -self._llz)
 
         source = self.source_model.selected_source
         if source is None:
             raise ValueError("No source selected in the MultiBandLikelihood's source model")
 
-        saved_skydir = source.skydir  
-
         # use existing ellipse sigma if available, otherwise default to 0.1 deg 
         if hasattr(source, 'ellipse'):
             sigma = source.ellipse.get('sigma', sigma)
-        ellipse = Localization(TSmap_function(source), **kwargs).localize(sigma=sigma)
-        if not update:
-            # move only if requested, otherwise just return the ellipse parameters
-            source.skydir = saved_skydir
+
+        with self.tsmap_view(source) as tsm:
+            ellipse = Localization(tsm, **kwargs).localize(sigma=sigma)
+            if update and ellipse is not None:
+                tsm.saved_skydir = SkyCoord(ellipse['ra'], ellipse['dec'], unit='deg', frame='icrs')
+
         # attach result in any case
         source.ellipse = ellipse
         return ellipse
+
+    def plot_tsmap(
+        self,
+        source_name=None,
+        *,
+        size=None,
+        npix=None,
+        ax=None,
+        figsize=(6, 6),
+        cmap='viridis',
+        colorbar=True,
+        contour_levels=None,
+        show_source=True,
+        show_peak=True,
+    ):
+        """Plot a square TS map in ICRS RA/Dec coordinates.
+
+        Parameters
+        ----------
+        source_name : str, source-like, or None, optional
+            Source selector. When ``None``, the currently selected source is
+            used.
+        size : float or None, optional
+            Full map width in degrees. When omitted, it is inferred from the
+            current localization ellipse if available, otherwise a default of
+            ``0.25`` deg is used.
+        npix : int or None, optional
+            Number of pixels per side. When omitted, it is chosen from ``size``
+            at roughly ``0.02`` deg sampling and rounded up to an odd value so
+            the central source falls on a pixel center.
+        ax : matplotlib.axes.Axes or None, optional
+            Axes to draw into. A new square figure is created when ``None``.
+        figsize : tuple[float, float], optional
+            Figure size used only when creating a new figure.
+        cmap : str, optional
+            Matplotlib colormap name.
+        colorbar : bool, optional
+            Whether to draw a colorbar.
+        contour_levels : sequence[float] or None, optional
+            Optional contour levels to overlay.
+        show_source : bool, optional
+            Mark the source center with a white ``+``.
+        show_peak : bool, optional
+            Mark the maximum sampled TS pixel with a black ``x``.
+
+        Returns
+        -------
+        dict
+            Plot payload with ``fig``, ``ax``, ``contour``, ``tsmap``, ``ra``,
+            ``dec``, ``size``, and ``npix``.
+        """
+        import astropy.units as u
+
+        source_model = self.source_model
+        if source_name is None:
+            source = source_model.selected_source
+        else:
+            source = source_model.find_source(source_name)
+        if source is None:
+            raise ValueError('No source is selected in the source model for a tsmap plot')
+
+        if size is None:
+            size = 0.25
+            ellipse = getattr(source, 'ellipse', None)
+            if isinstance(ellipse, dict):
+                scale = ellipse.get('a', ellipse.get('sigma', None))
+                if scale is not None and np.isfinite(scale):
+                    size = float(np.clip(max(0.25, 15.0 * scale), 0.25, 2.0))
+
+        if npix is None:
+            npix = max(25, int(np.ceil(size / 0.02)) + 1)
+        npix = int(npix)
+        if npix < 3:
+            raise ValueError('npix must be at least 3')
+        if npix % 2 == 0:
+            npix += 1
+
+        center = source.skydir.icrs
+        half_size = 0.5 * float(size)
+        offsets = np.linspace(-half_size, half_size, npix)
+        lon_offsets, lat_offsets = np.meshgrid(offsets, offsets)
+
+        with self.tsmap_view(source) as tsm:
+            coords = center.spherical_offsets_by(lon_offsets * u.deg, lat_offsets * u.deg)
+            flat_coords = coords.reshape((coords.size,))
+            tsmap = np.fromiter((tsm(coord) for coord in flat_coords), dtype=float).reshape((npix, npix))
+
+        # scale TS values to 5 sigmas
+        scaled_tsmap = tsmap #5- np.sqrt(-np.clip(tsmap, -25, 0)) 
+
+        ra = coords.ra.deg
+        dec = coords.dec.deg
+
+        # fig, ax = plt.subplots(figsize=figsize) if ax is None else (ax.figure, ax)
+
+        # if contour_levels is None:
+        #     contour_levels = np.linspace(float(np.nanmin(scaled_tsmap)), float(np.nanmax(scaled_tsmap)), 6)
+
+        # contour = ax.contourf(ra, dec, tsmap, cmap=cmap, 
+        #         levels = np.linspace(float(np.nanmin(scaled_tsmap)), float(np.nanmax(scaled_tsmap)), 26))
+        
+        # ax.contour(ra, dec, tsmap, levels=contour_levels, colors='white', linewidths=0.8)
+        # ax.clabel(contour)#, inline=True, fontsize=8, fmt='%.1f')
+
+        # if show_source:
+        #     ax.plot(center.ra.deg, center.dec.deg, marker='+', color='white', markersize=10, mew=1.5)
+
+        # if show_peak:
+        #     peak_index = np.unravel_index(np.nanargmax(tsmap), tsmap.shape)
+        #     ax.plot(ra[peak_index], dec[peak_index], marker='x', color='black', markersize=7, mew=1.5)
+
+        # ax.set(
+        #     xlabel='RA (deg)',
+        #     ylabel='Dec (deg)',
+        #     title=f'{source.name} TS map',
+        # )
+        # ax.invert_xaxis()
+        # ax.set_box_aspect(1)
+
+        # if colorbar:
+        #     fig.colorbar(contour, ax=ax,)# label=r'$\sigma (\sqrt{TS_{\max}-TS})$')
+
+        return dict(
+            # fig=fig,
+            # ax=ax,
+            # contour=contour,
+            # image=contour,
+            tsmap=tsmap,
+            ra=ra,
+            dec=dec,
+            size=float(size),
+            npix=npix,
+        )
     
        
     
-    def fitter_view(self, select=None, exclude=None):
-        """Context manager for fitting, similar to FermiFit.fitter_view, for MultiBandLikelihood.
+    def fitter_view(self, select=None, setpars=None, **kwargs):
+        """Return a fitter view over all or a subset of free parameters.
+
+        Parameters
+        ----------
+        select : str, list, or None
+            If None, returns a :class:`views.FitterView` over all free
+            parameters. Otherwise, constructs a
+            :class:`views.SubsetFitterView` for the selection.
+        setpars : dict or None
+            If provided, set these parameter values before constructing the
+            view.
+        **kwargs
+            Forwarded to the view constructor.
+
+        Returns
+        -------
+        views.FitterView or views.SubsetFitterView
+        """
+        if setpars is not None:
+            self.sources.parameters.setitems(setpars)
+
+        if select is None:
+            return views.FitterView(self, **kwargs)
+        return views.SubsetFitterView(self, select, **kwargs)
+
+    def energy_flux_view(self, source_name, energy=None, **kw):
+        """Return a functor expressing log-likelihood as energy flux.
+
+        Parameters
+        ----------
+        source_name : str
+            Source whose normalization is profiled.
+        energy : float or None
+            Energy in MeV. If None, uses the model reference energy e0.
+        **kw
+            Forwarded to :class:`views.EnergyFluxView`.
+
+        Returns
+        -------
+        views.EnergyFluxView
+        """
+        try:
+            source = self.sources.find_source(source_name)
+        except Exception as msg:
+            raise Exception(
+                'could not create energy flux function for source %s;%s'
+                % (source_name, msg)
+            )
+        return views.EnergyFluxView(self, source.name, energy, **kw)
+
+    def selected_source_energy_flux_view(self, energy=None, **kw):
+        """Return an energy-flux view for the currently selected source."""
+        src = self.source_model.selected_source
+        if src is None:
+            raise ValueError('No source is selected')
+        return self.energy_flux_view(src.name, energy=energy, **kw)
+
+    def fit(self, select=None, *, exclude=None, summarize=True, setpars=None, **kwargs):
+        """Fit free parameters using :class:`~like3.likelihood.Likelihood`.
 
         Parameters
         ----------
         select : None, item, or list of items
-            Optional parameter selector (not yet implemented).
+            Optional parameter selector forwarded to ``Likelihood.select``.
         exclude : None, item, or list of items
-            Optional parameter selector to remove from select (not yet implemented).
+            Currently unused; reserved for future subset exclusion.
+        summarize : bool, default=True
+            If True, print the fit summary after a successful fit.
+        setpars : dict or None
+            Optional parameter values to set before fitting.
 
         Returns
         -------
-        context manager yielding a FitterView-like object.
+        Likelihood
+            The fitted :class:`~like3.likelihood.Likelihood` instance, with
+            ``fit_info`` populated.
         """
-        # This is a minimal implementation for demonstration.
-        # In a real implementation, you may want to support select/exclude and diagnostics.
-        from contextlib import contextmanager
-        class DummyFitterView:
-            def __init__(self, mbl):
-                self.mbl = mbl
-                self.calls = 0
-                self.initial_likelihood = self.mbl.loglike()
-                self.parameter_names = self.mbl.parameters.parameter_names
-                self.mask = np.ones(len(self.parameter_names), dtype=bool)
-                self.covariance = None
-                self.fmin_ret = None
-            def maximize(self, **kwargs):
-                # Placeholder: call maximize on parameters if available
-                if hasattr(self.mbl.parameters, 'maximize'):
-                    self.mbl.parameters.maximize(**kwargs)
-                    self.calls += 1
-            def log_like(self):
-                return self.mbl.loglike()
-            def delta_loglike(self):
-                return float(self.log_like() - self.initial_likelihood)
-            def get_parameters(self):
-                return self.mbl.parameters.get_parameters()
-            def set_parameters(self, pars):
-                self.mbl.parameters.set_parameters(pars)
-            def gradient(self):
-                # Placeholder: call gradient if available
-                if hasattr(self.mbl, 'gradient'):
-                    return self.mbl.gradient()
-                return None
-            def save_covariance(self):
-                # Placeholder: set dummy covariance
-                n = len(self.parameter_names)
-                self.covariance = np.eye(n)
-            def plot_all(self):
-                print('plot_all: not implemented for MultiBandLikelihood')
-            def summary(self):
-                print('summary: not implemented for MultiBandLikelihood')
-        @contextmanager
-        def _ctx():
-            fv = DummyFitterView(self)
-            try:
-                yield fv
-            finally:
-                pass
-        return _ctx()
+        from like3.likelihood import Likelihood
 
-    def fit(self, select=None, exclude=None, summarize=True, setpars=None, **kwargs):
-            """Perform a legacy-style fit using the shared fitter-view workflow, adapted for MultiBandLikelihood.
-
-            Parameters
-            ----------
-            select : None, item, or list of items
-                Optional parameter selector forwarded to ``fitter_view``.
-            exclude : None, item, or list of items
-                Optional parameter selector to remove from ``select``.
-            summarize : bool, default=True
-                If True, print the fit summary after a successful fit.
-            setpars : dict or None
-                Optional parameter values to set before fitting.
-            **kwargs
-                Legacy fitter options. Supported convenience keywords handled here
-                are ``ignore_exception``, ``update_by``, ``tolerance``, and
-                ``plot``; remaining keywords are forwarded to ``fv.maximize``.
-            """
-            # This method is adapted from FermiFit.fit for MultiBandLikelihood usage.
-            if len(self.source_model.parameters) == 0:
-                print('No parameters to fit')
-                return
-
-            ignore_exception = kwargs.pop('ignore_exception', False)
-            update_by = kwargs.pop('update_by', 1.0)
-            tolerance = kwargs.pop('tolerance', 0.0)
-            plot = kwargs.pop('plot', False)
-
-            if setpars is not None:
-                self.source_model.parameters.setitems(setpars, quiet=True)
-
-            fit_kw = dict(use_gradient=True, estimate_errors=True)
-            fit_kw.update(kwargs)
-
-            # Use a context manager if available, else just call maximize directly
-            # For MultiBandLikelihood, we assume a 'fitter_view' context manager is not present,
-            # so we call maximize directly on the source_model.parameters
-            # This may need to be adapted if a fitter_view is implemented.
-            try:
-                # Placeholder for delta_loglike check if implemented
-                qual = 99.0
-                # Assume source_model.parameters has a maximize method (or similar)
-                if hasattr(self, 'maximize'):
-                    self.maximize(**fit_kw)
-                else:
-                    print('No maximize method found on source_model.parameters')
-                    return
-                # Optionally, retrieve fit results and diagnostics here
-                if summarize:
-                    print('Fit completed for MultiBandLikelihood.')
-            except Exception as msg:
-                print(f'Fit Failure {msg}: quality: {qual:.2f}')
-                if not ignore_exception:
-                    raise
+        if len(self.source_model.parameters) == 0:
+            print('No parameters to fit')
             return
 
-    def localization_view(self):
-        """Return a LocalizedSourceView for the current source model.
+        if setpars is not None:
+            self.source_model.parameters.setitems(setpars, quiet=True)
+
+        mbl = self
+
+        class _MultiBandModel:
+            """Adapter exposing the Likelihood interface over all selected bands."""
+            parameters = mbl.source_model.parameters
+            parameter_names = mbl.source_model.parameter_names
+            source_model = mbl.source_model
+
+            @property
+            def data(self):
+                return np.concatenate([
+                    bl.coverage['photons'].to_numpy() for bl in mbl._iter_bands()
+                ])
+
+            def counts(self):
+                """Fresh model counts across all selected bands."""
+                parts = []
+                for bl in mbl._iter_bands():
+                    pix = bl.coverage['pix'].to_numpy()
+                    exp = bl.coverage['exposure'].to_numpy()
+                    c = np.zeros(len(pix))
+                    for src in bl.source_model:
+                        c += bl.response(src, pix) * src.model(bl.band.energy)
+                    c *= exp
+                    parts.append(c)
+                return np.concatenate(parts)
+
+            def count_gradient(self):
+                """Gradient (n_params, total_pixels) across all selected bands."""
+                return np.vstack([bl.pixel_gradient() for bl in mbl._iter_bands()]).T
+
+            def parsubset(self, *args):
+                return mbl.source_model.parsubset(*args)
+
+        model = _MultiBandModel()
+        lik = Likelihood(model)
+
+        if select is not None:
+            if isinstance(select, (list, tuple)):
+                lik.select(*select)
+            else:
+                lik.select(select)
+
+        lik.maximize()
+
+        if summarize:
+            lik.summary()
+
+        self.fit_info = lik.fit_info
+
+
+    def get_sed_poisson_table(self, source_name=None, event_type=None, tol=0.2):
+        """Return an SED table with one Poisson object per energy bin.
+
+        Parameters
+        ----------
+        source_name : str, Source, or None
+            Source selector forwarded to ``SourceModel.find_source``.
+        event_type : None, int, or str
+            Event-type selection forwarded to ``sedfuns.sed_poisson_table``.
+        tol : float
+            Fit-quality tolerance forwarded to ``PoissonFitter``.
 
         Returns
         -------
-        LocalizedSourceView
-            Helper for localization and delta-TS scans for the selected source.
-        Raises
-        ------
-        SourceModelException
-            If no source is selected in the source model.
+        pandas.DataFrame
+            Per-band SED table containing a ``poiss`` column with
+            ``like3.loglikelihood.Poisson`` entries.
         """
-        from .sourcelist import LocalizedSourceView
-        return LocalizedSourceView(self.source_model)
+        source = self.source_model.find_source(source_name)
+        pkg = __package__ if __package__ else 'like3'
+        sedfuns = importlib.import_module(f'{pkg}.sedfuns')
+        return sedfuns.sed_poisson_table(
+            self,
+            source_name=source.name,
+            event_type=event_type,
+            tol=tol,
+        )
+
+    def plot_sed_with_band_points(
+        self,
+        source=None,
+        *,
+        sed_table=None,
+        set_kwargs=None,
+        ax=None,
+        update=False,
+        event_type=None,
+        tol=0.2,
+        emin=100,
+        emax=1e5,
+        xlim=None,
+        ylim=(0.1, None),
+        npts=100,
+        model_label=None,
+        points_label='Per-band SED',
+        title=None,
+        show_upper_limits=True,
+    ):
+        """Plot source SED model with per-band errorbar points.
+
+        Parameters
+        ----------
+        source : Source, str, or None, optional
+            Source selector forwarded to ``SourceModel.find_source``.
+            When ``None`` (default), the currently selected source is used.
+        sed_table : pandas.DataFrame or None, optional
+            Precomputed SED Poisson table containing ``elow``, ``ehigh``,
+            ``flux``, ``lflux``, and ``uflux`` columns. When provided,
+            this table is used directly and no call to
+            :meth:`get_sed_poisson_table` is made.
+        set_kwargs : dict or None, optional
+            Keyword arguments forwarded to ``Axes.set``. These values override
+            the default axis settings used by this method.
+        ax : matplotlib.axes.Axes or None, optional
+            Axes to draw into. A new figure is created when ``None``.
+        update : bool, optional
+            Force regeneration of the source SED Poisson table when
+            ``sed_table`` is not provided. Default ``False``.
+        event_type : None, int, or str, optional
+            Event-type selection forwarded to :meth:`get_sed`.
+        tol : float, optional
+            Poisson-fit tolerance forwarded to :meth:`get_sed`.
+        emin, emax : float, optional
+            Model-curve plotting range in MeV.
+        xlim : tuple[float, float] or None, optional
+            X-axis limits in MeV. Defaults to ``(emin, emax)``.
+        npts : int, optional
+            Number of model-curve points.
+        model_label : str or None, optional
+            Legend label for the model curve. Defaults to source name.
+        points_label : str, optional
+            Legend label for the binned points.
+        title : str or None, optional
+            Plot title. Defaults to source name.
+        show_upper_limits : bool, optional
+            If True, plot upper-limit markers for bins with ``flux <= 0``.
+
+        Returns
+        -------
+        matplotlib.axes.Axes
+            Axes with model SED and per-band points.
+        """
+        import matplotlib.pyplot as plt
+
+        src = self.source_model.find_source(source)
+        if sed_table is None:
+            if not update and hasattr(src, 'sedrec'):
+                sed_table = src.sedrec
+            else:
+                sed_table = self.get_sed_poisson_table(
+                    source_name=src.name,
+                    event_type=event_type,
+                    tol=tol,
+                )
+                src.sedrec = sed_table
+
+        if sed_table is None:
+            raise ValueError(f'No SED table available for source {src.name}')
+
+        fields = set(getattr(sed_table, 'columns', ()))
+        needed = {'elow', 'ehigh', 'flux', 'lflux', 'uflux'}
+        missing = needed - fields
+        if missing:
+            raise ValueError(f'sed table missing required fields: {sorted(missing)}')
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=(6, 4))
+
+        if xlim is None:
+            xlim = (emin, emax)
+
+        # Plot model SED directly in eV cm^-2 s^-1 units.
+        model = src.model
+        energies = np.logspace(np.log10(emin), np.log10(emax), npts)
+        dnde = model(energies)  # ph cm^-2 s^-1 MeV^-1
+        e2dnde_ev = energies**2 * dnde * 1e6
+        ax.loglog(
+            energies,
+            e2dnde_ev,
+            label=src.name.strip() if model_label is None else model_label,
+        )
+
+        if model.has_errors():
+            g = model.external_gradient(energies)
+            cov = model.get_cov_matrix()
+            var_dnde = np.sum((cov @ g) * g, axis=0)
+            var_dnde = np.clip(var_dnde, 0, None)
+            sigma_e2dnde_ev = energies**2 * np.sqrt(var_dnde) * 1e6
+            ax.fill_between(
+                energies,
+                e2dnde_ev - sigma_e2dnde_ev,
+                e2dnde_ev + sigma_e2dnde_ev,
+                alpha=0.3,
+            )
+
+        elow = np.asarray(sed_table['elow'], dtype=float)
+        ehigh = np.asarray(sed_table['ehigh'], dtype=float)
+        flux = np.asarray(sed_table['flux'], dtype=float)
+        lflux = np.asarray(sed_table['lflux'], dtype=float)
+        uflux = np.asarray(sed_table['uflux'], dtype=float)
+
+        ecent = np.sqrt(elow * ehigh)
+        xerr = np.vstack([
+            np.clip(ecent - elow, 0, np.inf),
+            np.clip(ehigh - ecent, 0, np.inf),
+        ])
+        # sed_table fluxes are energy-flux values from EnergyFluxView (eV units).
+        y = flux
+        ylo = lflux
+        yhi = uflux
+
+        det_mask = np.isfinite(y) & np.isfinite(ylo) & np.isfinite(yhi) & (flux > 0)
+        if np.any(det_mask):
+            yerr = np.vstack([
+                np.clip(y[det_mask] - ylo[det_mask], 0, np.inf),
+                np.clip(yhi[det_mask] - y[det_mask], 0, np.inf),
+            ])
+            ax.errorbar(
+                ecent[det_mask],
+                y[det_mask],
+                xerr=xerr[:, det_mask],
+                yerr=yerr,
+                fmt='o',
+                ms=5,
+                capsize=2,
+                lw=1,
+                color='tab:orange',
+                label=points_label,
+            )
+
+        if show_upper_limits:
+            ul_mask = np.isfinite(uflux) & (flux <= 0)
+            if np.any(ul_mask):
+                y_ul = uflux[ul_mask]
+                yerr_ul = 0.35 * np.clip(y_ul, 0, np.inf)
+                ax.errorbar(
+                    ecent[ul_mask],
+                    y_ul,
+                    xerr=xerr[:, ul_mask],
+                    yerr=yerr_ul,
+                    uplims=True,
+                    fmt='v',
+                    ms=4,
+                    lw=1,
+                    color='tab:red',
+                    label='95% UL',
+                )
+
+        defaults = dict(
+            xlabel='Energy (MeV)',
+            ylabel=r'$E^2\,dN/dE\ [\mathrm{eV\,cm^{-2}\,s^{-1}}]$',
+            title=src.name.strip() if title is None else title,
+            xlim=xlim,
+            ylim=ylim,
+            xscale='log',
+            yscale='log',
+        )
+        if set_kwargs is not None:
+            defaults.update(set_kwargs)
+        ax.set(**defaults)
+
+        ax.grid(True, which='both', alpha=0.25)
+        ax.legend()
+        return ax
+
+    def zea_plot(self, what):
+        """
+        """
+        raise NotImplementedError('ZEA plotting not yet implemented for MultiBandLikelihood')
+
 
 class BandLikelihood(HEALPix):
     """ For a given band and source model, select active pixels from the SourceModel, 
@@ -525,7 +948,7 @@ class BandLikelihood(HEALPix):
         self.evaluate_source_model()  # Update model counts based on new position
 
         
-    def loglike(self, pars=None, skydir=None):
+    def log_like(self, pars=None, skydir=None):
         """Compute the log-likelihood for the current model parameters.
         If `pars` is provided, update the source model parameters before computing.
         If `skydir` is provided, evaluate the model with the selected source at that position .
@@ -1100,11 +1523,11 @@ class FermiFit(views.LikelihoodViews):
             pt.select(keys=saved_keys)
             src.model.setp('Norm', norm0)
             src.changed = True
-            ll_ref_all = float(self.loglike())
+            ll_ref_all = float(self.log_like())
 
             src.model.setp('Norm', alpha * norm0)
             src.changed = True
-            ll_test_all = float(self.loglike())
+            ll_test_all = float(self.log_like())
 
             all_band_delta = ll_test_all - ll_ref_all
         finally:
@@ -1216,20 +1639,26 @@ class FermiFit(views.LikelihoodViews):
     # Likelihood
     # ------------------------------------------------------------------
 
-    def loglike(self, skydir=None):
+    def log_like(self, skydir=None, summed=True):
         """Total Poisson log-likelihood summed over all selected bands.
 
         Parameters
         ----------
         skydir : SkyCoord or None, optional
             Trial sky position forwarded to each band's ``loglike`` call.
+        summed : bool, optional
+            If True (default), return the sum of log-likelihoods over all bands.
+            If False, return an array of log-likelihoods for each band.
 
         Returns
         -------
-        float
+        float or np.ndarray
         """
         pt = self.pixel_table
-        return float(sum(band.loglike(skydir=skydir) for band in pt._iter_bands()))
+        if summed:
+            return float(sum(band.log_like(skydir=skydir) for band in pt._iter_bands()))
+        else:
+            return np.array([band.log_like(skydir=skydir) for band in pt._iter_bands()])
 
     def gradient(self, pars=None):
         """Analytic gradient of the total log-likelihood for free parameters."""
@@ -1322,7 +1751,7 @@ class FermiFit(views.LikelihoodViews):
 
         with self.fitter_view(select, exclude=exclude) as fv:
             if tolerance > 0:
-                qual = fv.delta_loglike()
+                qual = fv.delta_log_like()
                 if qual < tolerance and qual > 0:
                     if summarize:
                         print(
@@ -1338,7 +1767,7 @@ class FermiFit(views.LikelihoodViews):
                 if summarize:
                     print(
                         '%d calls: improvement, quality: %.2f, %.2f'
-                        % (fv.calls, w - fv.initial_likelihood, fv.delta_loglike())
+                        % (fv.calls, w - fv.initial_likelihood, fv.delta_log_like())
                     )
                 with redirect_stdout(io.StringIO()):
                     fv.modify(update_by)
@@ -1410,7 +1839,7 @@ class FermiFit(views.LikelihoodViews):
                 cor=100*cor.round(2) if cor is not None else None,
                 deltaTS=round(2.0 * (fv.log_like() - fv.initial_likelihood), 1),
                 # mask_indeces=np.arange(len(fv.mask))[fv.mask],
-                qual=float(fv.delta_loglike().round(2)),
+                qual=float(fv.delta_log_like().round(2)),
             )
         if summarize:
             self.summary()
@@ -1688,7 +2117,7 @@ class FermiFit(views.LikelihoodViews):
             x = max(float(x), 0.0)
             norm = norm_floor * np.exp(np.clip(x, 0.0, 700.0))
             _set_norm(norm)
-            return self.loglike()
+            return self.log_like()
 
         # Use local curvature around the current best value to set a linear
         # scale so the PoissonFitter variable has O(1) width.
@@ -1811,7 +2240,7 @@ def main(
     frame='galactic',
     verbose=False,
 ):
-    """Build and return a ``FermiFit`` for one catalog source.
+    """Build and return a ``MultiBandLikelihood`` for one catalog source.
 
     Parameters
     ----------
@@ -1831,8 +2260,9 @@ def main(
 
     Returns
     -------
-    FermiFit
-        Fit wrapper with attached ``pixel_table`` and ``source_model``.
+    MultiBandLikelihood
+        Multi-band likelihood wrapper with attached ``pixel_table`` and
+        ``source_model``.
     """
     package_root = Path(__file__).resolve().parent.parent
     path_candidates = [
@@ -1861,11 +2291,12 @@ def main(
         source_model=source_model,
     )
     plt.style.use('dark_background')
-    return FermiFit(pixel_table, verbose=verbose)
+    likelihood = MultiBandLikelihood(pixel_table, source_model)
+    return likelihood
 
 
 def _parse_args(argv=None):
-    parser = argparse.ArgumentParser(description='Build a FermiFit from a catalog source name.')
+    parser = argparse.ArgumentParser(description='Build a MultiBandLikelihood from a catalog source name.')
     parser.add_argument('source_name', help='Catalog source name used to build the SourceModel.')
     parser.add_argument('cone_size',  help='Cone radius in degrees for catalog selection.')
 
@@ -1903,7 +2334,7 @@ if __name__ == '__main__':
     args = _parse_args()
     show_date()
     with capture_hide(f'Setup output for {args.source_name}') as setup_output:
-        ff = main(
+        mbl = main(
             args.source_name, 
             float(args.cone_size),
             pixel_table_path=args.pixel_table_path,
@@ -1913,13 +2344,13 @@ if __name__ == '__main__':
             frame=args.frame,
         )
 
-        pt = ff.pixel_table
-        sm = ff.source_model
+        pt = mbl.pixel_table
+        sm = mbl.source_model
         selected = getattr(sm, 'selected_source', None)
         selected_name = None if selected is None else selected.name
  
     
-        print(f'Built FermiFit for {selected_name or args.source_name}')
+        print(f'Built MultiBandLikelihood for {selected_name or args.source_name}')
         print(f'Pixel table: {pt.name}')
         print(f'Sources, selected near {args.source_name}: {", ".join(s.name for s in sm)}')
 

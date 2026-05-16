@@ -574,8 +574,8 @@ def sed_poisson_table(roi, source_name=None, event_type=None, tol=0.1):
             for elow, ehigh in zip(ebins[:-1], ebins[1:]):
                 row = dict(
                     energy=float(np.sqrt(elow * ehigh)),
-                    elow=float(elow),
-                    ehigh=float(ehigh),
+                    elow=int(elow),
+                    ehigh=int(ehigh),
                     poiss=None,
                     maxdev=np.nan,
                     wprime=np.nan,

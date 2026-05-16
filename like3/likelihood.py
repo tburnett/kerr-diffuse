@@ -70,11 +70,13 @@ class Likelihood:
         d = self.data
         m = self.model.counts()
         # Constant factorial terms are omitted because they do not affect argmax.
-        logl = np.sum(d * np.log(m) - m)
+        logl = np.sum(d * np.log(np.maximum(m, 1e-12)) - m)
         # Gradient of log L for Poisson model: sum((d/m - 1) * dm/dtheta).
         # count_gradient() returns shape (n_total_free, n_pixels); restrict to the
         # active subset defined by the current parameter mask (set via select()).
-        full_grad = ((d / m - 1) * self.model.count_gradient()).sum(axis=1)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratio = np.where(m > 0, d / m, 0.0)
+        full_grad = ((ratio - 1) * self.model.count_gradient()).sum(axis=1)
         grad = full_grad[self.mp.mask]
         return logl, grad
  
@@ -142,8 +144,13 @@ class Likelihood:
         if x0 is None:
             x0 = self.model.parameters.values.copy()
         initial_val, _ = self(x0)
-        x_fit, val, d = optimize.fmin_l_bfgs_b(self, x0,  bounds=self.model.parameters.bounds); 
-        if d['warnflag'] != 0:
+        x_fit, val, d = optimize.fmin_l_bfgs_b(
+            self, x0, bounds=self.model.parameters.bounds, factr=1e3, pgtol=1e-2)
+        if d['warnflag'] == 2:
+            # Line-search abnormal: accept if objective improved, otherwise raise.
+            if val > initial_val:
+                raise RuntimeError('fit_plot: optimization failed: %s' % d['task'])
+        elif d['warnflag'] != 0:
             raise RuntimeError('fit_plot: optimization failed: %s' % d['task'])
         # Re-evaluate at reported optimum to synchronize objective + gradient.
         val, gradient = self(x_fit)
@@ -155,7 +162,8 @@ class Likelihood:
         G = self.model.count_gradient()  # (n_total_free, n_pix)
         G_active = G[self.mp.mask]       # (n_active, n_pix)
         m = self.model.counts()          # (n_pix,)
-        hess = (G_active / m) @ G_active.T  # (n_active, n_active)
+        safe_m = np.maximum(m, 1e-12)
+        hess = (G_active / safe_m) @ G_active.T  # (n_active, n_active)
         cov = np.linalg.inv(hess)
         sigs = np.sqrt(cov.diagonal())
 
