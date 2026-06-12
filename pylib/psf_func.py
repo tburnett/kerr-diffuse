@@ -99,6 +99,20 @@ def _read_pickle_compat(path):
 class PSFlist(list):
     """ Manage a list of PSF functions"""
 
+    @classmethod
+    def _event_type_to_int(cls, event_type):
+        if isinstance(event_type, str):
+            label = event_type.strip().upper()
+            aliases = {'FB': 0}
+            if label in aliases:
+                return aliases[label]
+            if label in cls.PSF.et_name:
+                return cls.PSF.et_name.index(label)
+            if label.isdigit():
+                return int(label)
+            raise ValueError(f'Unknown event type label: {event_type!r}')
+        return int(event_type)
+
     class PSF(dict):
         """ the PSF fumctor, in degrees, for a band
         Note that it is the density per square degree (180/pi)**2 = 3283 per sr)
@@ -186,6 +200,25 @@ class PSFlist(list):
             t = self.PSF(table, which)
             if event_type is None or t.event_type == event_type:
                 self.append(t)
+
+    def get_psf(self, event_type, energy, tol_mev=1.0):
+        """Return the nearest-energy PSF for *event_type* within *tol_mev* MeV."""
+        et = self._event_type_to_int(event_type)
+        target_energy = float(energy)
+        tol_mev = float(tol_mev)
+
+        matches = [psf for psf in self if int(psf.event_type) == et]
+        if not matches:
+            raise ValueError(f'No PSF entries for event_type={event_type!r} ({et})')
+
+        nearest = min(matches, key=lambda psf: abs(float(psf.energy) - target_energy))
+        delta_mev = abs(float(nearest.energy) - target_energy)
+        if delta_mev > tol_mev:
+            raise ValueError(
+                f'No PSF within {tol_mev:.3g} MeV for event_type={event_type!r} '
+                f'and energy={target_energy:.3f} MeV (nearest: {nearest.energy:.3f} MeV)'
+            )
+        return nearest
 
     @classmethod
     def example_plot(cls, *, title='',ids=None, default_ids=[0,4,8,10]):

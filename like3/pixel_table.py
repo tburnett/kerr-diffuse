@@ -757,6 +757,7 @@ class PixelTable(dict):
             Path to a PSF file for the bands. 
         """
         root = Path(root).expanduser()
+        self.version=root.name.split('.')[0].split('_')[-1]
         super().__init__()
         # self.source_model = source_model
         self._selected: list | None = None
@@ -850,10 +851,16 @@ class PixelTable(dict):
                     _raw = np.asarray(skymap_data['SUNMOON'], dtype=np.float32)
                     fits_diffuse += _raw[order_idx]; del _raw
 
-            _raw = np.asarray(skymap_data['POINTSOURCES'], dtype=np.float32)
-            fits_sources = _raw[order_idx]; del _raw
             _raw = np.asarray(skymap_data['EXTENDEDSOURCES'], dtype=np.float32)
-            fits_sources += _raw[order_idx]; del _raw
+            fits_sources = _raw[order_idx]; del _raw
+
+            if self.version<'v5':
+                _raw = np.asarray(skymap_data['POINTSOURCES'], dtype=np.float32)
+                fits_sources += _raw[order_idx]; del _raw
+            else:
+                print('*** Need new code for point source info in v5+ FITS files')
+
+
 
             del order_idx
 

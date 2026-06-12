@@ -82,8 +82,8 @@ class Poisson(object):
     #     return 'Poisson: mu,beta= %.1f, %.1f' %( mu, beta)
     
     def __repr__(self):
-        if self.flux==0:
-            return f'< {self.uflux:.3g} '
+        if self.flux==0 or self.ts<4:
+            return f'< {self.percentile():.3g} (ts={"0" if self.ts==0 else f"{self.ts:.1f}"})'
         relerr = np.abs(np.array(self.errors)/self.flux-1)
         return '{:.3g}[1+{:.3f}-{:.3f}]'.format(self.flux, relerr[0],relerr[1] )
     

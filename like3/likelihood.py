@@ -69,13 +69,15 @@ class Likelihood:
         self.mp.values = x
         d = self.data
         m = self.model.counts()
+        safe_m = np.maximum(m, 1e-12)
         # Constant factorial terms are omitted because they do not affect argmax.
-        logl = np.sum(d * np.log(np.maximum(m, 1e-12)) - m)
+        logl = np.sum(d * np.log(safe_m) - m)
         # Gradient of log L for Poisson model: sum((d/m - 1) * dm/dtheta).
         # count_gradient() returns shape (n_total_free, n_pixels); restrict to the
         # active subset defined by the current parameter mask (set via select()).
-        with np.errstate(divide='ignore', invalid='ignore'):
-            ratio = np.where(m > 0, d / m, 0.0)
+        ratio = np.zeros_like(d, dtype=float)
+        with np.errstate(invalid='ignore'):
+            np.divide(d, safe_m, out=ratio, where=m > 0)
         full_grad = ((ratio - 1) * self.model.count_gradient()).sum(axis=1)
         grad = full_grad[self.mp.mask]
         return logl, grad

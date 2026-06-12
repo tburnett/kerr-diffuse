@@ -7,15 +7,19 @@ import importlib
 import io
 from pathlib import Path
 import sys
+import warnings
 
 import matplotlib.pyplot as plt
 
 plt.style.use('dark_background')
 import numpy as np
-from astropy.coordinates import SkyCoord
+from astropy.coordinates import SkyCoord, Angle
 from astropy_healpix import HEALPix
 import pandas as pd
-from like3 import views
+from like3 import views, loglikelihood
+from like3.pixel_table import PixelTable
+from like3.sourcelist import SourceModel
+import importlib
 
 class PSFlookup:
     
@@ -71,6 +75,30 @@ class PSFlookup:
 
 from like3.fitter import Fitted   
 class MultiBandLikelihood(dict, Fitted):
+    def poisson_at_energy(self, energy, tol=0.2, **kwargs):
+        """Return a Poisson object for the selected source at the given energy.
+
+        Uses the eflux_view context manager and PoissonFitter to fit the likelihood curve
+        as a function of differential energy flux at the specified energy.
+
+        Parameters
+        ----------
+        energy : float
+            Energy in MeV for which to compute the Poisson fit.
+        tol : float, optional
+            Fit-quality tolerance for PoissonFitter (default 0.2).
+        **kwargs
+            Additional arguments forwarded to PoissonFitter.
+
+        Returns
+        -------
+        Poisson
+            Fitted Poisson object representing the likelihood at this energy.
+        """
+       
+        with self.eflux_view(energy) as eflux_ll:
+            pf = loglikelihood.PoissonFitter(eflux_ll, tol=tol, **kwargs)
+            return pf._poiss if hasattr(pf, '_poiss') else pf.poiss
 
 
     """A collection of BandLikelihood objects, one per band, that share a common SourceModel.
@@ -82,6 +110,7 @@ class MultiBandLikelihood(dict, Fitted):
         self.source_model = source_model
         self.selected = None
         self.energies = pixel_table.energies
+        self.fit_info: dict = {}
         super().__init__({key: BandLikelihood(band, source_model) for key, band in self.pixel_table.items()})
 
         self.llz = self.log_like()  # baseline log-likelihood for delta-TS calculations
@@ -244,7 +273,7 @@ class MultiBandLikelihood(dict, Fitted):
         if source is None:
             raise ValueError('No source is selected in the source model for a tsmap')
 
-        loglike = self.loglike
+        log_like = self.log_like
 
         class TSmap_function:
 
@@ -478,38 +507,158 @@ class MultiBandLikelihood(dict, Fitted):
             return views.FitterView(self, **kwargs)
         return views.SubsetFitterView(self, select, **kwargs)
 
-    def energy_flux_view(self, source_name, energy=None, **kw):
-        """Return a functor expressing log-likelihood as energy flux.
+    # def energy_flux_view(self, source_name, energy=None, **kw):
+    #     """Return a functor expressing log-likelihood as energy flux.
+
+    #     Parameters
+    #     ----------
+    #     source_name : str
+    #         Source whose normalization is profiled.
+    #     energy : float or None
+    #         Energy in MeV. If None, uses the model reference energy e0.
+    #     **kw
+    #         Forwarded to :class:`views.EnergyFluxView`.
+
+    #     Returns
+    #     -------
+    #     views.EnergyFluxView
+    #     """
+    #     try:
+    #         source = self.sources.find_source(source_name)
+    #     except Exception as msg:
+    #         raise Exception(
+    #             'could not create energy flux function for source %s;%s'
+    #             % (source_name, msg)
+    #         )
+    #     return views.EnergyFluxView(self, source.name, energy, **kw)
+
+    # def selected_source_energy_flux_view(self, energy=None, **kw):
+    #     """Return an energy-flux view for the currently selected source."""
+    #     src = self.source_model.selected_source
+    #     if src is None:
+    #         raise ValueError('No source is selected')
+    #     return self.energy_flux_view(src.name, energy=energy, **kw)
+
+    @contextmanager
+    def eflux_view(self, energy):
+        """Yield an energy-flux likelihood view for the selected source.
+
+        The active band selection is temporarily reduced to the band(s)
+        containing ``energy`` and the currently selected source is temporarily
+        assigned a power-law spectral model.  On exit (including exceptions),
+        both the original spectral model and the original band selection are
+        restored.
 
         Parameters
         ----------
-        source_name : str
-            Source whose normalization is profiled.
-        energy : float or None
-            Energy in MeV. If None, uses the model reference energy e0.
-        **kw
-            Forwarded to :class:`views.EnergyFluxView`.
+        energy : float
+            Energy in MeV used to select active band(s).
 
-        Returns
-        -------
+        Yields
+        ------
         views.EnergyFluxView
+            Callable view of negative log-likelihood as a function of
+            differential energy flux.
         """
-        try:
-            source = self.sources.find_source(source_name)
-        except Exception as msg:
-            raise Exception(
-                'could not create energy flux function for source %s;%s'
-                % (source_name, msg)
-            )
-        return views.EnergyFluxView(self, source.name, energy, **kw)
+        if energy is None:
+            raise ValueError('eflux_view requires an energy value in MeV')
 
-    def selected_source_energy_flux_view(self, energy=None, **kw):
-        """Return an energy-flux view for the currently selected source."""
-        src = self.source_model.selected_source
-        if src is None:
+        source = self.source_model.selected_source
+        if source is None:
             raise ValueError('No source is selected')
-        return self.energy_flux_view(src.name, energy=energy, **kw)
 
+        energy = float(energy)
+        saved_selection = None if self.selected is None else list(self.selected)
+        saved_model = source.spectral_model
+        saved_changed = bool(getattr(source, 'changed', False))
+
+        def _powerlaw_at(model, e):
+            """Create a power-law proxy matching model normalization/slope at e."""
+            from like3 import spectral_models
+            from like3.sources import set_default_bounds
+
+            if getattr(model, 'name', None) == 'PowerLaw':
+                pl = model.copy()
+            else:
+                pl = None
+                if hasattr(model, 'create_powerlaw'):
+                    candidate = model.create_powerlaw()
+                    if getattr(candidate, 'name', None) == 'PowerLaw':
+                        pl = candidate.copy()
+                if pl is None:
+                    e1 = max(1e-3, e * (1 - 1e-3))
+                    e2 = e * (1 + 1e-3)
+                    f1 = max(float(model(e1)), 1e-300)
+                    f2 = max(float(model(e2)), 1e-300)
+                    gamma = -np.log(f2 / f1) / np.log(e2 / e1)
+                    norm = max(float(model(e)), 1e-300)
+                    pl = spectral_models.PowerLaw(p=[norm, gamma], e0=e)
+
+            if hasattr(pl, 'e0'):
+                pl.e0 = e
+            if hasattr(pl, 'free') and len(pl.free) >= 2:
+                pl.free[0] = True
+                pl.free[1] = False
+            set_default_bounds(pl, force=True)
+            return pl
+
+        try:
+            self.select(energy=energy)
+            source.spectral_model = _powerlaw_at(saved_model, energy)
+            self.update()
+            yield views.EnergyFluxView(self, source.name, energy)
+        finally:
+            source.spectral_model = saved_model
+            source.changed = saved_changed
+            # Ensure all bands are refreshed before restoring the prior selection.
+            self.select()
+            self.update()
+            if saved_selection is None:
+                self.select()
+            else:
+                self.select(saved_selection)
+
+        # ------------------------------------------------------------------
+    # Freeze / thaw
+    # ------------------------------------------------------------------
+
+    def freeze(self, param, source_name=None, ):
+        """Freeze one or all parameters of a source's spectral model.
+
+        Parameters
+        ----------
+        source_name : str, Source, or None
+            Source selector forwarded to ``SourceModel.find_source``.
+        param : str, int, or None, optional
+            Parameter name or index to freeze.  When ``None`` all parameters
+            of the source's model are frozen.
+        """
+        src = self.source_model.find_source(source_name)
+        if param is None:
+            src.model.free[:] = False
+        else:
+            src.model.freeze(param)
+        self.source_model.reinitialize()  # Ensure parameter set is updated after thawing.
+
+    def thaw(self,  param,source_name=None,):
+        """Thaw (unfreeze) one or all parameters of a source's spectral model.
+
+        Parameters
+        ----------
+        source_name : str, Source, or None
+            Source selector forwarded to ``SourceModel.find_source``.
+        param : str, int, or None, optional
+            Parameter name or index to thaw.  When ``None`` all parameters
+            of the source's model are thawed.
+        """
+        src = self.source_model.find_source(source_name)
+        if param is None:
+            src.model.free[:] = True
+        else:
+            src.model.thaw(param)
+        self.source_model.reinitialize()  # Ensure parameter set is updated after thawing.
+
+    
     def fit(self, select=None, *, exclude=None, summarize=True, setpars=None, **kwargs):
         """Fit free parameters using :class:`~like3.likelihood.Likelihood`.
 
@@ -583,11 +732,99 @@ class MultiBandLikelihood(dict, Fitted):
                 lik.select(select)
 
         lik.maximize()
+        self.fit_info = lik.fit_info
 
         if summarize:
-            lik.summary()
+            self.summary()
 
-        self.fit_info = lik.fit_info
+    def summary(self, out=None, title=None, gradient=True, ts=True):
+        """Print a summary table of fitted parameter values and diagnostics.
+
+        Parameters
+        ----------
+        out : file-like or None
+            Output stream; defaults to stdout.
+        title : str or None
+            Optional title line.
+        gradient : bool
+            Include likelihood-gradient column when available.
+        ts : bool
+            Include TS column when available.
+        """
+        if title is not None:
+            print(title, file=out)
+
+        fmt_hdr = '%-21s%6s%10s%10s'
+        tup_hdr = ('Name', 'index', 'value', 'error(%)')
+
+        pset = self.source_model.parameters
+        all_names = pset.parameter_names
+        all_model_params = np.asarray(pset.model_parameters)
+        n_all = len(all_names)
+
+        param_mask = np.asarray(getattr(pset, 'mask', np.ones(n_all, dtype=bool)), dtype=bool)
+        grad = None
+        ts_values = None
+
+        if self.fit_info:
+            fit_mask = self.fit_info.get('param_mask')
+            if fit_mask is not None:
+                param_mask = np.asarray(fit_mask, dtype=bool)
+            if gradient:
+                grad = self.fit_info.get('grad')
+                if grad is not None:
+                    grad = np.asarray(grad, dtype=float)
+                if grad is not None and len(grad) == int(param_mask.sum()):
+                    fmt_hdr += '%10s'
+                    tup_hdr += ('ll_grad',)
+            if ts:
+                ts_values = self.fit_info.get('ts_values')
+                if ts_values is not None:
+                    fmt_hdr += '%10s'
+                    tup_hdr += ('TS',)
+
+        if gradient and grad is None:
+            try:
+                _, grad = self.loglike_grad()
+                grad = np.asarray(grad, dtype=float)[param_mask]
+                fmt_hdr += '%10s'
+                tup_hdr += ('ll_grad',)
+            except Exception:
+                grad = None
+
+        print(fmt_hdr % tup_hdr, file=out)
+
+        active_names = all_names[param_mask]
+        active_model_params = all_model_params[param_mask]
+        index_array = np.arange(n_all)[param_mask]
+
+        n_active = int(param_mask.sum())
+        uncertainties = pset.uncertainties[param_mask] if self.fit_info else np.zeros(n_active)
+
+        prev = ''
+        for i, (name, value) in enumerate(zip(active_names, active_model_params)):
+            t = name.split('_')
+            pname = t[-1]
+            sname = '_'.join(t[:-1])
+            display_name = name if sname != prev else len(sname) * ' ' + '_' + pname
+            prev = sname
+
+            rsig = float(uncertainties[i]) if i < len(uncertainties) else 0.0
+            psig = '%.1f' % (rsig * 100) if rsig > 0 and not np.isnan(rsig) else '***'
+
+            truncname = display_name[:20] + '*' if len(display_name) > 20 else display_name
+            fmt = '%-21s%6d%10.4g%10s'
+            tup = (truncname, index_array[i], value, psig)
+
+            if gradient and grad is not None:
+                fmt += '%10.1f'
+                tup += (float(grad[i]),)
+            if ts and ts_values is not None:
+                fmt += '%10s'
+                ts_val = ts_values[i]
+                tup += (f'{ts_val:.0f}' if np.isfinite(ts_val) else '',)
+
+            print(fmt % tup, file=out)
 
 
     def get_sed_poisson_table(self, source_name=None, event_type=None, tol=0.2):
@@ -805,6 +1042,133 @@ class MultiBandLikelihood(dict, Fitted):
         ax.legend()
         return ax
 
+    def norm_profile(self, source_name=None, tol=0.5):
+        """Return a Norm profile fitted in log-space.
+
+        All other free parameters are held fixed at their current values.
+        The fit is performed against ``x = log(norm / norm_floor)`` (with an
+        additional linear rescaling for numerical stability), then exposed via a
+        callable object in physical Norm units.
+
+        Parameters
+        ----------
+        source_name : str, Source, or None
+            Source selector forwarded to ``SourceModel.find_source``.  Defaults
+            to the currently selected source.
+        tol : float, optional
+            Fit-quality tolerance forwarded to ``PoissonFitter``.
+
+        Returns
+        -------
+        object
+            Profile object with ``__call__``, ``flux``, ``errors``, ``limit``,
+            and ``ts`` attributes in physical Norm units.
+
+        Raises
+        ------
+        ValueError
+            If no ``Norm`` parameter exists in the source's spectral model.
+        """
+        pkg = __package__ if __package__ else 'like3'
+        PoissonFitter = importlib.import_module(f'{pkg}.loglikelihood').PoissonFitter
+
+        source = self.source_model.find_source(source_name)
+        model = source.model
+        best_norm = float(model.getp('Norm'))
+        norm_floor = 1e-30
+        safe_best = max(best_norm, norm_floor)
+
+        def _set_norm(norm):
+            model.setp('Norm', max(float(norm), norm_floor))
+            source.changed = True
+
+        def _loglike_x(x):
+            # x is log(norm / norm_floor), constrained to x >= 0 by PoissonFitter.
+            x = max(float(np.asarray(x, dtype=float).reshape(-1)[0]), 0.0)
+            norm = norm_floor * np.exp(np.clip(x, 0.0, 700.0))
+            _set_norm(norm)
+            return self.log_like()
+
+        # Use local curvature around the current best value to set a linear
+        # scale so the PoissonFitter variable has O(1) width.
+        x0 = float(np.log(safe_best / norm_floor))
+        h = 1e-3
+        try:
+            f0 = _loglike_x(x0)
+            fp = _loglike_x(x0 + h)
+            fm = _loglike_x(max(x0 - h, 0.0))
+            curvature = max(2.0 * f0 - fp - fm, 0.0) / (h * h)
+            sigma_x = 1.0 / np.sqrt(curvature) if curvature > 0 else 1.0
+            sigma_x = float(np.clip(sigma_x, 1e-4, 1e4))
+            y0 = x0 / sigma_x
+
+            def _loglike_y(y):
+                return _loglike_x(y * sigma_x)
+
+            try:
+                pf = PoissonFitter(_loglike_y, scale=max(y0, 1.0), tol=tol)
+            except Exception:
+                # Some low-information or strongly non-Poisson-like profiles can
+                # exceed the strict maxdev test; retry with a looser tolerance.
+                pf = PoissonFitter(_loglike_y, scale=max(y0, 1.0), tol=max(1.0, 2.0 * tol))
+            poiss_y = pf.poiss
+        finally:
+            _set_norm(best_norm)
+
+        class _LogNormProfile:
+            def __init__(self, poiss, sigma, floor):
+                self._poiss = poiss
+                self._sigma = float(sigma)
+                self._floor = float(floor)
+
+            def __str__(self):
+                flux = self.flux
+                lo, hi = self.errors
+                limit = self.limit
+                if flux > 0:
+                    return (
+                        f'LogNormProfile(flux={flux:.4g}, '
+                        f'errors=({lo:.4g}, {hi:.4g}), '
+                        f'ts={self.ts:.2f})'
+                    )
+                return f'LogNormProfile(flux=0, limit95={limit:.4g}, ts={self.ts:.2f})'
+
+            __repr__ = __str__
+
+            def _norm_to_y(self, norm):
+                n = np.clip(np.asarray(norm, dtype=float), self._floor, np.inf)
+                x = np.log(n / self._floor)
+                return x / self._sigma
+
+            def __call__(self, norm):
+                y = self._norm_to_y(norm)
+                if np.ndim(y) == 0:
+                    return float(self._poiss(float(y)))
+                return np.asarray(self._poiss(y), dtype=float)
+
+            @property
+            def flux(self):
+                y_peak = max(self._poiss.flux, 0.0)
+                return float(self._floor * np.exp(np.clip(y_peak * self._sigma, 0.0, 700.0)))
+
+            @property
+            def errors(self):
+                y_lo, y_hi = self._poiss.errors
+                lo = self._floor * np.exp(np.clip(y_lo * self._sigma, 0.0, 700.0))
+                hi = self._floor * np.exp(np.clip(y_hi * self._sigma, 0.0, 700.0))
+                return (float(lo), float(hi))
+
+            @property
+            def limit(self):
+                y_lim = self._poiss.limit if hasattr(self._poiss, 'limit') else self._poiss.percentile(0.95)
+                return float(self._floor * np.exp(np.clip(y_lim * self._sigma, 0.0, 700.0)))
+
+            @property
+            def ts(self):
+                return float(self._poiss.ts)
+
+        return _LogNormProfile(poiss_y, sigma_x, norm_floor)
+
     def zea_plot(self, what):
         """
         """
@@ -823,6 +1187,7 @@ class BandLikelihood(HEALPix):
         super().__init__(nside=band.nside, order=band.order, frame=band.frame)
         self.center = source_model[0].skydir if len(source_model) > 0 else SkyCoord(0, 0, unit='deg')
         self.coverage = None  # populated on demand by build_coverage()
+        self.empty_coverage = False
         self.psf_cache = {}  # populated on demand by response()
         self.build_coverage() if source_model else None
 
@@ -859,7 +1224,7 @@ class BandLikelihood(HEALPix):
         radius_deg = r68_radius * self.band.psf.r68 if self.band.psf is not None else 2.0
         mask = np.zeros(len(self.band.pix), dtype=bool)
         for src in self.source_model:
-            mask |= self.band.cone_search(src.skydir, radius_deg)
+            mask |= self._coverage_mask(src.skydir, radius_deg)
         pix = self.band.pix[mask]
         photons = self.band.photons[mask]
         diffuse_counts = self.band.diffuse_counts[mask]
@@ -873,7 +1238,62 @@ class BandLikelihood(HEALPix):
             background_counts=diffuse_counts + source_counts,
             exposure=self.band.exposure_map(pix).astype(np.float32),
         ))
-        self.evaluate_source_model()   
+        self.empty_coverage = len(self.coverage) == 0
+        if len(self.coverage) == 0:
+            self.coverage['model_counts'] = np.array([], dtype=float)
+            warnings.warn(self._coverage_error_message('build coverage'), stacklevel=2)
+            return
+        self.evaluate_source_model()
+
+    def _normalize_skydir(self, center):
+        """Return a SkyCoord-compatible center from either SkyCoord or legacy SkyDir."""
+        return center.coord if hasattr(center, 'coord') else center
+
+    def _coverage_padding_deg(self):
+        """Approximate half-width used to include coarse pixels that overlap a search cone."""
+        resolution = getattr(self.band, 'pixel_resolution', None)
+        if resolution is None:
+            return 0.0
+        if hasattr(resolution, 'to_value'):
+            return float(resolution.to_value('deg'))
+        return float(resolution)
+
+    def _coverage_mask(self, center, radius_deg):
+        """Return a sparse-pixel mask for source coverage using an overlap-aware cone search."""
+        center = self._normalize_skydir(center)
+        padded_radius = radius_deg + self._coverage_padding_deg()
+        if hasattr(self.band, 'cone_search_skycoord'):
+            cone_pix = np.asarray(
+                self.band.cone_search_skycoord(center, Angle(padded_radius, 'deg')),
+                dtype=np.int64,
+            )
+            if len(cone_pix) > 0:
+                return np.isin(self.band.pix, cone_pix)
+        return self.band.cone_search(center, padded_radius)
+
+    def _coverage_error_message(self, action):
+        """Return a diagnostic string describing an empty coverage selection."""
+        names = [getattr(src, 'name', str(src)) for src in self.source_model]
+        src_text = ', '.join(names) if names else '<no sources>'
+        return (
+            f'Band {self.band.key} ({self.band.energy:.0f} MeV) has empty coverage; '
+            f'cannot {action}. This usually means the selected source footprint '
+            f'did not intersect any sparse pixels in the band. Sources: {src_text}'
+        )
+
+    def _require_coverage(self, action):
+        """Return whether coverage is usable, tracking empty coverage on the instance."""
+        if self.coverage is None:
+            raise RuntimeError(f'Band {self.band.key} has no coverage table; cannot {action}.')
+        if len(self.coverage) == 0:
+            self.empty_coverage = True
+            return False
+        self.empty_coverage = False
+        return True
+
+    def _free_parameter_count(self):
+        """Return the number of free source-model parameters for empty-coverage fallbacks."""
+        return int(sum(np.count_nonzero(src.model.free) for src in self.source_model))
 
     def response(self, source, pixels=None,*, ignore_cache_for=None):
         """Return PSF response for a source evaluated on given pixel indices.
@@ -920,6 +1340,9 @@ class BandLikelihood(HEALPix):
         """Evaluate the source model counts for coverage pixels."""
         if pix is None:
             if self.coverage is not None:
+                if not self._require_coverage('evaluate source model'):
+                    self.coverage['model_counts'] = np.array([], dtype=float)
+                    return
                 pix = self.coverage['pix'].to_numpy()
             else:
                 pix = self.band.pix
@@ -978,9 +1401,13 @@ class BandLikelihood(HEALPix):
             self.evaluate_source_model()
 
         # Data and model (diffuse + other sources + active source counts for coverage pixels)
+        if not self._require_coverage('evaluate log-likelihood'):
+            return 0.0
         cov = self.coverage
         data = cov['photons'].to_numpy()
-        model = cov['model_counts'].to_numpy() # temporary for bright source testing!
+        # model = cov['model_counts'].to_numpy() # temporary for bright source testing!
+        model = (cov.model_counts.array + cov.background_counts.array) 
+        
 
         # Poisson log-likelihood (ignoring constant term)
         ll = np.sum(data * np.log(model + 1e-12) - model)
@@ -993,7 +1420,8 @@ class BandLikelihood(HEALPix):
         -------
         np.ndarray
             Gradient matrix of shape (n_pixels, n_free_parameters)."""
-        
+        if not self._require_coverage('evaluate pixel gradients'):
+            return np.zeros((0, self._free_parameter_count()), dtype=float)
         g = []
         keys = self.coverage['pix'].to_numpy() 
         for src in self.source_model:
@@ -1010,6 +1438,8 @@ class BandLikelihood(HEALPix):
         If `pars` is provided, update the source model parameters before computing."""
         if pars is not None:
             self.parameters = pars
+        if not self._require_coverage('evaluate log-likelihood gradient'):
+            return 0.0, np.zeros(self._free_parameter_count(), dtype=float)
         cov = self.coverage
         data = cov['photons'].to_numpy()
         model = cov['model_counts'].to_numpy()
@@ -1025,45 +1455,167 @@ class BandLikelihood(HEALPix):
     def expand_healpix_array(self,arr):
             """Expand a per-pixel array to a full HEALPix array."""
 
-            if len(arr) == 12*self.nside**2:
+            nside = getattr(self, 'nside', self.band.nside)
+            npix = 12 * nside**2
+
+            if len(arr) == npix:
                 return arr
             
             if len(arr) == len(self.coverage):
-                hpa = np.full(12*self.nside**2, np.nan, dtype=float)
+                hpa = np.full(npix, np.nan, dtype=float)
                 hpa[self.coverage.pix] = arr
                 return hpa
-            raise ValueError(f'Cannot expand array of length {len(arr)} to HEALPix array of length {12*self.nside**2}')
+            raise ValueError(f'Cannot expand array of length {len(arr)} to HEALPix array of length {npix}')
+
+    def _plot_component_values(self, component):
+        """Return a full HEALPix array for a coverage component or numeric array."""
+        if self.coverage is None:
+            raise RuntimeError('BandLikelihood has no coverage table for plotting')
+
+        if isinstance(component, str):
+            component = {'residual': 'resid'}.get(component, component)
+            if component == 'data':
+                arr = self.coverage['photons'].to_numpy(dtype=float)
+            elif component == 'diffuse':
+                arr = self.coverage['diffuse_counts'].to_numpy(dtype=float)
+            elif component == 'sources':
+                arr = self.coverage['source_counts'].to_numpy(dtype=float)
+            elif component == 'model':
+                arr = self.coverage['model_counts'].to_numpy(dtype=float)
+            elif component == 'resid':
+                arr = self.residual
+            elif component == 'sigma':
+                arr = self.sigma
+            elif component == 'exposure':
+                arr = self.coverage['exposure'].to_numpy(dtype=float)
+            elif component in self.coverage:
+                arr = self.coverage[component].to_numpy(dtype=float)
+            else:
+                raise ValueError(f'Unknown coverage component: {component!r}')
+        else:
+            arr = np.asarray(component, dtype=float)
+
+        return self.expand_healpix_array(arr)
+
+    def _default_plot_log(self, component, log):
+        """Choose a plotting log-scale default appropriate for the component."""
+        if log is not None:
+            return log
+        if isinstance(component, str) and component in {'resid', 'residual', 'sigma'}:
+            return False
+        return True
+
+    def _plot_center(self, center=None):
+        """Resolve a plotting center from explicit input or the first/selected source."""
+        if center is not None:
+            return center.coord if hasattr(center, 'coord') else center
+
+        source_model = self.source_model
+        selected = getattr(source_model, 'selected_source', None)
+        if selected is not None:
+            return selected.skydir.coord if hasattr(selected.skydir, 'coord') else selected.skydir
+
+        if len(source_model) > 0:
+            skydir = source_model[0].skydir
+            return skydir.coord if hasattr(skydir, 'coord') else skydir
+
+        raise ValueError('No source is available for plotting; pass center explicitly')
 
     @property
     def residual(self):
         """Compute the residual counts (data - model) for coverage pixels."""
-        return self.coverage['photons'].to_numpy() - self.coverage['source_counts'].to_numpy()
+        model_key = 'background_counts' if 'background_counts' in self.coverage else 'model_counts'
+        return self.coverage['photons'].to_numpy() - self.coverage[model_key].to_numpy()
     
     @property
     def sigma(self):
         """Compute residual in (approximate) sigma units for coverage pixels."""
-        model = self.coverage['model_counts'].to_numpy()
+        model_key = 'background_counts' if 'background_counts' in self.coverage else 'model_counts'
+        model = self.coverage[model_key].to_numpy()
         data = self.coverage['photons'].to_numpy()
         return np.where(model > 0, (data - model) / np.sqrt(model), 0.0)
 
-    def zea_plot(self, what, **kwargs):
-        """
-         Plot a HEALPix map of the given per-pixel quantity *what* in ZEA projection 
-         centered on the source model."""
-        from like3 import sky_display
-        if isinstance(what, str) and what in self.coverage:
-            arr = self.expand_healpix_array(self.coverage[what])
-        elif isinstance(what, np.ndarray):
-            arr = self.expand_healpix_array(what)
+    def ait_plot(self, component='data', *, figsize=(12, 6), fig=None, colorbar=True,
+                 label='counts/pixel', title=None, shrink=0.7, cmap='viridis',
+                 log=None, **kwargs):
+        """Render an all-sky AIT projection for a BandLikelihood coverage component."""
+        from matplotlib.colors import LogNorm, Normalize
+        from utilities.skymaps import AITfigure
+
+        log = self._default_plot_log(component, log)
+        mp = self._plot_component_values(component)
+        if log:
+            mp = mp.copy()
+            mp[mp == 0] = np.nan
+
+        vmin = kwargs.pop('vmin', None)
+        vmax = kwargs.pop('vmax', None)
+        norm_fn = LogNorm if log else Normalize
+
+        afig = AITfigure(fig=fig, figsize=figsize, title=title)
+        afig.imshow(mp, norm=norm_fn(vmin=vmin, vmax=vmax), cmap=cmap, **kwargs)
+        if colorbar:
+            afig.colorbar(label=label, shrink=shrink)
+        return afig
+
+    def zea_plot(self, component='data', center=None, *, figsize=(6, 5), pixelsize=None,
+                 size=None, fig=None, axes_visible=True, cmap='viridis', colorbar=True,
+                 title=None, label='counts/pixel', log=None, vmin=None, vmax=None,
+                 frame='galactic', **kwargs):
+        """Render a local ZEA projection for a BandLikelihood coverage component."""
+        from matplotlib.patches import Circle
+        from utilities.skymaps import ZEAfigure
+
+        center = self._plot_center(center)
+        log = self._default_plot_log(component, log)
+        psf = self.psf
+        if psf is not None:
+            size = size if size is not None else 16 * psf.r68
+            pixelsize = pixelsize if pixelsize is not None else psf.r68 / 50
         else:
-            raise ValueError(f"Unknown coverage key or array: {what}")
-        
-        zea = sky_display.zea_plot(self.center, arr, r68 = self.psf.r68, 
-                                   source_model=self.source_model, **kwargs)
-        zea.axes_text(0.98, 0.98,
-                        f'{self.band.energy / 1e3:.2f} GeV\nPSF{self.psf.event_type-2}',
-                        color='white', ha='right', va='top', fontsize=12)
-        return zea
+            size = size if size is not None else 5
+            pixelsize = pixelsize if pixelsize is not None else 0.05
+
+        zfig = ZEAfigure(
+            center,
+            size=size,
+            fig=fig,
+            figsize=figsize,
+            frame=frame,
+            pixelsize=pixelsize,
+            axes_visible=axes_visible,
+            title='' if title is None else title,
+        )
+
+        if component is not None:
+            mp = self._plot_component_values(component)
+            mp = mp.copy()
+            mp[mp == 0] = np.nan
+            zfig.imshow(mp, log=log, vmin=vmin, vmax=vmax, cmap=cmap, **kwargs)
+            if colorbar:
+                zfig.colorbar(label=label, shrink=0.9, extend='max')
+
+        band_label = getattr(self.band, 'psf_name', None)
+        if band_label is None:
+            event_type = getattr(self.psf, 'event_type', None)
+            band_label = f'PSF{event_type - 2}' if event_type is not None and event_type >= 2 else 'Band'
+        zfig.axes_text(
+            0.98,
+            0.98,
+            f'{self.band.energy / 1e3:.2f} GeV\n{band_label}',
+            color='white',
+            ha='right',
+            va='top',
+            fontsize=12,
+        )
+
+        if psf is not None:
+            ax = zfig.ax
+            r68_px = psf.r68 / pixelsize
+            cx, cy = (ax.transAxes + ax.transData.inverted()).transform((0.12, 0.12))
+            ax.add_patch(Circle((cx, cy), r68_px, fill=False, edgecolor='white', linewidth=1.5))
+
+        return zfig
 
 def gradient_check(bl,  eps=1e-3):
     """Compare analytic gradient from grad_fn to numerical gradient of loglike_fn at pars."""
@@ -2114,7 +2666,7 @@ class FermiFit(views.LikelihoodViews):
 
         def _loglike_x(x):
             # x is log(norm / norm_floor), constrained to x >= 0 by PoissonFitter.
-            x = max(float(x), 0.0)
+            x = max(float(np.asarray(x, dtype=float).reshape(-1)[0]), 0.0)
             norm = norm_floor * np.exp(np.clip(x, 0.0, 700.0))
             _set_norm(norm)
             return self.log_like()
