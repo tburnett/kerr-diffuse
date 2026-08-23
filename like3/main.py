@@ -507,37 +507,37 @@ class MultiBandLikelihood(dict, Fitted):
             return views.FitterView(self, **kwargs)
         return views.SubsetFitterView(self, select, **kwargs)
 
-    # def energy_flux_view(self, source_name, energy=None, **kw):
-    #     """Return a functor expressing log-likelihood as energy flux.
+    def energy_flux_view(self, source_name, energy=None, **kw):
+        """Return a functor expressing log-likelihood as energy flux.
 
-    #     Parameters
-    #     ----------
-    #     source_name : str
-    #         Source whose normalization is profiled.
-    #     energy : float or None
-    #         Energy in MeV. If None, uses the model reference energy e0.
-    #     **kw
-    #         Forwarded to :class:`views.EnergyFluxView`.
+        Parameters
+        ----------
+        source_name : str
+            Source whose normalization is profiled.
+        energy : float or None
+            Energy in MeV. If None, uses the model reference energy e0.
+        **kw
+            Forwarded to :class:`views.EnergyFluxView`.
 
-    #     Returns
-    #     -------
-    #     views.EnergyFluxView
-    #     """
-    #     try:
-    #         source = self.sources.find_source(source_name)
-    #     except Exception as msg:
-    #         raise Exception(
-    #             'could not create energy flux function for source %s;%s'
-    #             % (source_name, msg)
-    #         )
-    #     return views.EnergyFluxView(self, source.name, energy, **kw)
+        Returns
+        -------
+        views.EnergyFluxView
+        """
+        try:
+            source = self.sources.find_source(source_name)
+        except Exception as msg:
+            raise Exception(
+                'could not create energy flux function for source %s;%s'
+                % (source_name, msg)
+            )
+        return views.EnergyFluxView(self, source.name, energy, **kw)
 
-    # def selected_source_energy_flux_view(self, energy=None, **kw):
-    #     """Return an energy-flux view for the currently selected source."""
-    #     src = self.source_model.selected_source
-    #     if src is None:
-    #         raise ValueError('No source is selected')
-    #     return self.energy_flux_view(src.name, energy=energy, **kw)
+    def selected_source_energy_flux_view(self, energy=None, **kw):
+        """Return an energy-flux view for the currently selected source."""
+        src = self.source_model.selected_source
+        if src is None:
+            raise ValueError('No source is selected')
+        return self.energy_flux_view(src.name, energy=energy, **kw)
 
     @contextmanager
     def eflux_view(self, energy):

@@ -97,7 +97,7 @@ class KerrPixelTable(dict):
             Slice into the parent table's flat arrays for this band's rows.
         """
 
-        def __init__(self, meta: tuple[str, float, float, int, int]) -> None:
+        def __init__(self, meta: tuple[str, float, float, int, int], order: str = 'nested') -> None:
             """Construct a Band from a metadata tuple.
 
             Parameters
@@ -113,11 +113,57 @@ class KerrPixelTable(dict):
             psf_index = self.event_type if self.event_type < 2 else self.event_type - 2
             self.key = (int(psf_index), int(_energy_index(self.e0)))
             self.energy = f'{np.sqrt(self.e0 * self.e1) * 1e-3:.2f} GeV'
-            super().__init__(nside=nside, frame='galactic', order='nested')
+            super().__init__(nside=nside, frame='galactic', order=order)
 
         def __repr__(self) -> str:
             return f"Band{self.key}: {self.psf_name}@{self.energy} nside {self.nside} occ {self.nocc/(12*self.nside**2):.3f}"
-        
+
+        def ait_plot(self, component: str | np.ndarray ='diffuse',*, name='', figsize=(10,5), log=True, title='', colorbar=False, **kwargs):
+            """Plot the band contents using an Aitoff projection.
+
+            Parameters
+            ----------
+            component : str or np.ndarray, optional
+                The component to plot (default is 'diffuse'). If an array-like object is provided, it will be used directly for plotting.
+            figsize : tuple, optional
+                Figure size (default is (10,5)).
+            log : bool, optional
+                Whether to use a logarithmic scale (default is True).
+            title : str, optional
+                Title for the plot (default is '').
+            colorbar : bool, optional
+                Whether to display a colorbar (default is False).
+            **kwargs : dict
+                Additional keyword arguments passed to `AITfigure.imshow`.
+            """
+            from utilities.skymaps import AITfigure
+
+            if type(component) is not str: # assume an array-like object with proper shape for plotting
+                toplot = component
+                name = name or 'custom'
+            else:
+                if not hasattr(self, component):
+                    raise KeyError(f"Component '{component}' not found in the band")
+                toplot = getattr(self, component)
+                name = component
+
+            # create full ring ordered HEALPix array with NaNs, then fill in the values at the specified indices
+            hparray = np.full(12*self.nside**2, np.nan, dtype=np.float32)
+            idx = self.indices
+            if len(idx) != len(toplot):
+                raise ValueError("Length of indices does not match length of data to plot")
+            if self.order.lower() == 'nested':
+                idx = self.nested_to_ring(idx) 
+            hparray[idx] = toplot
+
+            afig = AITfigure(figsize=figsize)
+            afig.imshow(np.log10(hparray+1e-6) if log else hparray, **kwargs);
+            if title:
+                afig.set_title(title, fontsize=14)
+            if colorbar:
+                afig.colorbar(label=name if not log else f'log10({name})', shrink=0.8)
+            return afig
+
             
     def __init__(self, *pars: str | Path, toring: bool = False) -> None:
         """Load a Kerr pixel table from .npz/.pickle file pair(s).
@@ -168,7 +214,7 @@ class KerrPixelTable(dict):
 
         offset = 0
         for i, m in enumerate(meta):
-            b = self.Band(m, )
+            b = self.Band(m, order='nested' if not toring else 'ring')
             self[b.key] = b
             nocc = int(m[-1])
             sl = slice(offset, offset + nocc)
@@ -182,11 +228,74 @@ class KerrPixelTable(dict):
             import healpy as hp
             for b in self.values():
                 b.indices = hp.nest2ring(b.nside, b.indices.astype(int)).astype(np.uint32)
+
             self.indices = np.concatenate([b.indices for b in self.values()])
 
         self.ring = toring  # flag for the FITS fits
         self.meta_df = pd.DataFrame(meta, columns='event_type emin emax nside nocc'.split())
         self.meta_df['occupancy'] = (self.meta_df.nocc / (12 * self.meta_df.nside**2)).round(3)
+
+    def __getitem__(self, key: int | tuple[int, int]) -> Band:
+        """Return a band by keyed tuple or by ordered band index."""
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return cast(self.Band, super().__getitem__(key))
+
+    def process_point_sources(self, srcinfo, outfile=None):
+        """Process point sources to be added to the pixel table.
+        This function loops over the bands in the pixel table and the corresponding point source bands,
+        accumulating the point source counts for each pixel. The counts can either be saved to a file
+        or returned as an array.    
+
+        Parameters
+        ----------
+        self : object
+            The pixel table object.
+        srcinfo : KerrPtsrcInfo
+            The point source information object.
+        outfile : str, optional
+            If provided, save the point source counts to this npz file.
+            Example: `files/kerr/pointsources.npz`
+        """
+
+        # Initialize an array to store point source counts for each pixel in the pixel table
+        ptsrc_counts = np.zeros(len(self.counts), dtype=np.float32)
+
+        # Loop over the pixel table bands and the correponding point source bands
+        for j,(key,ptband) in enumerate(self.items()):
+            psband = srcinfo.meta.iloc[j]
+            print(f"{key}",end='')
+            # the correspoinding slices of the pixel table and point source table for this band
+            ptslice, psslice = ptband.slice, psband.slice
+            # print(f'\tslices: {ptband.slice}, {psband.slice}')
+            nside = psband.nside; assert nside == ptband.nside, f"nside mismatch: {nside} != {ptband.nside}"
+            # the pixel list for this band
+            pt_pixel_indices = self.indices[ptslice]
+            assert max(pt_pixel_indices) < 12*nside**2, f"Pixel indices {pt_pixel_indices} exceed the maximum for nside {psband.nside}"
+
+            # get the counts, names, and indices to the pixels for this band
+            counts = srcinfo.pscounts[psslice]
+            # name_indices = srcinfo.nameidx[psslice]
+
+            # indices into the pixeltable
+            pix_indices = srcinfo.healpixidx[psslice]
+            # add the counts for a given pixel index
+
+            np.add.at(ptsrc_counts[ptslice], pix_indices, counts)
+
+        print()
+        # add the point source counts as a new column in the pixel table
+        self.columns += ['pointsources']
+        self.pointsources = ptsrc_counts
+        for key, band in self.items(): 
+            setattr( band, 'pointsources', ptsrc_counts[band.slice])
+            
+       
+        if outfile is not None:
+            np.savez(outfile,  pointsources=ptsrc_counts)
+            print(f"Point source counts saved to {outfile}")
+        else:
+            return ptsrc_counts
 
     def to_fits(self, filename: str | Path) -> None:
         """Write the pixel table to a FITS file using the Kerr layout.
@@ -332,11 +441,26 @@ class _ToFITS:
 
 
 class KerrPtsrcInfo:
+    """Manage a ptsrc_vx.npz file of point source pixel model counts which has the following entries:
+
+        * names -- the FL16Y names of the catalog sources.  They are sub-ordered by spectral model, so all of the PowerLaw sources appear first, then LogParabola, then PLEC4
+        * spectra -- this is a (nband=43,nsrc=7141) array giving the total counts in each band predicted for the FL16Y model values
+        * entries_per_band -- (nband=43) array giving the total number of ps model counts for each band
+        * pscounts -- (sum(entries_per_band)) array with the counts for each pixel for each point sources.
+        * healpixidx -- the data HEALPixel index for the entries of pscounts 
+                (Note this is actually an index into the PIX array in the pixel npz files.)
+        * nameidx -- index into the names array identifying the source for each of the entries in the list
+    """
+    def __repr__(self):
+        return f"{self.__class__.__name__}   "
 
     class PtBand:
-        """Pixels associated with one or more sources in a specific band."""
-
-        def __init__(self, source_indices: Sequence[int], band_index: int, meta_row: pd.Series, table: pd.DataFrame) -> None:
+        """Pixels associated with one or more sources in a specific band.   
+        """
+        def __init__(self, source_indices: Sequence[int], 
+                     band_index: int, 
+                     meta_row: pd.Series, table: 
+                     pd.DataFrame) -> None:
             self.source_indices = [int(v) for v in source_indices]
             # Backward-compatible alias for single-source PtBand instances.
             self.source_index = self.source_indices[0] if len(self.source_indices) == 1 else None
@@ -351,7 +475,7 @@ class KerrPtsrcInfo:
                 f"pixels={len(self.table)})"
             )
     
-    def __init__(self, root = 'files/kerr/toby_v5'):    
+    def __init__(self, root='files/kerr/toby_v5'):    
         import pickle    
         
         r, v = root.split('_')
@@ -366,10 +490,10 @@ class KerrPtsrcInfo:
             self.columns += list(data.keys())
             for key, value in data.items():
                 setattr(self, key, value)
-        print(f"Loaded columns {list(data.keys())} from {ptsrc_file}")
+        print(f"Read {ptsrc_file}:\n\t  --> columns {list(data.keys())} ")
 
         npix = sum(self.entries_per_band)
-        print(f"Total number of pixels: {npix:,d}")
+        print(f"\tTotal number of pixels: {npix:,d}")
         if npix != len(self.nameidx):
             raise ValueError(f"Total number of pixels {npix} does not match length of nameidx {len(self.nameidx)}")
             
@@ -480,6 +604,18 @@ class KerrPtsrcInfo:
         table = table.drop(columns=['_total_counts'])
 
         return self.PtBand(source_indices, band_index, meta_row, table)
+    
+    def print_summary(self):
+        print(f'Column name        Shape')
+        for colname in self.columns:
+            print(f"{colname:18} {getattr(self, colname).shape}")
+
+        print(f'\nTotals:')
+        print(f"entries per band: {sum(self.entries_per_band):,d}")
+        print(f"pixels:           {len(self.nameidx):,d}")
+        print(f"pscounts:         {sum(self.pscounts):,.0f}")
+        print(f"spectra sum:      {(self.spectra).sum():,.0f}")
+
 
     @classmethod
     def test_demo(
