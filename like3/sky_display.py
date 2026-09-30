@@ -1,9 +1,11 @@
 """sky-plot display, with helpers for labels and hover tooltips."""
+# %matplotlib widget
+# from vscdark import set_style
+# set_style(dark=True, display_css=True)
 
 import pandas as pd
 import numpy as np
 from matplotlib import pyplot as plt
-from matplotlib.colors import LogNorm, Normalize
 from astropy.coordinates import SkyCoord
 from utilities.skymaps import AITfigure, ZEAfigure
 
@@ -71,7 +73,8 @@ def _install_text_hover(ax, entries):
         if event.inaxes is not ax:
             if annotation.get_visible():
                 annotation.set_visible(False)
-                ax.figure.canvas.draw_idle()
+            _set_colorbar_visible(ax, True)
+            ax.figure.canvas.draw_idle()
             return
 
         for artist, summary in entries:
@@ -81,17 +84,123 @@ def _install_text_hover(ax, entries):
             annotation.xy = artist.get_position()
             annotation.set_text(summary)
             annotation.set_visible(True)
+            _set_colorbar_visible(ax, False)
             ax.figure.canvas.draw_idle()
             return
 
         if annotation.get_visible():
             annotation.set_visible(False)
-            ax.figure.canvas.draw_idle()
+        _set_colorbar_visible(ax, True)
+        ax.figure.canvas.draw_idle()
 
     callback_id = ax.figure.canvas.mpl_connect('motion_notify_event', on_move)
     ax._hover_annotation = annotation
     ax._hover_entries = entries
     ax._hover_callback_id = callback_id
+    return callback_id
+
+
+def _format_hover_value(value, value_format='auto'):
+    """Format a plotted value for a hover annotation."""
+    if isinstance(value, (np.ndarray, list, tuple)):
+        arr = np.asarray(value)
+        if arr.size == 0:
+            return str(value)
+        if arr.size != 1:
+            flat = arr.ravel()
+            if np.allclose(flat, flat[0], rtol=1e-12, atol=1e-12):
+                value = flat[0]
+            else:
+                value = np.nanmean(flat)
+        else:
+            value = arr.item()
+
+    if value_format == 'auto':
+        if isinstance(value, (np.floating, float)):
+            if not np.isfinite(value):
+                return str(value)
+            if abs(value) >= 1e4 or (abs(value) > 0 and abs(value) < 1e-3):
+                return f'{value:.2e}'
+            text = f'{value:.3g}'
+            if '.' in text:
+                text = text.rstrip('0').rstrip('.')
+            return text
+
+        if isinstance(value, (np.integer, int)):
+            return str(int(value))
+
+        return str(value)
+
+    try:
+        return value_format.format(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _set_colorbar_visible(ax, visible):
+    """Toggle the associated colorbar visibility for the figure."""
+
+    # assume the colorbar axis is the last axis in the figure
+    cbar_ax = ax.figure.axes[-1]
+    if hasattr(cbar_ax, '_colorbar'):
+        cbar_ax.set_visible(visible)
+        ax.figure.canvas.draw_idle()
+
+
+def _install_value_hover(ax, artist, value_format='auto'):
+    """Attach a cursor-value hover annotation showing coordinates and image value."""
+    if artist is None:
+        return None
+
+    annotation = ax.annotate(
+        '',
+        xy=(0, 0),
+        xytext=(12, 12),
+        textcoords='offset points',
+        ha='left',
+        va='bottom',
+        fontsize=8,
+        color='white',
+        bbox=dict(boxstyle='round', fc='black', ec='white', alpha=0.85),
+        zorder=25,
+    )
+    annotation.set_visible(False)
+
+    def on_move(event):
+        text_hover = getattr(ax, '_hover_annotation', None)
+        if text_hover is not None and text_hover.get_visible():
+            if annotation.get_visible():
+                annotation.set_visible(False)
+            _set_colorbar_visible(ax, True)
+            ax.figure.canvas.draw_idle()
+            return
+
+        if event.inaxes is not ax or event.xdata is None or event.ydata is None:
+            if annotation.get_visible():
+                annotation.set_visible(False)
+            _set_colorbar_visible(ax, True)
+            ax.figure.canvas.draw_idle()
+            return
+
+        value = artist.get_cursor_data(event)
+        if value is None:
+            if annotation.get_visible():
+                annotation.set_visible(False)
+            _set_colorbar_visible(ax, True)
+            ax.figure.canvas.draw_idle()
+            return
+
+        _set_colorbar_visible(ax, False)
+        coord = ax.format_coord(event.xdata, event.ydata)
+        annotation.xy = (event.xdata, event.ydata)
+        annotation.set_text(f'{coord[:coord.find("(")]}: {_format_hover_value(value, value_format)}')
+        annotation.set_visible(True)
+        ax.figure.canvas.draw_idle()
+
+    callback_id = ax.figure.canvas.mpl_connect('motion_notify_event', on_move)
+    ax._value_hover_annotation = annotation
+    ax._value_hover_artist = artist
+    ax._value_hover_callback_id = callback_id
     return callback_id
 
 # example usage:
@@ -133,28 +242,67 @@ def _install_text_hover(ax, entries):
 
 def ait_plot(pixel_data, *, figsize=(12,6), fig=None, colorbar=True,
                 label='counts/pixel', title=None,
-                shrink=0.7, cmap='viridis', frame='galactic', log=True, **kwargs):
+                shrink=0.7, cmap='viridis', frame='galactic', log=True,
+                value_format='auto', source_model=None, catalog=None,
+                **kwargs):
 
     mp = pixel_data 
     if log: mp[mp==0] = np.nan
-    vmin = kwargs.pop('vmin', None)
-    vmax = kwargs.pop('vmax', None)
-    norm_fn = LogNorm if log else Normalize
+
     afig = AITfigure(fig=fig, figsize=figsize, title=title)
-    afig.imshow(mp, norm=norm_fn(vmin=vmin, vmax=vmax), cmap=cmap, **kwargs)
+    afig.imshow(mp, log=log,  cmap=cmap, **kwargs)
+    _install_value_hover(afig.ax, getattr(afig, 'mappable', None), value_format=value_format)
     if colorbar:
-        afig.colorbar(label=label, shrink=shrink)
-    return afig   
+        cbar = afig.colorbar(label=label, shrink=shrink)
+        afig.figure._sky_display_colorbar = cbar
+        _set_colorbar_visible(afig.ax, True)
+
+    if catalog is None and source_model is not None:
+        catalog = getattr(source_model, 'fermi_catalog', None)
+    if catalog is not None and hasattr(catalog, 'select_cone'):
+        center = SkyCoord(0.0, 0.0, unit='deg', frame='galactic')
+        cone_size = 15.0
+        catalog_subset = catalog.select_cone(center, cone_size=cone_size)
+        if catalog_subset is not None and len(catalog_subset) > 0:
+            if hasattr(catalog_subset, 'skycoord'):
+                catalog_coords = catalog_subset.skycoord
+            else:
+                catalog_coords = SkyCoord(
+                    catalog_subset.ra.values,
+                    catalog_subset.dec.values,
+                    unit='deg',
+                    frame='fk5',
+                )
+            model_names = set() if source_model is None else {src.name for src in source_model}
+            model_mask = catalog_subset.index.isin(model_names)
+            for coord, name, in_model in zip(catalog_coords, catalog_subset.index, model_mask):
+                sky = coord.transform_to('galactic')
+                x = -np.radians(sky.l.deg)
+                y = np.radians(sky.b.deg)
+                afig.ax.text(
+                    x, y,
+                    str(name) if not str(name).startswith('FL16Y') else str(name)[5:],
+                    color='red' if in_model else 'white',
+                    fontsize=8,
+                    ha='left',
+                    va='bottom',
+                )
+
+    return afig
 
 def zea_plot(center, pixel_data,  *, psf=None, figsize=(6, 5), r68=None,
         pixelsize=None, size=None, fig=None, axes_visible=True,
         cmap='viridis', colorbar=True, title=None, label='counts/pixel', log=True,
-        vmin=None, vmax=None, frame='galactic', source_model=None, **kwargs):
+        vmin=None, vmax=None, frame='galactic', source_model=None,
+        value_format='auto', catalog=None, **kwargs):
 
-    # r68 give, scale for size and pixel size defaults if not provided
+    # r68 gives the scale for size and pixel-size defaults if not provided.
     if r68 is not None:
         _size      = size      if size      is not None else 16 * r68
         _pixelsize = pixelsize if pixelsize is not None else r68 / 50
+    else:
+        _size      = size      if size      is not None else 5
+        _pixelsize = pixelsize if pixelsize is not None else 0.05
 
     zfig = ZEAfigure(center, size=_size, fig=fig, figsize=figsize,frame=frame,
                         pixelsize=_pixelsize, axes_visible=axes_visible,
@@ -164,8 +312,11 @@ def zea_plot(center, pixel_data,  *, psf=None, figsize=(6, 5), r68=None,
     if log: pixel_data[pixel_data == 0] = np.nan
     zfig.imshow(pixel_data, log=log, #norm=LogNorm if log else Normalize, 
                  vmin=vmin, vmax=vmax, cmap=cmap, **kwargs)
+    _install_value_hover(zfig.ax, getattr(zfig, 'mappable', None), value_format=value_format)
     if colorbar:
-        zfig.colorbar(label=label, shrink=0.9, extend='max')
+        cbar = zfig.colorbar(label=label, shrink=0.9, extend='max')
+        zfig.figure._sky_display_colorbar = cbar
+        _set_colorbar_visible(zfig.ax, True)
             #   color='white', ha='right', va='top', fontsize=12)
 
     # r68 PSF-size circle in lower left
@@ -179,9 +330,9 @@ def zea_plot(center, pixel_data,  *, psf=None, figsize=(6, 5), r68=None,
         ax.text(cx, cy, rf'${r68:.2f}^\circ$', color='white', fontsize=10,
                 ha='center', va='center',)
 
-    sm = source_model 
-
-    catalog = None if sm is None else getattr(sm, 'fermi_catalog', None)
+    sm = source_model
+    if catalog is None and sm is not None:
+        catalog = getattr(sm, 'fermi_catalog', None)
     if catalog is not None and hasattr(catalog, 'select_cone'):
         cone_size = _size / np.sqrt(2.0)
         catalog_subset = catalog.select_cone(zfig.center, cone_size=cone_size)
@@ -196,9 +347,7 @@ def zea_plot(center, pixel_data,  *, psf=None, figsize=(6, 5), r68=None,
                     frame='fk5',
                 )
 
-            model_names = set()
-            if sm is not None:
-                model_names = {src.name for src in sm}
+            model_names = set() if sm is None else {src.name for src in sm}
             model_mask = catalog_subset.index.isin(model_names)
 
             zfig.scatter(
@@ -229,7 +378,7 @@ def zea_plot(center, pixel_data,  *, psf=None, figsize=(6, 5), r68=None,
                 text_artist = zfig.ax.text(
                     x + 4,
                     y + 4,
-                    name if not name.startswith('FL16Y') else name[5:],
+                    name if not str(name).startswith('FL16Y') else str(name)[5:],
                     color='red' if in_model else 'white',
                     fontsize=8,
                     ha='left',

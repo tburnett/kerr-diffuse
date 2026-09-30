@@ -140,6 +140,8 @@ class KerrPixelTable(dict):
 
             if type(component) is not str: # assume an array-like object with proper shape for plotting
                 toplot = component
+                if len(toplot) != len(self.indices):
+                    raise ValueError("Length of data to plot does not match number of indices")
                 name = name or 'custom'
             else:
                 if not hasattr(self, component):
@@ -259,12 +261,12 @@ class KerrPixelTable(dict):
         """
 
         # Initialize an array to store point source counts for each pixel in the pixel table
-        ptsrc_counts = np.zeros(len(self.counts), dtype=np.float32)
+        ptsrc_counts = np.zeros(len(self.counts), dtype=np.float64)
 
         # Loop over the pixel table bands and the correponding point source bands
         for j,(key,ptband) in enumerate(self.items()):
             psband = srcinfo.meta.iloc[j]
-            print(f"{key}",end='')
+            # print(f"{key}",end='')
             # the correspoinding slices of the pixel table and point source table for this band
             ptslice, psslice = ptband.slice, psband.slice
             # print(f'\tslices: {ptband.slice}, {psband.slice}')
@@ -275,15 +277,17 @@ class KerrPixelTable(dict):
 
             # get the counts, names, and indices to the pixels for this band
             counts = srcinfo.pscounts[psslice]
-            # name_indices = srcinfo.nameidx[psslice]
+            assert counts.min()!=0, f"Point source counts contain zero values, key={key}"
+            # name_indices = srcinfo.nameidx[psslice] # not used here
 
             # indices into the pixeltable
             pix_indices = srcinfo.healpixidx[psslice]
             # add the counts for a given pixel index
 
             np.add.at(ptsrc_counts[ptslice], pix_indices, counts)
+            # assert ptsrc_counts[ptslice].min() != 0, f"zero point source counts encountered for key={key}"
 
-        print()
+        # print()
         # add the point source counts as a new column in the pixel table
         self.columns += ['pointsources']
         self.pointsources = ptsrc_counts
@@ -297,17 +301,19 @@ class KerrPixelTable(dict):
         else:
             return ptsrc_counts
 
-    def to_fits(self, filename: str | Path) -> None:
+    def to_fits(self, filename: str | Path, overwrite: bool = True) -> None:
         """Write the pixel table to a FITS file using the Kerr layout.
 
         Parameters
         ----------
         filename : str or Path
             Output FITS file path.
+        overwrite : bool, optional
+            Whether to overwrite an existing FITS file. Default is True.   
         """
         tf = _ToFITS(self)
         hdul = fits.HDUList([fits.PrimaryHDU(), tf.skymap_hdu(), tf.band_hdu()])
-        hdul.writeto(filename, overwrite=True)
+        hdul.writeto(filename, overwrite=overwrite)
         print(f"Wrote FITS file to {filename}")
 
 

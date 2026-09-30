@@ -325,27 +325,42 @@ class EffectiveAreaIRF(object):
          4 -> PSF2 total
          5 -> PSF3 total
         """
-        if event_class == -1:
-            return self._eval_front_back(e, c, phi=phi, bilinear=bilinear)
+        match event_class:
+            case -1:
+                return self._eval_front_back(e, c, phi=phi, bilinear=bilinear)
+            case 0:
+                front, _ = self._eval_front_back(e, c, phi=phi, bilinear=bilinear)
+                return front
+            case 1:
+                _, back = self._eval_front_back(e, c, phi=phi, bilinear=bilinear)
+                return back
+            case 2 | 3 | 4 | 5:
+                target_partition = f"PSF{event_class - 2}"
+                psf_eval = self._get_partition_evaluator(target_partition)
+                front, back = psf_eval._eval_front_back(e, c, phi=phi, bilinear=bilinear)
+                return np.asarray(front) + np.asarray(back)
 
-        if event_class == 0:
-            front, _ = self._eval_front_back(e, c, phi=phi, bilinear=bilinear)
-            return front
+            case _:
+                raise ValueError("event_class must be one of -1, 0, 1, 2, 3, 4, 5")
 
-        if event_class == 1:
-            _, back = self._eval_front_back(e, c, phi=phi, bilinear=bilinear)
-            return back
+        # if event_class == 0:
+        #     front, _ = self._eval_front_back(e, c, phi=phi, bilinear=bilinear)
+        #     return front
 
-        if event_class in (2, 3, 4, 5):
-            target_partition = f"PSF{event_class - 2}"
-            psf_eval = self._get_partition_evaluator(target_partition)
-            front, back = psf_eval._eval_front_back(e, c, phi=phi, bilinear=bilinear)
-            return np.asarray(front) + np.asarray(back)
+        # if event_class == 1:
+        #     _, back = self._eval_front_back(e, c, phi=phi, bilinear=bilinear)
+        #     return back
 
-        raise ValueError("event_class must be one of -1, 0, 1, 2, 3, 4, 5")
+        # if event_class in (2, 3, 4, 5):
+        #     target_partition = f"PSF{event_class - 2}"
+        #     psf_eval = self._get_partition_evaluator(target_partition)
+        #     front, back = psf_eval._eval_front_back(e, c, phi=phi, bilinear=bilinear)
+        #     return np.asarray(front) + np.asarray(back)
+
+        # raise ValueError("event_class must be one of -1, 0, 1, 2, 3, 4, 5")
 
 
-class ExposureMap:
+class ExposureMap(HEALPix):
     """Callable HEALPix exposure map interpolator using astropy-healpix."""
 
     def __init__(self, values, nside=None, nest=False, frame="icrs"):
@@ -373,20 +388,21 @@ class ExposureMap:
                 f"HEALPix map length {arr.size} does not match nside={nside} "
                 f"(expected {expected_npix})"
             )
+        
 
         frame = frame.lower()
         if frame not in ("icrs", "galactic"):
             raise ValueError("frame must be 'icrs' or 'galactic'")
+        super().__init__(nside=nside, order="nested" if nest else "ring", frame=frame)
 
         self.values = arr
         self.nside = nside
         self.nest = bool(nest)
-        self.frame = frame
-        self.hpx = HEALPix(
-            nside=self.nside,
-            order="nested" if self.nest else "ring",
-            frame=self.frame,
-        )
+        # self.hpx = HEALPix(
+        #     nside=self.nside,
+        #     order="nested" if self.nest else "ring",
+        #     frame=self.frame,
+        # )
 
     def __call__(self, skycoord):
         """Return bilinearly interpolated exposure at one or many sky coordinates."""
@@ -399,7 +415,7 @@ class ExposureMap:
         lon = c.spherical.lon
         lat = c.spherical.lat
 
-        return self.hpx.interpolate_bilinear_lonlat(lon, lat, self.values)
+        return self.interpolate_bilinear_lonlat(lon, lat, self.values)
 
     def ait_plot(
         self,
@@ -409,7 +425,7 @@ class ExposureMap:
         grid_color="0.45",
         figsize=(12, 6),
         title=None,
-        colorbar=True,
+        colorbar=True, shrink=1, 
         **healpix_fill_kwargs,
     ):
         """Display the map with utilities.skymaps.AITfigure and return the figure."""
@@ -421,7 +437,7 @@ class ExposureMap:
         plot_vals = 100 * (vals / mean_val - 1) if np.isfinite(mean_val) and mean_val != 0 else np.full_like(vals, np.nan, dtype=float)
         
         if title is None:
-            title = "Exposure ratio to mean" + (" (log10)" if log10 else "")
+            title = "Exposure ratio to mean" #+ (" (log10)" if log10 else "")
 
         ait = AITfigure(figsize=figsize, grid_color=grid_color)
         ait.healpix_fill(
@@ -431,13 +447,13 @@ class ExposureMap:
             **healpix_fill_kwargs,
         )
         if colorbar:
-            ait.colorbar(label=r'Deviation from mean (%)')
+            ait.colorbar(label=r'Deviation from mean (%)', shrink=shrink)
         ait.title(title)
-        ait.axes_text( 0.0, 0.0,
+        ait.axes_text( 0.0, -0.05,
             f"mean = {mean_val:.2e}"+ r" $\mathrm{cm^2 \, s}$",
             ha="left", va="bottom", fontsize=12,
          )
-        ait.show()
+        return ait #ait.show()
         
 
 
@@ -724,7 +740,7 @@ def make_aeff_costheta_function(
     wE = np.asarray(wE, dtype=np.float64)
     if wE.shape != energies.shape:
         raise ValueError("spectrum must return array with same shape as energies")
-    den_E = np.trapz(wE, energies)
+    den_E = np.trapezoid(wE, energies)
     if den_E <= 0 or not np.isfinite(den_E):
         raise ValueError("Invalid energy weight normalization")
 
@@ -739,7 +755,7 @@ def make_aeff_costheta_function(
             raise ValueError("Aeff(E, cos_theta, ...) must return shape matching cos(theta) grid")
         aeff_e[i] = vals
 
-    aeff_band_cth = np.trapz(aeff_e * wE[:, None], energies, axis=0) / den_E
+    aeff_band_cth = np.trapezoid(aeff_e * wE[:, None], energies, axis=0) / den_E
 
     def aeff_costheta(costheta):
         """Evaluate energy-averaged effective area at cos(theta)."""
@@ -891,7 +907,7 @@ def make_exposure_map_healpix(
     wc = np.asarray(wc, dtype=np.float64)
     if wc.shape != cth.shape:
         raise ValueError("costh_weight must return array with same shape as cos(theta) grid")
-    den_cth = np.trapz(wc, cth)
+    den_cth = np.trapezoid(wc, cth)  ### was trapz before 2.0
     if den_cth <= 0 or not np.isfinite(den_cth):
         raise ValueError("Invalid cos(theta) weight normalization")
 
@@ -1014,7 +1030,7 @@ def build_pixel_table_exposure(
         band.aeff_costheta = make_aeff_costheta_function(
             band.e0,
             band.e1,
-            Aeff=Aeff,
+            Aeff=Aeff[band.psf_name],
             event_type=event_type,
             irf=irf,
             file_path=file_path,
@@ -1028,7 +1044,7 @@ def build_pixel_table_exposure(
         )
 
         map_values = make_exposure_map_healpix(
-            Aeff=Aeff,
+            Aeff=Aeff[band.psf_name],
             emin=band.e0,
             emax=band.e1,
             livetime=livetime,
@@ -1050,5 +1066,5 @@ def build_pixel_table_exposure(
         )
         exposure_by_band[band.key] = ExposureMap(map_values, nest=nest, frame=frame)
 
-    pixel_table.attach_exposure(exposure_by_band, frame=frame, nest=nest)
-    return pixel_table
+    # pixel_table.attach_exposure(exposure_by_band, frame=frame, nest=nest)
+    return exposure_by_band

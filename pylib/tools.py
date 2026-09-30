@@ -140,12 +140,12 @@ class FigNum:
     def __repr__(self):
         return self.current
     
-def show_date(title=None):
-    from pylib.ipynb_docgen import show
-    if title is not None: show(f"""<font size="+3"> {title}</font>""")
-    import datetime
-    date=str(datetime.datetime.now())[:16]
-    show(f"""<h5 style="text-align:right; margin-right:15px"> {date}</h5>""")
+# def show_date(title=None):
+#     from pylib.ipynb_docgen import show
+#     if title is not None: show(f"""<font size="+3"> {title}</font>""")
+#     import datetime
+#     date=str(datetime.datetime.now())[:16]
+#     show(f"""<h5 style="text-align:right; margin-right:15px"> {date}</h5>""")
 
 def update_legend(ax, data, hue, **kwargs):
     """ seaborn companion to insert counts in legend,

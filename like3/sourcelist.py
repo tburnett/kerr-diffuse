@@ -54,6 +54,18 @@ class SourceModel(list):
     def __repr__(self):
         return f'SourceModel: @{self.name} {len(self)} sources with {len(self.parameters)} free parameters'
 
+    def __getitem__(self, key):
+        """Access sources by integer index or by source name.
+
+
+        """
+        if isinstance(key, str):
+            # Use find_source for name-based lookup
+            return self.find_source(key)
+        else:
+            # Use default list indexing for integers and slices
+            return super().__getitem__(key)
+
     def model_counts(self, band, pix):
         """Return predicted counts for pixels in one energy band.
 
@@ -336,7 +348,11 @@ class SourceModel(list):
             the same name already exists.
         """
         if newsource is not None:
-            assert isinstance(newsource, sources.Source)
+            if isinstance(newsource, pd.Series):
+                newsource = sources.PointSource(name=newsource.name, 
+                skydir=(newsource.ra,  newsource.dec), model=str(newsource.specfunc))
+            elif not isinstance(newsource, sources.Source):
+                raise TypeError("newsource must be a Source instance or a pandas Series")
         else:
             newsource = sources.PointSource(**kw)
             

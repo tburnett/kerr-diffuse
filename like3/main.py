@@ -19,58 +19,59 @@ import pandas as pd
 from like3 import views, loglikelihood
 from like3.pixel_table import PixelTable
 from like3.sourcelist import SourceModel
+from like3.psf import PSFlookup
 import importlib
 
-class PSFlookup:
+# class PSFlookup:
     
-    def __init__(self, table_path='files/loc'):
-        """ A functor that returns the PSF for a given band, using the same PSF for all pixels in the band.
+#     def __init__(self, table_path='files/loc'):
+#         """ A functor that returns the PSF for a given band, using the same PSF for all pixels in the band.
 
-        Loads :class:`~pylib.psf_func.PSFlist` entries from *table_path* and
-        matches each band to the nearest-energy PSF for its event type.
-        When *table_path* is a directory, ``fb_psf_table.pkl`` is used for
-        FRONT/BACK bands (event types 0-1) and ``psf_psf_table.pkl`` for
-        PSF-partition bands (event types 2-5).  If an event type is absent
-        from the tables, the FRONT (event type 0) shapes are used as a
-        fallback.
+#         Loads :class:`~pylib.psf_func.PSFlist` entries from *table_path* and
+#         matches each band to the nearest-energy PSF for its event type.
+#         When *table_path* is a directory, ``fb_psf_table.pkl`` is used for
+#         FRONT/BACK bands (event types 0-1) and ``psf_psf_table.pkl`` for
+#         PSF-partition bands (event types 2-5).  If an event type is absent
+#         from the tables, the FRONT (event type 0) shapes are used as a
+#         fallback.
 
-        Parameters
-        ----------
-        table_path : str or Path, optional
-            Directory containing ``fb_psf_table.pkl`` and
-            ``psf_psf_table.pkl``, or a direct path to a single pickle file.
-            Default is ``'files/loc'``.
+#         Parameters
+#         ----------
+#         table_path : str or Path, optional
+#             Directory containing ``fb_psf_table.pkl`` and
+#             ``psf_psf_table.pkl``, or a direct path to a single pickle file.
+#             Default is ``'files/loc'``.
 
-        Returns
-        -------
-        PixelTable
-            Returns *self* for method chaining.
-        """
-        from pylib.psf_func import PSFlist
-        import copy
+#         Returns
+#         -------
+#         PixelTable
+#             Returns *self* for method chaining.
+#         """
+#         from pylib.psf_func import PSFlist
+#         import copy
 
-        all_psfs = PSFlist(event_type=None, table_path=table_path)
-        if not all_psfs:
-            print(f'PSFlookup: no PSF entries loaded from {table_path!r}')
-            return self
+#         all_psfs = PSFlist(event_type=None, table_path=table_path)
+#         if not all_psfs:
+#             print(f'PSFlookup: no PSF entries loaded from {table_path!r}')
+#             return self
 
-        et_names = PSFlist.PSF.et_name
-        ets = sorted({p.event_type for p in all_psfs})
-        et_labels = [et_names[e] if e < len(et_names) else str(e) for e in ets]
-        # print(f'PSFlookup: {len(all_psfs)} PSF entries '
-        #       f'({", ".join(et_labels)}) from {table_path!r}')
-        self.psf_list = all_psfs
+#         et_names = PSFlist.PSF.et_name
+#         ets = sorted({p.event_type for p in all_psfs})
+#         et_labels = [et_names[e] if e < len(et_names) else str(e) for e in ets]
+#         # print(f'PSFlookup: {len(all_psfs)} PSF entries '
+#         #       f'({", ".join(et_labels)}) from {table_path!r}')
+#         self.psf_list = all_psfs
 
-    def __call__(self, band):
-        """Return the PSF for *band*."""
+#     def __call__(self, band):
+#         """Return the PSF for *band*."""
         
-        for candidate_psf in self.psf_list:
-            if band.event_type != candidate_psf.event_type:
-                continue
-            if abs(candidate_psf.energy/band.energy-1)<0.1:
-                # print(f'PSFlookup: found PSF {candidate_psf} for band {band}')
-                return candidate_psf
-        raise ValueError(f'PSFlookup: no PSF found for band {band} ')
+#         for candidate_psf in self.psf_list:
+#             if band.event_type != candidate_psf.event_type:
+#                 continue
+#             if abs(candidate_psf.energy/band.energy-1)<0.1:
+#                 # print(f'PSFlookup: found PSF {candidate_psf} for band {band}')
+#                 return candidate_psf
+#         raise ValueError(f'PSFlookup: no PSF found for band {band} ')
 
 
 from like3.fitter import Fitted   
@@ -114,7 +115,10 @@ class MultiBandLikelihood(dict, Fitted):
         super().__init__({key: BandLikelihood(band, source_model) for key, band in self.pixel_table.items()})
 
         self.llz = self.log_like()  # baseline log-likelihood for delta-TS calculations
-        
+
+    def __repr__(self):
+        return f"<MultiBandLikelihood: {len(self)} bands,  selected={self.selected}, sources={list(map(str, self.source_model.source_names))}>"
+    
     @property
     def sources(self):
         # For compatibility with FermiFit-like interface
@@ -977,6 +981,8 @@ class MultiBandLikelihood(dict, Fitted):
         flux = np.asarray(sed_table['flux'], dtype=float)
         lflux = np.asarray(sed_table['lflux'], dtype=float)
         uflux = np.asarray(sed_table['uflux'], dtype=float)
+        ts = np.asarray(sed_table['ts'], dtype=float) if 'ts' in sed_table.columns else np.full_like(flux, np.nan, dtype=float)
+        weak_ts = np.isfinite(ts) & (ts < 4)
 
         ecent = np.sqrt(elow * ehigh)
         xerr = np.vstack([
@@ -988,7 +994,7 @@ class MultiBandLikelihood(dict, Fitted):
         ylo = lflux
         yhi = uflux
 
-        det_mask = np.isfinite(y) & np.isfinite(ylo) & np.isfinite(yhi) & (flux > 0)
+        det_mask = np.isfinite(y) & np.isfinite(ylo) & np.isfinite(yhi) & (flux > 0) & (~weak_ts)
         if np.any(det_mask):
             yerr = np.vstack([
                 np.clip(y[det_mask] - ylo[det_mask], 0, np.inf),
@@ -1008,7 +1014,7 @@ class MultiBandLikelihood(dict, Fitted):
             )
 
         if show_upper_limits:
-            ul_mask = np.isfinite(uflux) & (flux <= 0)
+            ul_mask = np.isfinite(uflux) & ((flux <= 0) | weak_ts)
             if np.any(ul_mask):
                 y_ul = uflux[ul_mask]
                 yerr_ul = 0.35 * np.clip(y_ul, 0, np.inf)
@@ -1175,15 +1181,34 @@ class MultiBandLikelihood(dict, Fitted):
         raise NotImplementedError('ZEA plotting not yet implemented for MultiBandLikelihood')
 
 
+
 class BandLikelihood(HEALPix):
     """ For a given band and source model, select active pixels from the SourceModel, 
         evaluate PSF responses for those pixels,
-        and provide the likelihood function."""
+        and provide the likelihood function.
 
-    def __init__(self, band, source_model):
+        Parameters
+        ----------
+        band : Band
+            The energy band for this likelihood.
+        source_model : SourceModel
+            The source model containing sources to be evaluated.
+        ignore_sources : bool, optional
+            If True, ignore sources when building coverage and evaluating the likelihood.
+    """
+
+    def __init__(self, band, source_model, ignore_sources=False):
         self.band = band
         self.source_model = source_model    
-        self.psf = PSFlookup()(band)
+        self.ignore_sources = ignore_sources
+        self.psf = getattr(band, 'psf', None)
+        if self.psf is None:
+            try:
+                self.psf = PSFlookup()(band)
+            except ValueError:
+                self.psf = None
+        if self.psf is not None:
+            setattr(band, 'psf', self.psf)
         super().__init__(nside=band.nside, order=band.order, frame=band.frame)
         self.center = source_model[0].skydir if len(source_model) > 0 else SkyCoord(0, 0, unit='deg')
         self.coverage = None  # populated on demand by build_coverage()
@@ -1221,7 +1246,14 @@ class BandLikelihood(HEALPix):
     def build_coverage(self, r68_radius: float = 4.0) -> None:
         """Build and cache a coverage DataFrame for pixels to the source footprint."""
         import pandas as pd
-        radius_deg = r68_radius * self.band.psf.r68 if self.band.psf is not None else 2.0
+        psf = getattr(self, 'psf', None)
+        if psf is None:
+            psf = getattr(self.band, 'psf', None)
+        if psf is None:
+            psf = PSFlookup()(self.band)
+            self.band.psf = psf
+        self.psf = psf
+        radius_deg = r68_radius * psf.r68 #if self.band.psf is not None else 2.0
         mask = np.zeros(len(self.band.pix), dtype=bool)
         for src in self.source_model:
             mask |= self._coverage_mask(src.skydir, radius_deg)
@@ -1235,13 +1267,13 @@ class BandLikelihood(HEALPix):
             photons=photons,
             diffuse_counts=diffuse_counts,
             source_counts=source_counts,
-            background_counts=diffuse_counts + source_counts,
+            background_counts=diffuse_counts if self.ignore_sources else diffuse_counts + source_counts,
             exposure=self.band.exposure_map(pix).astype(np.float32),
         ))
         self.empty_coverage = len(self.coverage) == 0
         if len(self.coverage) == 0:
             self.coverage['model_counts'] = np.array([], dtype=float)
-            warnings.warn(self._coverage_error_message('build coverage'), stacklevel=2)
+            # warnings.warn(self._coverage_error_message('build coverage'), stacklevel=2)
             return
         self.evaluate_source_model()
 
@@ -1459,13 +1491,17 @@ class BandLikelihood(HEALPix):
             npix = 12 * nside**2
 
             if len(arr) == npix:
+                # assume already a full HEALPix ring order array
                 return arr
-            
-            if len(arr) == len(self.coverage):
-                hpa = np.full(npix, np.nan, dtype=float)
-                hpa[self.coverage.pix] = arr
-                return hpa
-            raise ValueError(f'Cannot expand array of length {len(arr)} to HEALPix array of length {npix}')
+
+            if len(arr) != len(self.coverage):
+                raise ValueError(f'Cannot expand array of length {len(arr)} to HEALPix array of length {npix}')
+            order = getattr(self, 'order', getattr(self.band, 'order', 'ring'))
+            pix = self.coverage.pix if order == 'ring' else self.nested_to_ring(self.coverage.pix)
+            hpa = np.full(npix, np.nan, dtype=float)
+            hpa[pix] = arr
+            return hpa
+           
 
     def _plot_component_values(self, component):
         """Return a full HEALPix array for a coverage component or numeric array."""
@@ -1474,24 +1510,31 @@ class BandLikelihood(HEALPix):
 
         if isinstance(component, str):
             component = {'residual': 'resid'}.get(component, component)
-            if component == 'data':
-                arr = self.coverage['photons'].to_numpy(dtype=float)
-            elif component == 'diffuse':
-                arr = self.coverage['diffuse_counts'].to_numpy(dtype=float)
-            elif component == 'sources':
-                arr = self.coverage['source_counts'].to_numpy(dtype=float)
-            elif component == 'model':
-                arr = self.coverage['model_counts'].to_numpy(dtype=float)
-            elif component == 'resid':
-                arr = self.residual
-            elif component == 'sigma':
-                arr = self.sigma
-            elif component == 'exposure':
-                arr = self.coverage['exposure'].to_numpy(dtype=float)
-            elif component in self.coverage:
-                arr = self.coverage[component].to_numpy(dtype=float)
-            else:
-                raise ValueError(f'Unknown coverage component: {component!r}')
+            match component:
+                case 'data':
+                    arr = self.coverage['photons'].to_numpy(dtype=float)
+                case 'diffuse':
+                    arr = self.coverage['diffuse_counts'].to_numpy(dtype=float)
+                case 'sources':
+                    arr = self.coverage['source_counts'].to_numpy(dtype=float)
+                case 'model':
+                    arr = self.coverage['model_counts'].to_numpy(dtype=float)
+                case 'resid':
+                    arr = self.residual
+                case 'sigma':
+                    arr = self.sigma
+                case 'exposure':
+                    arr = self.coverage['exposure'].to_numpy(dtype=float)
+                case 'selected source' | 'selected':
+                    arr = self.response(self.source_model.selected_source)
+                case _ if component in self.source_model.source_names:
+                    arr = self.response(self.source_model[component])
+                case _ if component in self.coverage:
+                    arr = self.coverage[component].to_numpy(dtype=float)
+                case _:
+                    raise ValueError(f'Unknown coverage component: {component!r}: '
+                                     f'expected one of: data, diffuse, sources, model, resid, sigma, exposure, or a key in the coverage table, or a source name or "selected" ')
+
         else:
             arr = np.asarray(component, dtype=float)
 
@@ -1539,83 +1582,68 @@ class BandLikelihood(HEALPix):
                  label='counts/pixel', title=None, shrink=0.7, cmap='viridis',
                  log=None, **kwargs):
         """Render an all-sky AIT projection for a BandLikelihood coverage component."""
-        from matplotlib.colors import LogNorm, Normalize
         from utilities.skymaps import AITfigure
 
         log = self._default_plot_log(component, log)
         mp = self._plot_component_values(component)
-        if log:
-            mp = mp.copy()
-            mp[mp == 0] = np.nan
 
-        vmin = kwargs.pop('vmin', None)
-        vmax = kwargs.pop('vmax', None)
-        norm_fn = LogNorm if log else Normalize
-
+ 
         afig = AITfigure(fig=fig, figsize=figsize, title=title)
-        afig.imshow(mp, norm=norm_fn(vmin=vmin, vmax=vmax), cmap=cmap, **kwargs)
-        if colorbar:
-            afig.colorbar(label=label, shrink=shrink)
-        return afig
-
-    def zea_plot(self, component='data', center=None, *, figsize=(6, 5), pixelsize=None,
-                 size=None, fig=None, axes_visible=True, cmap='viridis', colorbar=True,
-                 title=None, label='counts/pixel', log=None, vmin=None, vmax=None,
-                 frame='galactic', **kwargs):
-        """Render a local ZEA projection for a BandLikelihood coverage component."""
-        from matplotlib.patches import Circle
-        from utilities.skymaps import ZEAfigure
-
-        center = self._plot_center(center)
-        log = self._default_plot_log(component, log)
-        psf = self.psf
-        if psf is not None:
-            size = size if size is not None else 16 * psf.r68
-            pixelsize = pixelsize if pixelsize is not None else psf.r68 / 50
-        else:
-            size = size if size is not None else 5
-            pixelsize = pixelsize if pixelsize is not None else 0.05
-
-        zfig = ZEAfigure(
-            center,
-            size=size,
-            fig=fig,
-            figsize=figsize,
-            frame=frame,
-            pixelsize=pixelsize,
-            axes_visible=axes_visible,
-            title='' if title is None else title,
-        )
-
-        if component is not None:
-            mp = self._plot_component_values(component)
-            mp = mp.copy()
-            mp[mp == 0] = np.nan
-            zfig.imshow(mp, log=log, vmin=vmin, vmax=vmax, cmap=cmap, **kwargs)
-            if colorbar:
-                zfig.colorbar(label=label, shrink=0.9, extend='max')
+        afig.imshow(mp, log=log,cmap=cmap, **kwargs)
 
         band_label = getattr(self.band, 'psf_name', None)
         if band_label is None:
             event_type = getattr(self.psf, 'event_type', None)
             band_label = f'PSF{event_type - 2}' if event_type is not None and event_type >= 2 else 'Band'
-        zfig.axes_text(
-            0.98,
-            0.98,
-            f'{self.band.energy / 1e3:.2f} GeV\n{band_label}',
-            color='white',
-            ha='right',
-            va='top',
-            fontsize=12,
+        afig.axes_text( 0, 0.98,
+            f'{self.band.energy / 1e3:.2f} GeV {band_label}\n{component}',
+            color='white', ha='left',  va='top', fontsize=10,
         )
+        if colorbar:
+            afig.colorbar(label=label, shrink=shrink)
+        return afig
 
-        if psf is not None:
-            ax = zfig.ax
-            r68_px = psf.r68 / pixelsize
-            cx, cy = (ax.transAxes + ax.transData.inverted()).transform((0.12, 0.12))
-            ax.add_patch(Circle((cx, cy), r68_px, fill=False, edgecolor='white', linewidth=1.5))
+    def zea_plot(self, component='data', center=None, *, figsize=(5, 4), pixelsize=None,
+                 size=None, fig=None, axes_visible=True, cmap='viridis', colorbar=True,
+                 title=None, label='counts/pixel', log=None, vmin=None, vmax=None,
+                 frame='galactic', **kwargs):
+        """Render a local ZEA projection for a BandLikelihood coverage component."""
+        from like3.sky_display import zea_plot as _sky_zea_plot
 
-        return zfig
+        center = self._plot_center(center)
+        log = self._default_plot_log(component, log)
+        psf = getattr(self, 'psf', None)
+        r68 = getattr(psf, 'r68', None) if psf is not None else None
+        if r68 is not None:
+            size = size if size is not None else 16 * r68
+            pixelsize = pixelsize if pixelsize is not None else r68 / 50
+        else:
+            size = size if size is not None else 5
+            pixelsize = pixelsize if pixelsize is not None else 0.05
+
+        pixel_data = self._plot_component_values(component)
+        return _sky_zea_plot(
+            center=center,
+            pixel_data=pixel_data,
+            psf=psf,
+            figsize=figsize,
+            r68=r68,
+            pixelsize=pixelsize,
+            size=size,
+            fig=fig,
+            axes_visible=axes_visible,
+            cmap=cmap,
+            colorbar=colorbar,
+            title=title,
+            label=label,
+            log=log,
+            vmin=vmin,
+            vmax=vmax,
+            frame=frame,
+            source_model=self.source_model,
+            # catalog=self.source_model.fermi_catalog,
+            **kwargs,
+        ) 
 
 def gradient_check(bl,  eps=1e-3):
     """Compare analytic gradient from grad_fn to numerical gradient of loglike_fn at pars."""
@@ -1886,6 +1914,8 @@ class FermiFit(views.LikelihoodViews):
         flux = np.asarray(sed_table['flux'], dtype=float)
         lflux = np.asarray(sed_table['lflux'], dtype=float)
         uflux = np.asarray(sed_table['uflux'], dtype=float)
+        ts = np.asarray(sed_table['ts'], dtype=float) if 'ts' in sed_table.columns else np.full_like(flux, np.nan, dtype=float)
+        weak_ts = np.isfinite(ts) & (ts < 4)
 
         ecent = np.sqrt(elow * ehigh)
         xerr = np.vstack([
@@ -1897,7 +1927,7 @@ class FermiFit(views.LikelihoodViews):
         ylo = lflux
         yhi = uflux
 
-        det_mask = np.isfinite(y) & np.isfinite(ylo) & np.isfinite(yhi) & (flux > 0)
+        det_mask = np.isfinite(y) & np.isfinite(ylo) & np.isfinite(yhi) & (flux > 0) & (~weak_ts)
         if np.any(det_mask):
             yerr = np.vstack([
                 np.clip(y[det_mask] - ylo[det_mask], 0, np.inf),
@@ -1917,7 +1947,7 @@ class FermiFit(views.LikelihoodViews):
             )
 
         if show_upper_limits:
-            ul_mask = np.isfinite(uflux) & (flux <= 0)
+            ul_mask = np.isfinite(uflux) & ((flux <= 0) | weak_ts)
             if np.any(ul_mask):
                 y_ul = uflux[ul_mask]
                 yerr_ul = 0.35 * np.clip(y_ul, 0, np.inf)
@@ -2908,3 +2938,35 @@ if __name__ == '__main__':
 
     show(setup_output)
     plt.style.use('dark_background')
+
+
+def add_spectral_summary(missed):
+    """Add curvature and peak-energy columns to the missed catalog and return it."""
+    if isinstance(missed, pd.Series):
+        missed = missed.to_frame().T
+
+    # missed = missed.copy()
+    missed['peak_energy_GeV'] = np.nan
+    missed['curvature'] = np.nan
+
+    for name, row in missed.iterrows():
+        model = getattr(row, 'specfunc', None)
+        if model is None:
+            continue
+
+        if hasattr(model, 'epeak'):
+            try:
+                missed.at[name, 'peak_energy_GeV'] = 10 ** model.epeak
+            except Exception:
+                missed.at[name, 'peak_energy_GeV'] = np.nan
+
+        try:
+            model_name = getattr(row, 'modelname', model.__class__.__name__)
+            if model_name == 'LogParabola':
+                missed.at[name, 'curvature'] = 2.0 * model.pars[2]
+            elif model_name in {'PLSuperExpCutoff', 'PLSuperExpCutoff4'}:
+                missed.at[name, 'curvature'] = model.curvature()
+        except Exception:
+            missed.at[name, 'curvature'] = np.nan
+
+    return missed

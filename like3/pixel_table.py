@@ -19,7 +19,7 @@ from astropy_healpix import HEALPix
 from pathlib import Path
 from typing import Callable, cast
 
-from .sky_display import _catalog_source_summary, _install_text_hover
+from .sky_display import _catalog_source_summary, _install_text_hover, ait_plot as sky_ait_plot, zea_plot as sky_zea_plot
 
 
 def _event_type_to_int(value):
@@ -119,9 +119,10 @@ class PixelTable(dict):
 
             self.psf_cache = {}  # populated on demand by get_psf_cache()
             super().__init__(nside, frame='galactic', order=order)
-            self.psf: Callable[[float], float] | None = None  # set later by PixelTable.set_psf()
+            self.psf: Callable[[float], float] | None = None
             self.r68: float | None = None
             self.source_model = source_model
+            self._ensure_psf()
             # self.roi = ROI(self, source_model) if source_model is not None else None
             # Dense array caches built once from sparse pixel arrays; see exposure_map.
             self._exposure_dense: np.ndarray | None = None  # shape (12*nside^2,)
@@ -145,6 +146,25 @@ class PixelTable(dict):
             self.slice: slice | None = None
             self.totals: dict | None = None
 
+        def _ensure_psf(self):
+            """Attach a PSF object to this band when one is available from the lookup table."""
+            if getattr(self, 'psf', None) is not None:
+                self.r68 = getattr(self.psf, 'r68', self.r68)
+                return self.psf
+
+            try:
+                from like3.psf import PSFlookup
+            except Exception:
+                return None
+
+            lookup = PSFlookup()
+            try:
+                self.psf = lookup(self)
+            except ValueError:
+                self.psf = None
+            self.r68 = getattr(self.psf, 'r68', self.r68)
+            return self.psf
+
         def __repr__(self) -> str:
             return f"Band{self.key}: {self.psf_name}@{self.energy * 1e-3:.2f} GeV nside {self.nside} occ {self.nocc/(12*self.nside**2):.3f}"
 
@@ -154,17 +174,6 @@ class PixelTable(dict):
                 cpix = np.asarray([], dtype=np.int64)
                 return cpix, np.asarray([], dtype=float)
 
-            # Backward-compatible path used by tests and older adapters where
-            # source.response(band).evaluate(keys) supplies sparse weights.
-            # if self.psf is None:
-            #     rsp = source.response(self)
-            #     if hasattr(rsp, 'evaluate'):
-            #         return rsp.evaluate(pixels)
-            #     raise RuntimeError('PSF not configured for this band; call PixelTable.set_psf() first')
-
-            # if getattr(source, 'skydir', None) is None:
-            #     cpix = np.asarray([], dtype=np.int64)
-            #     return cpix, np.asarray([], dtype=float)
 
             source_name = source.name if hasattr(source, 'name') else str(source)
             cache = self.psf_cache
@@ -207,48 +216,37 @@ class PixelTable(dict):
                 return lambda q: dense[np.asarray(q, dtype=np.intp)]
             return lambda q: np.zeros(len(np.asarray(q)), dtype=float)
 
-        # def _model_counts(self):
-        #     """Return the full model counts vector for this band."""
-        #     if self.source_model is not None:
-        #         counts = np.zeros(len(self.pix), dtype=float)
-        #         exp = self.exposure_map(self.pix)
-        #         for src in self.source_model:
-        #             flux = src.model(self.energy)
-        #             v = self.response(src, self.pix)
-        #             counts += v * flux
-        #         counts *= exp
-        #         return self.diffuse_counts + counts
-        #     return self.diffuse_counts + self.source_counts
         
         def _exposure_normalization(self):
             """factor to convert input counts per pixel for this power law to the weighted exposure times delta E."""
             return 1/(1e-14 * (np.sqrt(self.e0 * self.e1) * 1e-3) ** (-2.1))
 
         def _component_values(self, component):
-            """Resolve a coveratee component to a full HEALPix array of per-pixel values."""
+            """Resolve a coverafw component to a full HEALPix array of per-pixel values."""
             model = self._model_counts()
-            if component == 'exposure':
-                if self.pixel_exposure is None:
-                    raise ValueError('No pixel exposure has been attached to this band')
-                return self.pixel_exposure
-            if component == 'resid':
-                return self.photons - model
-            if component == 'sigma':
-                return (self.photons - model) / np.sqrt(model.clip(1e-2, None))
-            if component == 'model':
-                return model
-
-            if component == 'data':
-                return self.photons
-            if component == 'diffuse':
-                return self.diffuse_counts
-            if component == 'sources':
-                # When a source_model is set, derive source counts dynamically;
-                # otherwise fall back to the pre-computed FITS array.
-                if self.source_model is not None:
-                    return self.pixel_counts() - self.diffuse_counts
-                return self.source_counts
-            raise ValueError(f"Unknown component: {component!r}")
+            match component:
+                case 'exposure':
+                    if self.pixel_exposure is None:
+                        raise ValueError('No pixel exposure has been attached to this band')
+                    return self.pixel_exposure
+                case 'resid':
+                    return self.photons - model
+                case 'sigma':
+                    return (self.photons - model) / np.sqrt(model.clip(1e-2, None))
+                case 'model':
+                    return model
+                case 'data':
+                    return self.photons
+                case 'diffuse':
+                    return self.diffuse_counts
+                case 'sources':
+                    # When a source_model is set, derive source counts dynamically;
+                    # otherwise fall back to the pre-computed FITS array.
+                    if self.source_model is not None:
+                        return self.pixel_counts() - self.diffuse_counts
+                    return self.source_counts
+                case _:
+                    raise ValueError(f"Unknown component: {component!r}")
         
         def _display_values(self, param):
             """Return a full HEALPix array of per-pixel values.
@@ -369,25 +367,26 @@ class PixelTable(dict):
             from astropy_healpix import HEALPix
             if component not in ['data', 'diffuse', 'sources', 'model', 'resid', 'sigma', 'exposure']:
                 raise ValueError(f"Invalid component: {component!r}")
-            if component=='resid':
-                values = self.photons - (self.diffuse_counts + self.source_counts)
-            elif component=='sigma':
-                model = self.diffuse_counts + self.source_counts
-                values = (self.photons - model) / np.sqrt(model.clip(1e-2, None))
-            elif component=='model':
-                values = self.diffuse_counts + self.source_counts
-            elif component=='data':
-                values = self.photons
-            elif component=='diffuse':
-                values = self.diffuse_counts
-            elif component=='sources':
-                values = self.source_counts 
-            elif component=='exposure':
-                if self.pixel_exposure is None:
-                    raise ValueError('No pixel exposure has been attached to this band')
-                values = self.pixel_exposure
-            else:
-                values = self._display_values(component)
+            match component:
+                case 'resid':
+                    values = self.photons - (self.diffuse_counts + self.source_counts)
+                case 'sigma':
+                    model = self.diffuse_counts + self.source_counts
+                    values = (self.photons - model) / np.sqrt(model.clip(1e-2, None))
+                case 'model':
+                    values = self.diffuse_counts + self.source_counts
+                case 'data':
+                    values = self.photons
+                case 'diffuse':
+                    values = self.diffuse_counts
+                case 'sources':
+                    values = self.source_counts 
+                case 'exposure':
+                    if self.pixel_exposure is None:
+                        raise ValueError('No pixel exposure has been attached to this band')
+                    values = self.pixel_exposure
+                case _:
+                    values = self._display_values(component)
             nside = self.nside if nside is None or nside > self.nside else nside
             ratio = (self.nside // nside) ** 2
 
@@ -400,240 +399,113 @@ class PixelTable(dict):
             np.add.at(mp, pix, values)
             return mp
         
-        def ait_plot(self, component, *, figsize=(12,6), fig=None, colorbar=True,
-                     label='counts/pixel', title=None,
-                     shrink=0.7, cmap='viridis', frame='galactic', log=True, **kwargs):
+        def _display_values(self, component):
+            """Return the display values for a given component."""
+
+            if not isinstance(component, str): 
+                return component
+            
+            if component not in ['data', 'diffuse', 'sources', 'model', 'resid', 'sigma', 'exposure']:
+                raise ValueError(f"Invalid component: {component!r}")
+            match component:
+                case 'resid':
+                    return self.photons - (self.diffuse_counts + self.source_counts)
+                case 'sigma':
+                    model = self.diffuse_counts + self.source_counts
+                    return (self.photons - model) / np.sqrt(model.clip(1e-2, None))
+                case 'model':
+                    return self.diffuse_counts + self.source_counts
+                case 'data':
+                    return self.photons.astype(float)
+                case 'diffuse':
+                    return self.diffuse_counts
+                case 'sources':
+                    return self.source_counts 
+                case 'exposure':
+                    if self.pixel_exposure is None:
+                        raise ValueError('No pixel exposure has been attached to this band')
+                    return self.pixel_exposure
+                case _:
+                    raise ValueError(f"Unhandled component {component!r} expected one of {'data', 'diffuse', 'sources', 'model', 'resid', 'sigma', 'exposure'}")
+
+        def _expand_to_ring(self, mp):
+            """  make a full ring array
+            """
+            assert len(mp) == len(self.pix) 
+
+            ringpix = self.pix if self.order=='ring' else self.nested_to_ring(self.pix)
+            dense = np.full(12 * self.nside**2, np.nan, dtype=float)
+            dense[ringpix] = mp
+            return dense
+        
+        def ait_plot(self, component='data', *, figsize=(12,6), fig=None, colorbar=True,
+                     label='{}: counts / pixel', title=None, log=True,
+                     shrink=0.7, cmap='viridis', frame='galactic',
+                     value_format='auto', **kwargs):
             """Render an all-sky AIT projection for one band component.
 
-            Parameters
-            ----------
-            component : str
-                Component to visualize (see `ring_map` for valid names).
-   
-            figsize : tuple, optional
-                Figure size (width, height). Default is (12, 6).
-            fig : matplotlib.figure.Figure, optional
-                Existing figure to draw on; creates new if None.
-            colorbar : bool, optional
-                Whether to display a colorbar. Default is True.
-            shrink : float, optional
-                Colorbar size relative to axis. Default is 0.7.
-            cmap : str, optional
-                Matplotlib colormap name. Default is 'viridis'.
-            frame : str, optional
-                Sky coordinate frame. Default is 'galactic'.
-            log : bool, optional
-                If True, use a log scale for the color mapping of the map.
-                Default is True.
-            **kwargs
-                Additional arguments passed to imshow().
-
-            Returns
-            -------
-            utilities.skymaps.AITfigure
-                Chainable figure object. Call .show() to display.
+            This delegates to the shared sky-display helper so hover behavior,
+            colorbar visibility, and value formatting stay consistent with the
+            rest of the project.
             """
-            from utilities.skymaps import AITfigure
-            from matplotlib.colors import LogNorm, Normalize
+            mp = self._expand_to_ring(self._display_values(component))
+            afig = sky_ait_plot(
+                mp,
+                figsize=figsize,
+                fig=fig,
+                colorbar=colorbar,
+                label=label.format(component),
+                title=title,
+                shrink=shrink,
+                cmap=cmap,
+                frame=frame,
+                log=log,
+                value_format=value_format,
+                **kwargs,
+            )
+            afig.axes_text(0.02, 0.98, component, color='white', ha='left', va='top', fontsize=10)
+            return afig
 
-            if component == 'data':
-                mp = self.photons.astype(float)
-            elif component == 'diffuse':
-                mp = self.diffuse_counts
-            elif component == 'sources':
-                mp = self.source_counts
-            elif component == 'model':
-                mp = self.diffuse_counts + self.source_counts
-            elif component == 'resid':
-                mp = self.photons - (self.diffuse_counts + self.source_counts)
-            elif component == 'exposure':
-                if self.pixel_exposure is None:
-                    raise ValueError('No pixel exposure has been attached to this band')
-                mp = self.pixel_exposure
-            else:
-                mp = self._display_values(component)
-
-            if log: mp[mp==0] = np.nan
-            vmin = kwargs.pop('vmin', None)
-            vmax = kwargs.pop('vmax', None)
-            norm_fn = LogNorm if log else Normalize
-            afig = AITfigure(fig=fig, figsize=figsize, title=title)
-            afig.imshow(mp, norm=norm_fn(vmin=vmin, vmax=vmax), cmap=cmap, **kwargs)
-            if colorbar:
-                afig.colorbar(label=label, shrink=shrink)
-            return afig   
-
-        def zea_plot(self, component='data', center=None, *, nside=256, figsize=(6, 5),
+        def zea_plot(self, center, component='data', *, figsize=(5, 4),
                 pixelsize=None, size=None, fig=None, axes_visible=True,
-                cmap='viridis', colorbar=True, title=None, label='counts/pixel', log=True,
-                vmin=None, vmax=None, frame='galactic', **kwargs):
+                cmap='viridis', colorbar=True, title=None, label='{}: counts / pixel', log=True,
+                vmin=None, vmax=None, frame='galactic', value_format='auto', **kwargs):
             """Render a local ZEA projection for a single band around a center coordinate.
 
-            When a PSF is attached (``self.psf`` is not None), the field-of-view
-            and pixel resolution are derived automatically from ``psf.r68``:
-            ``size = 16 * r68``, ``pixelsize = r68 / 50``.  Both can be
-            overridden explicitly.
-
-                        After rendering the image the method overlays:
-
-            * Energy and event-type label in the upper-right corner.
-            * Optional *label* string in the upper-left corner.
-            * A circle of radius ``r68`` in the lower-left corner as a PSF
-              size indicator (only when PSF is attached).
-                        * Nearby catalog-source positions and names when a Fermi catalog is
-                            attached through ``self.source_model.fermi_catalog``. Sources in
-                            the current source model are highlighted.
-                        * Hover tooltips for those names on interactive Matplotlib backends.
-
-            Parameters
-            ----------
-            center : astropy.coordinates.SkyCoord or tuple or None, optional
-                Plot center. Tuples are interpreted as (lon, lat) in degrees
-                in the galactic frame. When None, the currently selected
-                source position is used.
-            component : str or None, optional
-                Component to visualize (see `ring_map` for valid names).
-                Pass ``None`` to create an empty axes. Default is 'data'.
-            nside : int, optional
-                HEALPix resolution for the ring map. Default is 256.
-            figsize : tuple, optional
-                Figure size in inches. Default is ``(6, 5)``.
-            pixelsize : float or None, optional
-                Pixel size in degrees. Derived from ``psf.r68 / 50`` when
-                None and the PSF is attached; otherwise defaults to 0.05.
-            size : float or None, optional
-                Field-of-view side length in degrees. Derived from
-                ``16 * psf.r68`` when None and the PSF is attached;
-                otherwise defaults to 5.
-            fig : matplotlib.figure.Figure, optional
-                Existing figure target; creates a new figure if None.
-            axes_visible : bool, optional
-                Show axis tick labels and grid. Default is True.
-            cmap : str, optional
-                Matplotlib colormap name. Default is ``'viridis'``.
-            colorbar : bool, optional
-                Display a colorbar. Default is True.
-            title : str or None, optional
-                Plot title.  Defaults to an empty string.
-            log : bool, optional
-                Apply logarithmic colour scaling. Default is True.
-            vmin, vmax : float or None, optional
-                Colour scale limits forwarded to ``ZEAfigure.imshow``.
-
-            **kwargs
-                Additional keyword arguments forwarded to ``ZEAfigure.imshow``.
-
-            Returns
-            -------
-            utilities.skymaps.ZEAfigure
-                Chainable figure object.
+            Delegates to the shared sky_display helper so the plotting and hover
+            behavior is consistent with the rest of the codebase.
             """
-            from utilities.skymaps import ZEAfigure
+            if type(center) is str:
+                center = SkyCoord.from_name(center)
 
-            if center is None:
-                sm = getattr(self, 'source_model', None)
-                selected = None if sm is None else getattr(sm, 'selected_source', None)
-                if selected is None:
-                    raise ValueError(
-                        'zea_plot center is None and no selected source is available; '
-                        'pass center explicitly or select a source first'
-                    )
-                center = selected.skydir
-
-            psf = self.psf
-            if psf is not None:
-                _size      = size      if size      is not None else 16 * psf.r68
-                _pixelsize = pixelsize if pixelsize is not None else psf.r68 / 50
-            else:
-                _size      = size      if size      is not None else 5
-                _pixelsize = pixelsize if pixelsize is not None else 0.05
-
-            zfig = ZEAfigure(center, size=_size, fig=fig, figsize=figsize,frame=frame,
-                             pixelsize=_pixelsize, axes_visible=axes_visible,
-                             title='' if title is None else title)
-
-            if component is not None:
-                mp = self._display_values(component)
-                mp[mp == 0] = np.nan
-                zfig.imshow(mp, log=log, vmin=vmin, vmax=vmax, cmap=cmap, **kwargs)
-                if colorbar:
-                    zfig.colorbar(label=label, shrink=0.9, extend='max')
+            mp = self._expand_to_ring(self._display_values(component))
+            zfig = sky_zea_plot(
+                center,
+                mp,
+                psf=getattr(self, 'psf', None),
+                figsize=figsize,
+                r68=getattr(self, 'r68', None),
+                pixelsize=pixelsize,
+                size=size,
+                fig=fig,
+                axes_visible=axes_visible,
+                cmap=cmap,
+                colorbar=colorbar,
+                title=title,
+                label=label.format(component),
+                log=log,
+                vmin=vmin,
+                vmax=vmax,
+                frame=frame,
+                source_model=getattr(self, 'source_model', None),
+                value_format=value_format,
+                **kwargs,
+            )
 
             zfig.axes_text(0.98, 0.98,
                            f'{self.energy / 1e3:.2f} GeV\n{self.psf_name}',
-                           color='white', ha='right', va='top', fontsize=12)
-
-            # r68 PSF-size circle in lower left
-            if psf is not None:
-                from matplotlib.patches import Circle
-                ax = zfig.ax
-                r68_px = psf.r68 / _pixelsize
-                cx, cy = (ax.transAxes + ax.transData.inverted()).transform((0.12, 0.12))
-                ax.add_patch(Circle((cx, cy), r68_px,
-                                    fill=False, edgecolor='white', linewidth=1.5))
-
-            sm = getattr(self, 'source_model', None)
-            catalog = None if sm is None else getattr(sm, 'fermi_catalog', None)
-            if catalog is not None and hasattr(catalog, 'select_cone'):
-                cone_size = _size / np.sqrt(2.0)
-                catalog_subset = catalog.select_cone(zfig.center, cone_size=cone_size)
-                if catalog_subset is not None and len(catalog_subset) > 0:
-                    if hasattr(catalog_subset, 'skycoord'):
-                        catalog_coords = catalog_subset.skycoord
-                    else:
-                        catalog_coords = SkyCoord(
-                            catalog_subset.ra.values,
-                            catalog_subset.dec.values,
-                            unit='deg',
-                            frame='fk5',
-                        )
-
-                    model_names = set()
-                    if sm is not None:
-                        model_names = {src.name for src in sm}
-                    model_mask = catalog_subset.index.isin(model_names)
-
-                    zfig.scatter(
-                        catalog_coords,
-                        marker='x',
-                        s=36,
-                        color='white',
-                        linewidths=0.8,
-                        alpha=0.8,
-                    )
-
-                    if np.any(model_mask):
-                        zfig.scatter(
-                            catalog_coords[model_mask],
-                            marker='o',
-                            s=70,
-                            facecolors='none',
-                            edgecolors='red',
-                            linewidths=1.5,
-                        )
-
-                    xpix, ypix = zfig.world_to_pixel(catalog_coords)
-                    nx, ny = zfig.array_shape
-                    hover_entries = []
-                    for x, y, name, in_model in zip(xpix, ypix, catalog_subset.index, model_mask):
-                        if not (0 <= x < nx and 0 <= y < ny):
-                            continue
-                        text_artist = zfig.ax.text(
-                            x + 4,
-                            y + 4,
-                            name if not name.startswith('FL16Y') else name[6:],
-                            color='red' if in_model else 'white',
-                            fontsize=8,
-                            ha='left',
-                            va='bottom',
-                        )
-                        text_artist.set_picker(True)
-                        hover_entries.append(
-                            (text_artist, _catalog_source_summary(catalog_subset.loc[name], in_model=in_model))
-                        )
-
-                    _install_text_hover(zfig.ax, hover_entries)
-
+                           color='white', ha='right', va='top', fontsize=10)
+            zfig.axes_text(0.02, 0.98, component, color='white', ha='left', va='top', fontsize=10)
             return zfig
         
         def get_outliers(self, sigma_min=4):
@@ -660,85 +532,7 @@ class PixelTable(dict):
             pix = np.arange(12*self.nside**2)
             return pd.DataFrame( dict(pixel=self.ring_to_nested(pix[out]), data=d[out], model=m[out], sigma=r[out] )) 
 
-        # def evaluate_source_model(self, pix=None):
-        #     if self.roi is not None:
-        #         return self.roi.evaluate_source_model(pix)
-        #     raise ValueError('No ROI/source_model attached to this band')
-        
-        # def build_coverage(self, r68_radius: float = 4.0) -> None:
-        #     if self.roi is not None:
-        #         self.roi.build_coverage(r68_radius)
-        #         self.coverage = self.roi.coverage  # for backward compatibility
-        #     else:
-        #         self.coverage = None
-
-        # def pixel_counts(self):
-        #     if self.roi is not None:
-        #         return self.roi.pixel_counts()
-        #     raise ValueError('No ROI/source_model attached to this band')
-
-        # def pixel_gradient(self, data):
-        #     if self.roi is not None:
-        #         return self.roi.pixel_gradient(data)
-        #     raise ValueError('No ROI/source_model attached to this band')
-
-        # def pixel_counts_and_gradient(self):
-        #     if self.roi is not None:
-        #         return self.roi.pixel_counts_and_gradient()
-        #     raise ValueError('No ROI/source_model attached to this band')
-
-        # def simulate(self, random_state=None, total_counts=None):
-        #     """Simulate pixel counts from the band model.
-
-        #     Parameters
-        #     ----------
-        #     random_state : int, np.random.Generator, or None
-        #         Seed or RNG for Poisson sampling. If None, returns deterministic
-        #         integer floor of model counts without noise.
-        #     total_counts : float or None
-        #         If provided, normalise the model shape to this total before sampling.
-
-        #     Returns
-        #     -------
-        #     tuple[np.ndarray, np.ndarray]
-        #         Sparse pixel indices and counts; only non-zero pixels are returned.
-        #     """
-        #     counts = self.pixel_counts()
-        #     if total_counts is not None:
-        #         counts = total_counts * counts / counts.sum()
-        #     if random_state is not None:
-        #         rng = np.random.default_rng(random_state)
-        #         counts = rng.poisson(counts)
-        #     else:
-        #         counts = counts.astype(int)
-        #     select = counts > 0
-        #     return self.pix[select], counts[select]
-
-        # def loglike(self, skydir=None):
-        #     """Poisson log-likelihood of the band's photon data against the model.
-
-        #     Parameters
-        #     ----------
-        #     skydir : SkyCoord or None, optional
-        #         Trial sky position forwarded to ``source_model.setposition``.
-
-        #     Returns
-        #     -------
-        #     float
-        #         ``sum(photons * log(model) - model)`` over all loaded pixels.
-        #     """
-        #     sm = self.source_model
-        #     if skydir is not None:
-        #         sm.setposition(skydir)
-        #     # need to flag the PSF to evaluate the model counts when a source_model is attached; otherwise the diffuse+source FITS arrays are used directly.
-            
-        #     # model is the predicted counts for each pixel, including diffuse and source contributions. 
-        #     model = self.pixel_counts()
-
-        #     model = model.clip(1e-30, None)
-        #     photons = self.coverage['photons'].to_numpy() #if self.coverage is not None else self.photons
-        #     return float(np.sum(photons * np.log(model) - model))
-
+  
     def __init__(self, root, source_model=[], *, emin=100, psf_path='files/loc'):
         """Load a pixel table from a Kerr-style FITS file.
 
@@ -830,7 +624,7 @@ class PixelTable(dict):
 
             # Apply the combined index to each column individually so that only
             # one raw column is live at a time, bounding peak memory usage.
-            skymap_names = skymap_data.names or ()
+            self.columns = skymap_names = skymap_data.names or ()
 
             _raw = np.asarray(skymap_data['PIX'], dtype=np.int64)
             pix = _raw[order_idx]; del _raw
@@ -854,7 +648,7 @@ class PixelTable(dict):
             _raw = np.asarray(skymap_data['EXTENDEDSOURCES'], dtype=np.float32)
             fits_sources = _raw[order_idx]; del _raw
 
-            if self.version<'v5':
+            if True: #self.version<'v5':
                 _raw = np.asarray(skymap_data['POINTSOURCES'], dtype=np.float32)
                 fits_sources += _raw[order_idx]; del _raw
             else:
@@ -1148,7 +942,7 @@ class PixelTable(dict):
         return self
 
     def ring_map(self, nside=128, component='data', frame='galactic'):
-        """Combine all compatible bands into one HEALPix RING map.
+        """Combine all bands with nside greater than or equal to the target nside into one HEALPix RING map.
 
         Parameters
         ----------
@@ -1165,23 +959,24 @@ class PixelTable(dict):
                 hmap += band.ring_map(nside, component, frame=frame)
         return hmap
     
-    def ait_plot(self, component='data', *, nside=128, figsize=(12,6), fig=None, colorbar=True, 
-                log=True, shrink=0.7, cmap='viridis', frame='galactic', **kwargs):
+    def ait_plot(self, component='data', *, nside=128, figsize=(12,6), fig=None, colorbar=True, title='',
+                log=True, shrink=0.7, vmin=None, vmax=None, cmap='viridis', frame='galactic', **kwargs):
         """Render an all-sky AIT projection aggregated across bands."""
         from utilities.skymaps import AITfigure
-        from matplotlib.colors import LogNorm, Normalize
 
         mp = self.ring_map(nside, component=component, frame=frame)
         if log: mp[mp==0] = np.nan
+        
+        afig = AITfigure(fig=fig, figsize=figsize, title=title )
 
-        afig = AITfigure(fig=fig, figsize=figsize, title=f'{component} for PixelTable {self.name}')
-        afig.imshow(mp, norm=LogNorm if log else Normalize, cmap=cmap, **kwargs)
+        afig.imshow(mp, log=log,  cmap=cmap, **kwargs)
         if colorbar:
-            afig.colorbar(label=label, shrink=shrink)
+            afig.colorbar(label=f'{component}: counts / nside {nside} pixel', shrink=shrink)
         return afig
+
     
     def zea_plot(self, center=None, *, component='data', nside=256, 
-                figsize=(8,8), size=5, pixelsize=0.1, fig=None,
+                figsize=(8,8), size=5, pixelsize=0.1, fig=None, log=True,
                 frame='icrs', proj='ZEA', cmap='viridis', 
                 colorbar=True, title=None,**kwargs):
         """Render a local ZEA projection aggregated across bands."""
@@ -1201,31 +996,12 @@ class PixelTable(dict):
         mp[mp==0] = np.nan
 
         zfig = ZEAfigure(center, size=size, fig=fig, proj=proj,figsize=figsize, title=title, frame=frame)
-        zfig.imshow(np.log10(mp), cmap=cmap, **kwargs)
+        zfig.imshow(mp, log=log, cmap=cmap, **kwargs)
         if colorbar:
             ## NOTE: this is not compatible with a following call to colorbar
             zfig.colorbar(label='log10(counts)', shrink=0.7)
         return zfig
 
-    # def build_coverage(self, r68_radius: float = 4.0) -> 'PixelTable':
-    #     """Build per-band coverage DataFrames restricting log-likelihood to source footprints.
-
-    #     Calls :meth:`Band.build_coverage` on every band.  Call again after changing
-    #     the source model position or after calling :meth:`select` with a new band set.
-
-    #     Parameters
-    #     ----------
-    #     r68_radius : float, optional
-    #         Cone radius in units of r68.  Default is 4.
-
-    #     Returns
-    #     -------
-    #     self : PixelTable
-    #         Returns *self* for method chaining.
-    #     """
-    #     for band in self.values():
-    #         band.build_coverage(r68_radius)
-    #     return self
 
     def _iter_bands(self):
         """Iterate over selected bands, or all bands when no selection is active."""
@@ -1373,395 +1149,58 @@ class PixelTable(dict):
             print(f'... truncated to first {len(shown)} rows (set max_rows to show more)')
         return df
 
-    # @property
-    # def parameters(self):
-    #     """Free-parameter set of the attached source model."""
-    #     if self.source_model is None:
-    #         raise AttributeError('parameters requires a source_model')
-    #     return self.source_model.parameters
-
-    # def preserve_parameters(self):
-    #     """Context manager that restores source-model parameter values on exit.
-
-    #     Snapshots the current free parameters on entry and writes them back
-    #     on exit, even if an exception is raised.  Useful for trial fits or
-    #     scan loops that should not permanently modify the model.
-
-    #     Example
-    #     -------
-    #     >>> with pixtab.preserve_parameters():
-    #     ...     pixtab.fit()
-    #     ...     print(pixtab.parameters.get_parameters())
-    #     # parameters are restored here
-    #     """
-    #     from contextlib import contextmanager
-
-    #     @contextmanager
-    #     def _ctx():
-    #         pset = self.parameters
-    #         saved = np.array(pset.get_parameters(), copy=True)
-    #         try:
-    #             yield
-    #         finally:
-    #             pset.set_parameters(saved)
-
-    #     return _ctx()
-
-    # @property
-    # def parameter_names(self):
-    #     """Names of the free parameters of the attached source model."""
-    #     if self.source_model is None:
-    #         raise AttributeError('parameter_names requires a source_model')
-    #     return self.source_model.parameter_names
-
-    # @property
-    # def bounds(self):
-    #     """Fitter-space parameter bounds from the attached source model."""
-    #     if self.source_model is None:
-    #         return None
-    #     return self.source_model.bounds
-
-    # def preserve_position(self):
-    #     """Context manager that restores the selected source's sky position on exit.
-
-    #     Snapshots ``source_model.selected_source.skydir`` on entry and writes
-    #     it back on exit, even if an exception is raised.  Useful for trial
-    #     localization scans that should not permanently move the source.
-
-    #     Example
-    #     -------
-    #     >>> with pixtab.preserve_position():
-    #     ...     pixtab.source_model.setposition(trial_skydir)
-    #     ...     print(pixtab.loglike())
-    #     # source position is restored here
-    #     """
-    #     from contextlib import contextmanager
-
-    #     @contextmanager
-    #     def _ctx():
-    #         if self.source_model is None:
-    #             raise ValueError('preserve_position requires a source_model')
-    #         src = self.source_model.selected_source
-    #         if src is None:
-    #             raise ValueError('preserve_position requires a selected source')
-    #         saved = src.skydir
-    #         try:
-    #             yield
-    #         finally:
-    #             src.skydir = saved
-
-    #     return _ctx()
-
-    # def localization_view(self, source_name=None):
-    #     """Return a localization context manager for the selected source.
-
-    #     Mirrors ``PixelTable.localization_view``; uses ``self.loglike`` so
-    #     localization is driven by the full pixel-table likelihood.
-
-    #     Parameters
-    #     ----------
-    #     source_name : str, Source-like, or None
-    #         Source identifier forwarded to ``SourceModel.localization_view``.
-
-    #     Returns
-    #     -------
-    #     _PixelTableLocalizationContext
-    #         Context manager yielding a ``PixelTableLocalizationView`` on entry.
-    #     """
-    #     if self.source_model is None:
-    #         raise ValueError('localization_view requires a source_model')
-    #     sm_context = self.source_model.localization_view(source_name)
-    #     return _PixelTableLocalizationContext(self, sm_context)
-
-    # def localize(self, source_name=None, sigma=0.1, verbose=True):
-        # """Run localization for a source and return a ``quadform.Localize`` result.
-
-        # Parameters
-        # ----------
-        # source_name : str, Source-like, or None
-        #     Source identifier forwarded to ``SourceModel.localization_view``.
-        # sigma : float, optional
-        #     Initial localization uncertainty in degrees.
-        # verbose : bool, optional
-        #     Print localization diagnostics.
-
-        # Returns
-        # -------
-        # like3.quadform.Localize
-        #     Completed localization result.
-        # """
-        # from like3.quadform import Localize
-        # with self.localization_view(source_name) as loc:
-        #     return Localize(loc, sigma=sigma, verbose=verbose)
-
-    # def loglike(self, skydir=None):
-        # """Total Poisson log-likelihood summed over selected bands.
-
-        # Parameters
-        # ----------
-        # skydir : SkyCoord or None, optional
-        #     Trial sky position forwarded to each ``Band.loglike`` call.
-
-        # Returns
-        # -------
-        # float
-        #     Sum of per-band log-likelihood values.
-        # """
-        # if self.source_model is None:
-        #     raise ValueError('loglike requires a source_model')
-        # return float(sum(band.loglike(skydir=skydir) for band in self._iter_bands()))
-
-    # def simulate(self, random_state=42):
-    #     """Simulate per-band photon counts from the source model.
-
-    #     Replaces ``band.photons`` for each selected band in place with Poisson
-    #     samples drawn from the current model prediction.
-
-    #     Parameters
-    #     ----------
-    #     random_state : int or np.random.Generator, optional
-    #         Seed or RNG for reproducible Poisson sampling.
-    #     """
-    #     if self.source_model is None:
-    #         raise ValueError('simulate requires a source_model')
-    #     rng = np.random.default_rng(random_state)
-    #     for band in self._iter_bands():
-    #         model = band.pixel_counts()
-    #         band.photons[:] = rng.poisson(model)
-
-    # def fit(self, select=None, *, method='l-bfgs-b', quiet=True, use_gradient=True, **kwargs):
-        """Optimize the free spectral parameters of the source model.
-
-        Minimizes the negative Poisson log-likelihood summed over all bands
-        using :class:`~like3.fitter.Minimizer`.
-
-        Parameters
-        ----------
-        select : str | int | list[str | int] or None, optional
-            Selection passed to :class:`~like3.parameterset.ParSubSet` to
-            identify the subset of parameters to optimize.  Supports the same
-            rich matching rules as ``ParSubSet.select``: source names (with
-            ``*`` wildcards), parameter names prefixed with ``_``, and integer
-            indices.  ``None`` (default) optimizes all free parameters.
-        method : str, optional
-            Optimization method: ``'l-bfgs-b'`` (default), ``'simplex'``,
-            or ``'powell'``.
-        quiet : bool, optional
-            Suppress optimizer diagnostic output.
-        use_gradient : bool, optional
-            If True, pass the analytic gradient to the optimizer.
-        **kwargs
-            Additional keyword arguments forwarded to ``Minimizer.__call__``.
+    def make_bands_dataframe(self) -> pd.DataFrame:
+        """ 
+        Create a pandas DataFrame from the pixel table.
 
         Returns
         -------
-        fitvalue : float
-            Negative log-likelihood at the optimum (relative to initial).
-        parameters : np.ndarray
-            Best-fit free-parameter vector.
-        errors : np.ndarray
-            1-sigma parameter uncertainties (NaN if estimation failed).
-
-        Side Effects
-        ------------
-        Updates ``self.source_model`` parameters in place.
-        Stores ``self.fit_info`` with ``'correlation'``, ``'errors'``, and
-        ``'gradient'`` arrays from the fit.
+        pandas.DataFrame
+            DataFrame with one row per band, containing columns for nside, mean exposure,
+            energy, and deltaE.
         """
-        if self.source_model is None:
-            raise ValueError('fit requires a source_model')
-        from like3.fitter import Minimizer, Fitted
+        dd = dict((key, dict(nside=pt.nside, mean=float(pt.pixel_exposure.mean()), 
+                            energy=pt.energy,
+                            deltaE=round(pt.e1-pt.e0,1))) 
+                    for key, pt in self.items()); 
+        
+        return pd.DataFrame.from_dict(dd, orient='index')
+          
 
-        source_model = self.source_model
-        assert source_model is not None
-        pset = source_model.parameters
-        pixel_table = self
-        initial_loglike = self.loglike()
-        use_gradient = kwargs.pop('use_gradient', use_gradient)
+    def declination_exposure_plots(self, band_keys: list, ncols=4) -> None: 
+        """
+        Generate declination exposure plots for the specified bands.
 
-        # Build a boolean mask for the subset of parameters to optimise.
-        all_names = np.asarray(pset.parameter_names)
-        n_all = len(all_names)
-        if select is not None:
-            from like3.parameterset import ParSubSet
-            select_args = select if isinstance(select, (list, tuple)) else [select]
-            subset = ParSubSet(self.source_model, *select_args)
-            param_mask = subset._mask
-        else:
-            param_mask = np.ones(n_all, dtype=bool)
+        Parameters
+        ----------
+        band_keys : list
+            List of band keys to plot.
+        ncols : int, optional
+            Number of columns in the subplot grid. Default is 4.
 
-        x_init = np.asarray(pset.get_parameters(), dtype=float)[param_mask].copy()
+        """
+        import pandas as pd
+        nrows = (len(band_keys) + ncols - 1) // ncols
+        fig, axx = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12,3), 
+                                sharex=True, sharey=True, constrained_layout=True)
+        for ax, key in zip(axx.flat, band_keys):
 
-        class _Objective(Fitted):
-            def __init__(self):
-                self._cache_pars = None
-                self._cache_value = None
-                self._cache_grad = None
-
-            @property
-            def bounds(self):
-                sm = pixel_table.source_model
-                assert sm is not None
-                b = sm.bounds
-                return b[param_mask] if b is not None else None
-
-            @property
-            def parameter_names(self):
-                return all_names[param_mask]
-
-            def get_parameters(self):
-                return np.asarray(pset.get_parameters())[param_mask]
-
-            def set_parameters(self, par):
-                full = np.asarray(pset.get_parameters(), dtype=float)
-                full[param_mask] = par
-                pset.set_parameters(full)
-
-            def _evaluate(self, pars, need_grad=False):
-                pars = np.asarray(pars, dtype=float)
-                if (
-                    self._cache_pars is not None
-                    and np.array_equal(pars, self._cache_pars)
-                    and (not need_grad or self._cache_grad is not None)
-                ):
-                    return self._cache_value, self._cache_grad
-
-                self.set_parameters(pars)
-                loglike = 0.0
-                full_grad = np.zeros(n_all, dtype=float) if need_grad else None
-
-                for band in pixel_table._iter_bands():
-                    counts = band.coverage['photons'].to_numpy() if band.coverage is not None else band.photons
-                    if need_grad:
-                        # Single PSF pass yields both model and Jacobian.
-                        model, dm_dtheta = band.pixel_counts_and_gradient()
-                    else:
-                        model = band.pixel_counts()
-                    model = np.clip(model, 1e-30, None)
-                    loglike += float(np.sum(counts * np.log(model) - model))
-                    if need_grad:
-                        assert full_grad is not None
-                        full_grad -= ((counts / model - 1.0)[:, None] * dm_dtheta).sum(axis=0)
-
-                if need_grad:
-                    assert full_grad is not None
-                    grad = full_grad[param_mask]
-                else:
-                    grad = None
-                value = -float(loglike) + initial_loglike
-                self._cache_pars = np.array(pars, copy=True)
-                self._cache_value = value
-                self._cache_grad = None if grad is None else np.array(grad, copy=True)
-                return value, grad
-
-            def __call__(self, pars, *args):
-                value, _ = self._evaluate(pars, need_grad=use_gradient)
-                return value
-
-            def gradient(self, pars):
-                """Return gradient of the objective at ``pars``."""
-                _, grad = self._evaluate(pars, need_grad=True)
-                return grad
-
-        objective = _Objective()
-        minimizer = Minimizer(objective, quiet=quiet)
-        fit_out = minimizer(method=method, use_gradient=use_gradient, **kwargs)
-        x_fit = np.array(fit_out[1], copy=True)
-        logl_opt = initial_loglike - float(fit_out[0])
-        delta_loglike = round(logl_opt - initial_loglike, 2)
-
-        # Analytical Fisher information matrix (Hessian of neg-loglike),
-        # summed over bands: H_ij = sum_n (1/m_n)(dm_n/dtheta_i)(dm_n/dtheta_j).
-        n_active = int(param_mask.sum())
-        hess = np.zeros((n_active, n_active), dtype=float)
-        for band in self._iter_bands():
-            band_model, dm_dtheta = band.pixel_counts_and_gradient()
-            band_model = np.clip(band_model, 1e-30, None)
-            G = dm_dtheta[:, param_mask].T  # (n_active, n_pix)
-            hess += (G / band_model) @ G.T
-
-        try:
-            cov = np.linalg.inv(hess)
-        except np.linalg.LinAlgError:
-            cov = np.full_like(hess, np.nan)
-        sigs = np.sqrt(np.clip(cov.diagonal(), 0.0, None))
-        outer = np.outer(sigs, sigs)
-        corr = np.where(outer > 0, cov / np.where(outer > 0, outer, 1.0), np.nan).round(2)
-
-        grad = objective.gradient(x_fit)
-
-        # TS-like values: 2 x delta-loglike forcing each Norm parameter to -20.
-        active_names = all_names[param_mask]
-        ts_values = np.full(n_active, np.nan)
-        for k, name in enumerate(active_names):
-            if name.endswith('_Norm'):
-                trial = x_fit.copy()
-                trial[k] = -20.0
-                objective.set_parameters(trial)
-                ts_values[k] = round(2.0 * (logl_opt - self.loglike()), 1)
-                objective.set_parameters(x_fit)
-
-        self.fit_info = dict(
-            hess=hess,
-            cov=cov,
-            sigs=sigs.round(4),
-            corr=corr,
-            grad=grad,
-            x_fit=x_fit,
-            x_init=x_init,
-            delta_loglike=delta_loglike,
-            ts_values=ts_values,
-        )
-        return fit_out
-
-    # def fit_source(self, source=None, energy_range=None, **kwargs):
-    #     """Fit a source over an optional energy range and return the result.
-
-    #     A convenience wrapper around :meth:`fit` that temporarily restricts
-    #     band iteration to bands whose energies fall within *energy_range*,
-    #     then restores the previous selection on exit.
-
-    #     Parameters
-    #     ----------
-    #     source : str, Source-like, or None, optional
-    #         Source to fit.  When ``None`` the first source in the attached
-    #         ``source_model`` is used (the model parameters are shared, so
-    #         fitting any named source optimises it in the context of all
-    #         others).  Currently passed through for future use; the actual
-    #         free-parameter set is determined by ``source_model.parameters``.
-    #     energy_range : tuple[float, float] or None, optional
-    #         ``(emin, emax)`` in **GeV**.  Bands with ``e0 < emin*1000`` or
-    #         ``e1 > emax*1000`` (MeV) are excluded during the fit.  Pass
-    #         ``None`` to use all currently selected bands.
-    #     **kwargs
-    #         Forwarded to :meth:`fit`.
-
-    #     Returns
-    #     -------
-    #     tuple
-    #         ``(fitvalue, parameters, errors)`` as returned by :meth:`fit`.
-    #     """
-    #     if self.source_model is None:
-    #         raise ValueError('fit_source requires a source_model')
-
-    #     # Save and restore selection so we don't permanently change it.
-    #     prior_selected = self._selected
-
-    #     try:
-    #         if energy_range is not None:
-    #             emin_mev = energy_range[0] * 1e3
-    #             emax_mev = energy_range[1] * 1e3
-    #             # Start from the prior selection if one is active.
-    #             candidate_keys = list(prior_selected) if prior_selected is not None else list(self.keys())
-    #             self._selected = [
-    #                 k for k in candidate_keys
-    #                 if self[k].e0 >= emin_mev and self[k].e1 <= emax_mev
-    #             ]
-    #         return self.fit(**kwargs)
-    #     finally:
-    #         self._selected = prior_selected
-
-
+            band = self[key]
+            dirs = band.healpix_to_skycoord(band.pix).icrs
+            edf = pd.DataFrame.from_dict(dict(ra=dirs.ra.deg, dec=dirs.dec.deg, 
+                                rel_exposure=band.pixel_exposure/(band.pixel_exposure.mean())
+                                ))
+            ax.scatter(np.sin(np.radians(edf.dec)), edf.rel_exposure, s=1)
+            ax.set(#xlabel="sin(Declination) (deg)",
+                ylabel="Relative Exposure",
+                title= f"Band {band.key}")
+            ax.axhline(1, color='r', linestyle='--')
+            ax.set(ylim=(0.5,1.8), xlim=(-1,1))
+            ax.grid('0.3', alpha=0.5)
+        fig.text(0.5, -0.04, "sin(Declination)", ha='center')
+        fig.suptitle("Declination Exposure dependence", fontsize=16)
+        plt.show()
+    
 def multi_ait(pixel_table, et, component='diffuse'):
     """Generate a 3x4 panel of band-level AIT plots for one event-type prefix.
 
@@ -2010,7 +1449,7 @@ class ResidualPlotter:
         fig1,fig2 = fig.subfigures(ncols=2, wspace=0.07)
 
         (AITfigure(fig=fig1, )
-            .imshow(self.photons, norm=LogNorm(), cmap='viridis') #nside=self.nside, 
+            .imshow(self.photons, log=True, cmap='viridis') #nside=self.nside, 
             .colorbar(label='photon counts', shrink=0.5)
             .title( 'photons\n'+f'nside {self.nside}', x=0, y = 0.9,ha='left', fontsize=16)
         )

@@ -16,14 +16,15 @@ from scipy.integrate import quad
 from scipy.interpolate import interp1d
 from scipy import  optimize
 # scipy.misc.derivative was removed in scipy 1.15; provide a drop-in replacement
-def derivative(func, x0, dx=1.0, n=1, args=(), order=3):
-    """Central finite-difference derivative (replaces scipy.misc.derivative)."""
-    if n == 1:
-        return (func(x0 + dx) - func(x0 - dx)) / (2 * dx)
-    elif n == 2:
-        return (func(x0 + dx) - 2 * func(x0) + func(x0 - dx)) / dx**2
-    else:
-        raise NotImplementedError("Only n=1 and n=2 supported")
+# def derivative(func, x0, dx=1.0, n=1, args=(), order=3):
+#     """Central finite-difference derivative (replaces scipy.misc.derivative)."""
+#     if n == 1:
+#         return (func(x0 + dx) - func(x0 - dx)) / (2 * dx)
+#     elif n == 2:
+#         return (func(x0 + dx) - 2 * func(x0) + func(x0 - dx)) / dx**2
+#     else:
+#         raise NotImplementedError("Only n=1 and n=2 supported")
+from scipy.differentiate import derivative
 
 from like3.uw_parmap import LinearMapper, LogMapper, LimitMapper, ParameterMapper
 # from uw.utilities import path
@@ -1250,6 +1251,7 @@ class Model(object):
         e: float
             energy in Mev, default e0
         """
+        from scipy.differentiate import derivative
         def dfun(x):
             def fun(x):
                 """flux as function of x=ln(e0/e)"""

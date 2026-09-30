@@ -4,6 +4,7 @@
 .gitconfig
 *.bak
 *.log
+*.png
 *~
 ~*
 
